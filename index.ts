@@ -17,6 +17,7 @@ import {
   createAssociatedTokenAccountIdempotentInstruction,
   createSyncNativeInstruction,
   createTransferCheckedInstruction,
+  createCloseAccountInstruction,
   getAccount,
 } from "@solana/spl-token";
 import { BN } from "@coral-xyz/anchor";
@@ -556,6 +557,21 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     const spotPriceUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
     const config = await macroSentinel.evaluateRegime(SOL_USDC_POOL.toBase58());
 
+    // Unwrap any stranded WSOL back to native SOL first. The Meteora SDK wraps
+    // totalXAmount from NATIVE lamports itself (and unwraps leftovers afterwards),
+    // so SOL must sit in the native balance, not in the WSOL ATA.
+    const botWsolAta = await getAssociatedTokenAddress(WSOL_MINT, wallet.publicKey);
+    try {
+      const wsolAcc = await getAccount(connection, botWsolAta);
+      if (wsolAcc) {
+        const unwrapTx = new Transaction().add(
+          createCloseAccountInstruction(botWsolAta, wallet.publicKey, wallet.publicKey)
+        );
+        await sendAndConfirmTransaction(connection, unwrapTx, [wallet]);
+        console.log(`[WSOL] Unwrapped ${(Number(wsolAcc.amount) / 1e9).toFixed(4)} WSOL to native SOL.`);
+      }
+    } catch {}
+
     const botUsdcAta = await getAssociatedTokenAddress(USDC_MINT, wallet.publicKey);
     let usdcBalanceUnits = 0;
     try {
@@ -563,7 +579,13 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
       usdcBalanceUnits = Number(acc.amount) / 1e6;
     } catch {}
 
-    const totalWorkingCapital = usdcBalanceUnits > 10 ? usdcBalanceUnits : deployedCapitalBaselineUsd;
+    // Count SOL already held above the gas reserve so retries don't keep buying more.
+    const preSolBal = await connection.getBalance(wallet.publicKey);
+    const existingSolUsd = (Math.max(0, preSolBal - GAS_RESERVE_LAMPORTS) / 1e9) * spotPriceUsd;
+
+    const totalWorkingCapital = usdcBalanceUnits + existingSolUsd > 10
+      ? usdcBalanceUnits + existingSolUsd
+      : deployedCapitalBaselineUsd;
     const targetDeployCapital = totalWorkingCapital * config.capitalDeployPct;
     
     // Strict ratio allocation based on bin distribution
@@ -571,7 +593,8 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     const askRatio = config.askBins / totalBins;
     const bidRatio = config.bidBins / totalBins;
 
-    const targetSolBuyUsd = targetDeployCapital * askRatio;
+    const targetAskUsd = targetDeployCapital * askRatio;
+    const targetSolBuyUsd = Math.min(usdcBalanceUnits, Math.max(0, targetAskUsd - existingSolUsd));
     const targetBidUsdcUsd = targetDeployCapital * bidRatio;
 
     let swapSig = "";
@@ -584,27 +607,12 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     }
 
     const solBal = await connection.getBalance(wallet.publicKey);
-    const usableSolLamports = Math.max(0, solBal - GAS_RESERVE_LAMPORTS); // Keep rent/gas reserve
-
-    // Sync native SOL into WSOL ATA so Meteora DLMM can deposit Token X
-    const botWsolAta = await getAssociatedTokenAddress(WSOL_MINT, wallet.publicKey);
-    if (usableSolLamports > 0) {
-      const wrapTx = new Transaction().add(
-        createAssociatedTokenAccountIdempotentInstruction(
-          wallet.publicKey,
-          botWsolAta,
-          wallet.publicKey,
-          WSOL_MINT
-        ),
-        SystemProgram.transfer({
-          fromPubkey: wallet.publicKey,
-          toPubkey: botWsolAta,
-          lamports: usableSolLamports,
-        }),
-        createSyncNativeInstruction(botWsolAta)
-      );
-      await sendAndConfirmTransaction(connection, wrapTx, [wallet]);
-    }
+    // Deposit only up to the ask target, keeping the gas/rent reserve native.
+    const targetAskLamports = Math.floor((targetAskUsd / spotPriceUsd) * 1e9);
+    const usableSolLamports = Math.max(0, Math.min(solBal - GAS_RESERVE_LAMPORTS, targetAskLamports));
+    // NOTE: no manual WSOL wrap here. initializePositionAndAddLiquidityByStrategy wraps
+    // totalXAmount from native SOL itself; wrapping first caused a double-wrap
+    // ("insufficient lamports") simulation failure.
 
     // Clamp so inclusive width ≤ DEFAULT_BIN_PER_POSITION (70) to avoid InvalidPositionWidth (6040).
     const activeBinIdNum = Number(activeBin.binId);
