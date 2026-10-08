@@ -1,0 +1,21 @@
+# Secrets & local env
+.env
+.env.*
+!.env.example
+
+# Dependencies & build
+node_modules/
+dist/
+
+# Logs & OS
+*.log
+npm-debug.log*
+.DS_Store
+
+# Key material (never commit)
+*.key
+*.pem
+id_rsa*
+keypair*.json
+*wallet*.json
+*secret*
