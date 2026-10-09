@@ -18,6 +18,9 @@ import {
   scoreInputs,
   smaFromDailyCandles,
   smaFromCoinGecko,
+  trendParts,
+  SCORE_BULL_MIN,
+  SCORE_BEAR_IMMEDIATE_BELOW,
 } from "../regime";
 
 const T0 = 1_791_500_000; // ~Oct 8 2026
@@ -69,6 +72,7 @@ function harness(opts: {
   failHist?: boolean;
   predicted?: any;
   candles?: ((now: number) => any) | null;
+  daily?: (now: number) => any;
 }) {
   let now = T0;
   const calls = { cg: 0, hist: 0, pred: 0, daily: 0, candles: 0 };
@@ -85,7 +89,7 @@ function harness(opts: {
     fetchDailyCandles: async () => {
       calls.daily++;
       if (all() || (opts.failDaily && opts.failDaily())) throw new Error("timeout");
-      return dailyCandles(now);
+      return opts.daily ? opts.daily(now) : dailyCandles(now);
     },
     fetchFundingHistory: async () => {
       calls.hist++;
@@ -157,7 +161,7 @@ test("funding SOL entry missing + history down → funding unknown/neutral, part
   const h = harness({ price: 120, failHist: true, predicted: [["BTC", []]] }); // trend +25 → score 75 alone
   const c1 = await h.s.evaluate();
   assert.equal(c1.details.fundingKnown, false);
-  assert.equal(c1.score, 75);
+  assert.ok(Math.abs(c1.score! - (75)) < 1e-9, `c1.score=${c1.score}`);
   assert.equal(c1.regime, "RANGE_CHOP");
   h.advance(3600);
   const c2 = await h.s.evaluate();
@@ -190,14 +194,14 @@ test("raw regime alternating each evaluation with small margin → hysteresis ho
   assert.ok(regimes.every((r) => r === "RANGE_CHOP"), regimes.join(","));
 });
 
-test("a single strong BULL read (score 100, margin 15) after dwell still needs a 2nd read", async () => {
+test("a single strong BULL read (score 100, margin 10) after dwell still needs a 2nd read", async () => {
   let apr = 0;
   const h = harness({ price: 109, hourly: (now) => hist(now, () => aprToHourly(apr)) });
   assert.equal((await h.s.evaluate()).regime, "RANGE_CHOP"); // score 75 → RANGE confirmed
   h.advance(3 * 3600);
   apr = 9;
   let c = await h.s.evaluate();
-  assert.equal(c.score, 100);
+  assert.ok(Math.abs(c.score! - (100)) < 1e-9, `c.score=${c.score}`);
   assert.equal(c.regime, "RANGE_CHOP");
   assert.match(c.holdReason, /BULL needs 2 consecutive reads \(1\/2\)/);
   h.advance(1800);
@@ -235,12 +239,12 @@ test("two consecutive confirming reads switch after boot; dwell 2h then holds a 
   assert.equal(c.regime, "RANGE_CHOP");
 });
 
-test("score < 30 → immediate BEAR (safety), no confirmation or dwell", async () => {
-  // price 20% below SMA → trend −25; funding −15% APR → −25 → score 0
+test("long-side score < 20 → immediate BEAR (safety), no confirmation or dwell", async () => {
+  // price 20% below SMA200 (= SMA50 in the harness) → long −15 + medium −10 + cross 0 = −25; funding −15% APR → −25 → score 0
   const h = harness({ price: SMA * 0.8, hourly: (now) => hist(now, () => aprToHourly(-15)) });
   const c = await h.s.evaluate();
   assert.equal(c.regime, "BEAR_DEFENSIVE");
-  assert.equal(c.score, 0);
+  assert.ok(Math.abs(c.score! - (0)) < 1e-9, `c.score=${c.score}`);
 });
 
 test("eval failure keeps last good regime < 6h, then falls back to RANGE (never BULL)", async () => {
@@ -363,11 +367,11 @@ test("short-term crash alone can't trigger BEAR; long side must agree", () => {
   const crash = { ...directionFromCandles(drift(-30)(T0), T0 * 1000)! }; // ~−10% in 24h
   const p = scoreInputs({ ...base, direction: crash });
   assert.equal(p.dirPts, -20);
-  assert.equal(p.score, 30);
+  assert.ok(Math.abs(p.score! - (30)) < 1e-9, `p.score=${p.score}`);
   assert.equal(classifyScore(p), "RANGE_CHOP"); // trend + funding = 0 → not BEAR
-  const bearish = scoreInputs({ ...base, solPrice: 102, direction: crash }); // 6.4% below the 200-day → trend −16
+  const bearish = scoreInputs({ ...base, solPrice: 102, direction: crash }); // 6.4% below the 200-day → long −9.6 (no SMA50)
   assert.equal(classifyScore(bearish), "BEAR_DEFENSIVE"); // long side agrees → BEAR (via normal confirmation)
-  assert.ok(bearish.longScore > 30, "long-side score above 30 → not the immediate shortcut");
+  assert.ok(bearish.longScore > SCORE_BEAR_IMMEDIATE_BELOW, "long-side score above 20 → not the immediate shortcut");
 });
 
 test("HL daily SMA: closed days only, ≥150 required, last 200 used", () => {
@@ -400,13 +404,13 @@ test("HL daily down → CoinGecko fallback; both down → trend unknown/neutral,
   const h1 = harness({ price: 109, failDaily: () => true });
   const c1 = await h1.s.evaluate();
   assert.match(c1.details.smaSource, /CoinGecko fallback/);
-  assert.equal(c1.details.trendPts, 25);
+  assert.ok(Math.abs(c1.details.trendPts! - (25)) < 1e-9, `c1.details.trendPts=${c1.details.trendPts}`);
 
   // both SMA sources down; funding +25 and a strong rally (+20) → raw would be BULL without trend…
   const h2 = harness({ price: 109, failDaily: () => true, failCg: () => true, hourly: (now) => hist(now, () => aprToHourly(9)), candles: drift(+30) });
   let c2 = await h2.s.evaluate();
   assert.equal(c2.details.trendKnown, false);
-  assert.equal(c2.details.trendPts, 0);
+  assert.ok(Math.abs(c2.details.trendPts! - (0)) < 1e-9, `c2.details.trendPts=${c2.details.trendPts}`);
   assert.match(c2.details.smaSource, /unknown \(HL 1d: timeout; CoinGecko: HTTP 429/);
   for (let i = 0; i < 480; i++) {
     // 2h of 15s keeper ticks
@@ -424,4 +428,96 @@ test("immediate BEAR shortcut needs the trend known (funding alone can't trip it
   assert.equal(c.details.trendKnown, false);
   assert.equal(c.rawRegime, "BEAR_DEFENSIVE"); // score 25 with trend unknown…
   assert.equal(c.regime, "RANGE_CHOP"); // …but no immediate switch on a partial read
+});
+
+/** Daily candles: 150 closed days at `old`, then 80 closed days at `recent` (SMA50 = recent), in-progress day = 999. */
+function twoLevelDaily(old: number, recent: number) {
+  return (now: number) =>
+    dailyCandles(now, old, 230, 999).map((r, i, a) => (i >= a.length - 1 - 80 && i < a.length - 1 ? { ...r, c: String(recent) } : r));
+}
+
+test("SMA50 from the same closed HL daily closes (last 50; in-progress day excluded)", () => {
+  const nowMs = T0 * 1000;
+  const r = smaFromDailyCandles(twoLevelDaily(80, 100)(T0), nowMs)!;
+  assert.equal(r.sma50.toFixed(4), "100.0000");
+  assert.equal(r.sma50Points, 50);
+  assert.equal(r.sma200.toFixed(4), ((120 * 80 + 80 * 100) / 200).toFixed(4));
+  const cg = smaFromCoinGecko({ prices: [...Array.from({ length: 150 }, (_, i) => [i, 80]), ...Array.from({ length: 50 }, (_, i) => [150 + i, 100]), [200, 5000]] })!;
+  assert.equal(cg.sma50.toFixed(4), "100.0000");
+});
+
+test("trend components: SMA50 above/below, golden/death cross, missing SMA50 → 0 for those parts", () => {
+  // today's live numbers: SOL $109.07, SMA200 $86.54, SMA50 $107.79
+  const now = trendParts(109.07, 86.54, 107.79);
+  assert.equal(now.long, 15); // +26% vs SMA200 → full
+  assert.ok(now.medium > 1.4 && now.medium < 1.6, `medium ${now.medium}`); // +1.2% vs SMA50 → +1.5
+  assert.equal(now.cross, 10); // SMA50 24.6% above SMA200 → golden cross, full
+  // price BELOW its 50-day while still above the 200-day: the medium component goes negative
+  const below = trendParts(100, 86.54, 107.79);
+  assert.ok(below.medium < -8.9 && below.medium > -9.1, `medium ${below.medium}`); // −7.2% vs SMA50 → −9.0
+  assert.equal(below.long, 15);
+  assert.ok(below.total < now.total - 8);
+  // death cross
+  const death = trendParts(80, 90, 76.5); // SMA50 15% below SMA200
+  assert.equal(death.cross, -10);
+  assert.ok(death.long < 0 && death.medium > 0);
+  // SMA50 missing → medium and cross are 0, long unaffected
+  const miss = trendParts(109, 86.54, NaN);
+  assert.equal(miss.medium, 0);
+  assert.equal(miss.cross, 0);
+  assert.equal(miss.long, 15);
+  // max ±35
+  assert.equal(trendParts(200, 100, 150).total, 35);
+  assert.equal(trendParts(50, 100, 70).total, -35);
+});
+
+test("BULL needs funding > 0: full trend (+35) and a strong rally (+20) with neutral funding stay RANGE", () => {
+  const dirUp = directionFromCandles(drift(+30)(T0), T0 * 1000)!;
+  const base = { solPrice: 200, sma200: 100, sma50: 150, smaPoints: 200, sma50Points: 50, direction: dirUp };
+  const neutral = scoreInputs({ ...base, funding: { ...UNKNOWN_FUNDING, known: true, apr: 1 } });
+  assert.equal(neutral.trendPts, 35);
+  assert.ok(neutral.score >= SCORE_BULL_MIN, `score ${neutral.score}`);
+  assert.equal(classifyScore(neutral), "RANGE_CHOP");
+  const paid = scoreInputs({ ...base, funding: { ...UNKNOWN_FUNDING, known: true, apr: 9 } });
+  assert.equal(classifyScore(paid), "BULL_EXPANSION");
+  // trend alone (direction 0, funding 0) maxes at 85 < 90
+  const flatDir = directionFromCandles(flat(200)(T0), T0 * 1000)!;
+  const alone = scoreInputs({ ...base, direction: flatDir, funding: { ...UNKNOWN_FUNDING, known: true, apr: 0 } });
+  assert.equal(alone.score, 85);
+  assert.equal(classifyScore(alone), "RANGE_CHOP");
+});
+
+test("sentinel: price below SMA50 lowers trend; [REGIME] line and summary show SMA200, SMA50 and each component", async () => {
+  // SMA200 = (120×80 + 80×120)/200 = 96, SMA50 = 120; price 109 → +13.5% vs 200 (long +15), −9.2% vs 50 (medium −10), cross +25% (+10)
+  const h = harness({ price: 109, daily: twoLevelDaily(80, 120), hourly: (now) => hist(now, () => aprToHourly(9)) });
+  const c = await h.s.evaluate(true);
+  assert.equal(c.details.sma50.toFixed(2), "120.00");
+  assert.equal(c.details.sma200.toFixed(2), "96.00");
+  assert.equal(c.details.trendLongPts, 15);
+  assert.equal(c.details.trendMedPts, -10);
+  assert.equal(c.details.crossPts, 10);
+  assert.ok(Math.abs(c.details.trendPts - 15) < 1e-9);
+  const line = h.logs[h.logs.length - 1];
+  assert.match(line, /vs SMA200 \$96\.00 \(\+13\.5%\) \+15\.0, vs SMA50 \$120\.00 \(-9\.2%\) -10\.0, cross SMA50\/200 \+25\.0% \+10\.0 \[HL 1d closes \(200\)\]/);
+  assert.match(h.s.summary(), /trend \+15\.0 \[SMA200 \$96\.00 \+15\.0, SMA50 \$120\.00 -10\.0, cross \+10\.0\], funding \+25\.0, dir \+0\.0/);
+});
+
+test("SMA50 unknown → its components score 0 and the read is partial (can't switch)", async () => {
+  // Inputs with SMA200 but no SMA50 (scoring level) …
+  const p = scoreInputs({ solPrice: 109, sma200: 86.54, smaPoints: 200, funding: { ...UNKNOWN_FUNDING, known: true, apr: 9 }, direction: directionFromCandles(flat(109)(T0), T0 * 1000)! });
+  assert.equal(p.trendMedPts, 0);
+  assert.equal(p.crossPts, 0);
+  assert.equal(p.trendLongPts, 15);
+  // … and in the sentinel: a fallback source without SMA50 is treated as a partial read
+  const h = harness({ price: 109, failDaily: () => true, hourly: (now) => hist(now, () => aprToHourly(9)), candles: drift(+30) });
+  (h as any).s["fetchers"].fetchCoinGecko = async () => ({ prices: [[0, NaN]] }); // unusable → SMA unknown entirely
+  let c = await h.s.evaluate();
+  assert.equal(c.details.trendKnown, false);
+  assert.ok(Number.isNaN(c.details.sma50));
+  for (let i = 0; i < 4; i++) {
+    h.advance(1800);
+    c = await h.s.evaluate();
+  }
+  assert.equal(c.regime, "RANGE_CHOP");
+  assert.match(c.holdReason, /trend\/SMA/);
 });

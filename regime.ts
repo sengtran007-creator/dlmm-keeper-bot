@@ -1,11 +1,14 @@
 /**
  * Macro regime classifier + per-position stop lock (pure logic; network access is injected).
  *
- * Score = 50 + trend term (±25) + funding term (±25).
- *   trend:   25 × clamp((price / SMA200 − 1) / 10%, −1, 1)        (full ±25 at ≥10% above/below the 200-day mean)
- *            SMA200 = mean of the last 200 CLOSED Hyperliquid SOL daily candles (UTC days; in-progress day
- *            excluded; ≥150 closed days required), cached 6h. Fallback: CoinGecko daily (same definition),
- *            then a cached SMA up to 24h old, else trend unknown → 0 (partial read; can't switch).
+ * Score = 50 + trend term (±35) + funding term (±25) + direction term (±20).
+ *   trend (±35) = three components from Hyperliquid SOL daily closes:
+ *            long   15 × clamp((price / SMA200 − 1) / 10%)    — primary; the only one with a forward edge in 500d of data
+ *            medium 10 × clamp((price / SMA50 − 1) / 8%)      — weeks-scale trend; 8% ≈ median |price/SMA50 − 1|
+ *            cross  10 × clamp((SMA50 / SMA200 − 1) / 15%)    — golden (+) / death (−) cross
+ *            SMA200 / SMA50 = mean of the last 200 / 50 CLOSED daily candles (UTC days; in-progress day
+ *            excluded; ≥150 / ≥50 closed days required), cached 6h. Fallback: CoinGecko daily (same definition),
+ *            then a cached SMA up to 24h old, else that component is unknown → 0 (partial read; can't switch).
  *            Price = latest HL 1h candle close (same feed as the direction term).
  *   funding: Hyperliquid SOL funding, 24h average of SETTLED hourly rates, annualized
  *            (hourly rate × 24 × 365 × 100). Fallback: HL predicted rate normalized by its interval.
@@ -22,17 +25,17 @@
  *            4h bounce inside a down day doesn't read as rising). |c| < 0.25 → 0 (flat); beyond that
  *            linear to ±20. Unknown → 0 (partial read; can't trigger a switch).
  * Regime (score = 50 + trend + funding + direction):
- *   BULL_EXPANSION  score ≥ 85 AND direction ≥ 0 (never BULL while price is falling short-term)
- *   BEAR_DEFENSIVE  score < 40 AND trend + funding < 0 (short-term direction alone can't make BEAR)
+ *   BULL_EXPANSION  score ≥ 90 AND direction ≥ 0 AND funding > 0 (trend alone, max 85, can never make BULL)
+ *   BEAR_DEFENSIVE  score < 35 AND trend + funding < 0 (short-term direction alone can't make BEAR)
  *   RANGE_CHOP      otherwise
  *
  * Hysteresis: a different regime must be observed on 2 consecutive complete evaluations (≥30 min apart)
  * OR (not for BULL) sit ≥10 points inside its band, AND the current regime must have been in force ≥2h.
- * Exception: BEAR immediately when the LONG-SIDE score 50 + trend + funding < 30 (direction excluded,
+ * Exception: BEAR immediately when the LONG-SIDE score 50 + trend + funding < 20 (direction excluded,
  * so short-term noise can't trip the safety shortcut). Boot starts in RANGE_CHOP (nothing persisted) and
  * leaves it only after 2 consecutive confirming reads ~30 min apart (no margin shortcut, no dwell at boot).
- * Schmitt band: an existing BULL is kept while score ≥ 75 and direction ≥ −8; an existing BEAR while
- * score < 48 (and trend + funding < 0) — so values hovering at an entry threshold don't flip the raw read.
+ * Schmitt band: an existing BULL is kept while score ≥ 80 and direction ≥ −8; an existing BEAR while
+ * score < 45 (and trend + funding < 0) — so values hovering at an entry threshold don't flip the raw read.
  * Failures: keep the current regime while the last good read is < 6h old, else fall back to RANGE_CHOP;
  * never default to BULL. Failed evaluations back off (5 min) instead of retrying every tick.
  */
@@ -55,15 +58,22 @@ export const REGIME_PROFILES: Record<MarketRegime, RegimeProfile> = {
 
 export const DEFAULT_REGIME: MarketRegime = "RANGE_CHOP";
 
-export const SCORE_BULL_MIN = 85;
-export const SCORE_BEAR_BELOW = 40;
-export const SCORE_BEAR_IMMEDIATE_BELOW = 30;
+export const SCORE_BULL_MIN = 90;
+export const SCORE_BEAR_BELOW = 35;
+export const SCORE_BEAR_IMMEDIATE_BELOW = 20;
 export const SWITCH_MARGIN_POINTS = 10;
 // Schmitt-trigger exits: once in BULL/BEAR, stay while the (looser) exit condition still holds.
-export const SCORE_BULL_STAY_MIN = 75;
+export const SCORE_BULL_STAY_MIN = 80;
 export const DIRECTION_BULL_STAY_MIN = -8;
-export const SCORE_BEAR_STAY_BELOW = 48;
+export const SCORE_BEAR_STAY_BELOW = 45;
+// Trend components (max points, full-scale deviation).
+export const TREND_LONG_MAX = 15;
 export const TREND_FULL_PCT = 0.1;
+export const TREND_MED_MAX = 10;
+export const TREND_MED_FULL_PCT = 0.08;
+export const TREND_CROSS_MAX = 10;
+export const TREND_CROSS_FULL_PCT = 0.15;
+export const TREND_MAX_POINTS = TREND_LONG_MAX + TREND_MED_MAX + TREND_CROSS_MAX;
 export const FUNDING_DEADBAND_APR = 3;
 export const FUNDING_FULL_BULL_APR = 8;
 export const FUNDING_OVERHEATED_APR = 40;
@@ -71,6 +81,7 @@ export const FUNDING_FULL_BEAR_APR = -10;
 export const FUNDING_WINDOW_HOURS = 24;
 export const SMA_DAYS = 200;
 export const SMA_MIN_DAYS = 150;
+export const SMA50_DAYS = 50;
 export const SMA_CACHE_SEC = 6 * 3600;
 export const SMA_FALLBACK_CACHE_SEC = 3600;
 export const SMA_STALE_MAX_SEC = 24 * 3600;
@@ -138,7 +149,10 @@ export interface MarketInputs {
   solPrice: number;
   sma200: number;
   smaPoints: number;
-  /** False when the SMA or the price is unavailable → trend term 0 and the read is partial. */
+  /** 50-day SMA of closed daily closes (NaN/absent = unknown → medium and cross components 0). */
+  sma50?: number;
+  sma50Points?: number;
+  /** False when SMA200 or the price is unavailable → trend term 0 and the read is partial. */
   trendKnown?: boolean;
   smaSource?: string;
   funding: FundingReading;
@@ -153,7 +167,9 @@ export function annualizeFunding(rate: number, intervalHours: number): number {
  * CoinGecko market_chart (daily) → live price (last point) + mean of the last 200 daily points before it
  * (same "closed days only" definition as the Hyperliquid SMA). null if unusable.
  */
-export function smaFromCoinGecko(data: any): { solPrice: number; sma200: number; smaPoints: number } | null {
+export function smaFromCoinGecko(
+  data: any
+): { solPrice: number; sma200: number; smaPoints: number; sma50: number; sma50Points: number } | null {
   const raw = data?.prices;
   if (!Array.isArray(raw) || raw.length < SMA_MIN_DAYS + 1) return null;
   const prices = raw.map((p: any) => Number(Array.isArray(p) ? p[1] : NaN));
@@ -161,14 +177,20 @@ export function smaFromCoinGecko(data: any): { solPrice: number; sma200: number;
   const solPrice = prices[prices.length - 1];
   const closed = prices.slice(0, -1).slice(-SMA_DAYS);
   const sma200 = closed.reduce((a: number, b: number) => a + b, 0) / closed.length;
-  return { solPrice, sma200, smaPoints: closed.length };
+  const c50 = closed.slice(-SMA50_DAYS);
+  const sma50 = c50.reduce((a: number, b: number) => a + b, 0) / c50.length;
+  return { solPrice, sma200, smaPoints: closed.length, sma50, sma50Points: c50.length };
 }
 
 /**
  * Hyperliquid candleSnapshot (1d) → mean of the last 200 CLOSED daily closes (candle end T < now; the
- * in-progress UTC day is excluded). Requires ≥150 closed days and a close within the last 48h.
+ * in-progress UTC day is excluded), plus the 50-day mean of the same closes. Requires ≥150 closed days
+ * (so SMA50's ≥50 is implied) and a close within the last 48h.
  */
-export function smaFromDailyCandles(rows: any, nowMs: number): { sma200: number; smaPoints: number; lastClose: number } | null {
+export function smaFromDailyCandles(
+  rows: any,
+  nowMs: number
+): { sma200: number; smaPoints: number; sma50: number; sma50Points: number; lastClose: number } | null {
   if (!Array.isArray(rows)) return null;
   const closed = rows
     .map((r: any) => ({ t: Number(r?.t), T: Number(r?.T), close: Number(r?.c) }))
@@ -178,7 +200,9 @@ export function smaFromDailyCandles(rows: any, nowMs: number): { sma200: number;
   if (nowMs - closed[closed.length - 1].T > 48 * 3600 * 1000) return null;
   const win = closed.slice(-SMA_DAYS);
   const sma200 = win.reduce((a: number, r: any) => a + r.close, 0) / win.length;
-  return { sma200, smaPoints: win.length, lastClose: closed[closed.length - 1].close };
+  const w50 = closed.slice(-SMA50_DAYS);
+  const sma50 = w50.reduce((a: number, r: any) => a + r.close, 0) / w50.length;
+  return { sma200, smaPoints: win.length, sma50, sma50Points: w50.length, lastClose: closed[closed.length - 1].close };
 }
 
 /** Hyperliquid fundingHistory rows (hourly, settled) → 24h average. null if too few valid samples. */
@@ -275,10 +299,28 @@ export function directionFromCandles(rows: any, nowMs: number): DirectionReading
 
 // ---------------- scoring ----------------
 
-export function trendPoints(solPrice: number, sma200: number): number {
-  if (!(solPrice > 0) || !(sma200 > 0)) return 0;
-  const rel = solPrice / sma200 - 1;
-  return 25 * Math.max(-1, Math.min(1, rel / TREND_FULL_PCT));
+
+export interface TrendParts {
+  /** price vs SMA200 (±15) */
+  long: number;
+  /** price vs SMA50 (±10) */
+  medium: number;
+  /** SMA50 vs SMA200 — golden/death cross (±10) */
+  cross: number;
+  total: number;
+}
+
+/** Trend components; any component whose inputs are missing/invalid scores 0. */
+export function trendParts(solPrice: number, sma200: number, sma50?: number): TrendParts {
+  const p = solPrice > 0;
+  const long = p && sma200 > 0 ? TREND_LONG_MAX * clamp1((solPrice / sma200 - 1) / TREND_FULL_PCT) : 0;
+  const medium = p && sma50! > 0 ? TREND_MED_MAX * clamp1((solPrice / sma50! - 1) / TREND_MED_FULL_PCT) : 0;
+  const cross = sma50! > 0 && sma200 > 0 ? TREND_CROSS_MAX * clamp1((sma50! / sma200 - 1) / TREND_CROSS_FULL_PCT) : 0;
+  return { long, medium, cross, total: long + medium + cross };
+}
+
+export function trendPoints(solPrice: number, sma200: number, sma50?: number): number {
+  return trendParts(solPrice, sma200, sma50).total;
 }
 
 export function fundingPoints(f: FundingReading): number {
@@ -302,6 +344,9 @@ export function directionPoints(d: DirectionReading): number {
 export interface ScoreParts {
   score: number;
   trendPts: number;
+  trendLongPts: number;
+  trendMedPts: number;
+  crossPts: number;
   fundingPts: number;
   dirPts: number;
   /** 50 + trend + funding (direction excluded) — the long-side view used by the BEAR rules. */
@@ -309,23 +354,32 @@ export interface ScoreParts {
 }
 
 export function scoreInputs(inp: MarketInputs): ScoreParts {
-  const trendPts = inp.trendKnown === false ? 0 : trendPoints(inp.solPrice, inp.sma200);
+  const t = inp.trendKnown === false ? { long: 0, medium: 0, cross: 0, total: 0 } : trendParts(inp.solPrice, inp.sma200, inp.sma50);
   const fundingPts = fundingPoints(inp.funding);
   const dirPts = directionPoints(inp.direction ?? UNKNOWN_DIRECTION);
-  const longScore = 50 + trendPts + fundingPts;
-  return { score: longScore + dirPts, trendPts, fundingPts, dirPts, longScore };
+  const longScore = 50 + t.total + fundingPts;
+  return {
+    score: longScore + dirPts,
+    trendPts: t.total,
+    trendLongPts: t.long,
+    trendMedPts: t.medium,
+    crossPts: t.cross,
+    fundingPts,
+    dirPts,
+    longScore,
+  };
 }
 
 /**
- * Raw regime for one read. `current` enables the Schmitt-trigger band: entering BULL needs score ≥ 85 and
- * direction ≥ 0, but an existing BULL is kept while score ≥ 75 and direction ≥ −8; entering BEAR needs
- * score < 40 with trend + funding < 0, an existing BEAR is kept while score < 48 and trend + funding < 0.
+ * Raw regime for one read. `current` enables the Schmitt-trigger band: entering BULL needs score ≥ 90,
+ * direction ≥ 0 and funding > 0, but an existing BULL is kept while score ≥ 80 and direction ≥ −8; entering
+ * BEAR needs score < 35 with trend + funding < 0, an existing BEAR is kept while score < 45 and trend + funding < 0.
  */
 export function classifyScore(parts: ScoreParts, current?: MarketRegime): MarketRegime {
   const longBearish = parts.trendPts + parts.fundingPts < 0;
   if (current === "BULL_EXPANSION" && parts.score >= SCORE_BULL_STAY_MIN && parts.dirPts >= DIRECTION_BULL_STAY_MIN) return "BULL_EXPANSION";
   if (current === "BEAR_DEFENSIVE" && parts.score < SCORE_BEAR_STAY_BELOW && longBearish) return "BEAR_DEFENSIVE";
-  if (parts.score >= SCORE_BULL_MIN && parts.dirPts >= 0) return "BULL_EXPANSION";
+  if (parts.score >= SCORE_BULL_MIN && parts.dirPts >= 0 && parts.fundingPts > 0) return "BULL_EXPANSION";
   if (parts.score < SCORE_BEAR_BELOW && longBearish) return "BEAR_DEFENSIVE";
   return "RANGE_CHOP";
 }
@@ -359,6 +413,8 @@ export interface RegimeConfig extends RegimeProfile {
     sma200: number;
     smaSource: string;
     smaPoints: number;
+    sma50: number;
+    sma50Points: number;
     trendKnown: boolean;
     fundingAnnual: number;
     fundingRawRate: number;
@@ -366,6 +422,9 @@ export interface RegimeConfig extends RegimeProfile {
     fundingSource: string;
     fundingKnown: boolean;
     trendPts: number;
+    trendLongPts: number;
+    trendMedPts: number;
+    crossPts: number;
     fundingPts: number;
     dirPts: number;
     longScore: number;
@@ -376,6 +435,14 @@ export interface RegimeConfig extends RegimeProfile {
     mom24hPct: number;
     turnoverRatio: number;
   };
+}
+
+export interface SmaReading {
+  sma200: number;
+  smaPoints: number;
+  sma50: number;
+  sma50Points: number;
+  source: string;
 }
 
 export interface RegimeFetchers {
@@ -408,6 +475,9 @@ interface GoodRead {
   inputs: MarketInputs;
   score: number;
   trendPts: number;
+  trendLongPts: number;
+  trendMedPts: number;
+  crossPts: number;
   fundingPts: number;
   dirPts: number;
   longScore: number;
@@ -430,7 +500,7 @@ export class RegimeSentinel {
   private inflight: Promise<RegimeConfig> | null = null;
   private lastLogAt = 0;
   private lastLogKey = "";
-  private smaCache: { sma200: number; smaPoints: number; source: string; at: number; validSec: number } | null = null;
+  private smaCache: (SmaReading & { at: number; validSec: number }) | null = null;
   private smaNextHlAt = 0;
   private smaNextCgAt = 0;
   /** Last SMA-source error (for logs); cleared on success. */
@@ -479,6 +549,8 @@ export class RegimeSentinel {
         sma200: g ? g.inputs.sma200 : NaN,
         smaSource: g ? g.inputs.smaSource ?? "n/a" : "n/a",
         smaPoints: g ? g.inputs.smaPoints : 0,
+        sma50: g && g.inputs.sma50 != null ? g.inputs.sma50 : NaN,
+        sma50Points: g ? g.inputs.sma50Points ?? 0 : 0,
         trendKnown: g ? g.inputs.trendKnown !== false : false,
         fundingAnnual: g ? g.inputs.funding.apr : NaN,
         fundingRawRate: g ? g.inputs.funding.rawRate : NaN,
@@ -486,6 +558,9 @@ export class RegimeSentinel {
         fundingSource: g ? g.inputs.funding.source : "n/a",
         fundingKnown: g ? g.inputs.funding.known : false,
         trendPts: g ? g.trendPts : 0,
+        trendLongPts: g ? g.trendLongPts : 0,
+        trendMedPts: g ? g.trendMedPts : 0,
+        crossPts: g ? g.crossPts : 0,
         fundingPts: g ? g.fundingPts : 0,
         dirPts: g ? g.dirPts : 0,
         longScore: g ? g.longScore : NaN,
@@ -505,11 +580,17 @@ export class RegimeSentinel {
     const sc = c.score != null ? c.score.toFixed(1) : "n/a";
     const extra =
       c.source === "held" ? `, raw ${c.rawRegime} held` : c.source === "last-good" ? ", last good read" : c.source === "default" ? ", default" : "";
-    const dir =
+    const d = c.details;
+    const parts =
       c.score == null
         ? ""
-        : (c.details.directionKnown ? `, dir ${fmtPts(c.details.dirPts)}` : ", dir unknown") + (c.details.trendKnown ? "" : ", trend unknown");
-    return `${c.regime} (score ${sc}${dir}${extra})`;
+        : (d.trendKnown
+            ? `: trend ${fmtPts(d.trendPts)} [SMA200 $${d.sma200.toFixed(2)} ${fmtPts(d.trendLongPts)}, ` +
+              (Number.isFinite(d.sma50) ? `SMA50 $${d.sma50.toFixed(2)} ${fmtPts(d.trendMedPts)}, cross ${fmtPts(d.crossPts)}]` : `SMA50 unknown]`)
+            : ": trend unknown") +
+          `, funding ${d.fundingKnown ? fmtPts(d.fundingPts) : "unknown"}` +
+          `, dir ${d.directionKnown ? fmtPts(d.dirPts) : "unknown"}`;
+    return `${c.regime} (score ${sc}${parts}${extra})`;
   }
 
   async evaluate(force = false): Promise<RegimeConfig> {
@@ -527,9 +608,16 @@ export class RegimeSentinel {
    * 200-day SMA with its own cache (6h for Hyperliquid, 1h for the CoinGecko fallback) and per-source
    * backoff (HL 15 min, CoinGecko 30 min) so a failing source is never hit on every tick or every eval.
    */
-  private async getSma(nowSec: number): Promise<{ sma200: number; smaPoints: number; source: string } | null> {
+  private async getSma(nowSec: number): Promise<SmaReading | null> {
     const c = this.smaCache;
-    if (c && nowSec - c.at < c.validSec) return { sma200: c.sma200, smaPoints: c.smaPoints, source: c.source };
+    const view = (x: SmaReading, source = x.source): SmaReading => ({
+      sma200: x.sma200,
+      smaPoints: x.smaPoints,
+      sma50: x.sma50,
+      sma50Points: x.sma50Points,
+      source,
+    });
+    if (c && nowSec - c.at < c.validSec) return view(c);
     const nowMs = nowSec * 1000;
     const errs: string[] = [];
     if (nowSec >= this.smaNextHlAt) {
@@ -537,10 +625,18 @@ export class RegimeSentinel {
         const rows = await this.fetchers.fetchDailyCandles(nowMs - (SMA_DAYS + 30) * 86400 * 1000, nowMs);
         const r = smaFromDailyCandles(rows, nowMs);
         if (!r) throw new Error("fewer than 150 closed daily candles / stale");
-        this.smaCache = { sma200: r.sma200, smaPoints: r.smaPoints, source: `HL 1d closes (${r.smaPoints})`, at: nowSec, validSec: SMA_CACHE_SEC };
+        this.smaCache = {
+          sma200: r.sma200,
+          smaPoints: r.smaPoints,
+          sma50: r.sma50,
+          sma50Points: r.sma50Points,
+          source: `HL 1d closes (${r.smaPoints})`,
+          at: nowSec,
+          validSec: SMA_CACHE_SEC,
+        };
         this.smaNextHlAt = nowSec + SMA_CACHE_SEC;
         this.smaError = "";
-        return { sma200: r.sma200, smaPoints: r.smaPoints, source: this.smaCache.source };
+        return view(this.smaCache);
       } catch (e: any) {
         this.smaNextHlAt = nowSec + SMA_HL_RETRY_SEC;
         errs.push(`HL 1d: ${errMsg(e)}`);
@@ -550,10 +646,18 @@ export class RegimeSentinel {
       try {
         const r = smaFromCoinGecko(await this.fetchers.fetchCoinGecko());
         if (!r) throw new Error("unusable price series");
-        this.smaCache = { sma200: r.sma200, smaPoints: r.smaPoints, source: `CoinGecko fallback (${r.smaPoints})`, at: nowSec, validSec: SMA_FALLBACK_CACHE_SEC };
+        this.smaCache = {
+          sma200: r.sma200,
+          smaPoints: r.smaPoints,
+          sma50: r.sma50,
+          sma50Points: r.sma50Points,
+          source: `CoinGecko fallback (${r.smaPoints})`,
+          at: nowSec,
+          validSec: SMA_FALLBACK_CACHE_SEC,
+        };
         this.smaNextCgAt = nowSec + SMA_FALLBACK_CACHE_SEC;
         this.smaError = errs.join("; ");
-        return { sma200: r.sma200, smaPoints: r.smaPoints, source: this.smaCache.source };
+        return view(this.smaCache);
       } catch (e: any) {
         this.smaNextCgAt = nowSec + SMA_CG_RETRY_SEC;
         errs.push(`CoinGecko: ${errMsg(e)}`);
@@ -561,7 +665,7 @@ export class RegimeSentinel {
     }
     if (errs.length) this.smaError = errs.join("; ");
     if (c && nowSec - c.at < SMA_STALE_MAX_SEC) {
-      return { sma200: c.sma200, smaPoints: c.smaPoints, source: `${c.source}, cached ${((nowSec - c.at) / 3600).toFixed(1)}h` };
+      return view(c, `${c.source}, cached ${((nowSec - c.at) / 3600).toFixed(1)}h`);
     }
     return null;
   }
@@ -592,6 +696,8 @@ export class RegimeSentinel {
       solPrice: price,
       sma200: sma ? sma.sma200 : NaN,
       smaPoints: sma ? sma.smaPoints : 0,
+      sma50: sma && sma.sma50 > 0 ? sma.sma50 : NaN,
+      sma50Points: sma && sma.sma50 > 0 ? sma.sma50Points : 0,
       trendKnown,
       smaSource: sma ? sma.source : `unknown${this.smaError ? ` (${this.smaError})` : ""}`,
       funding: funding ?? UNKNOWN_FUNDING,
@@ -606,11 +712,25 @@ export class RegimeSentinel {
     try {
       const inputs = await this.fetchInputs(now);
       const parts = scoreInputs(inputs);
-      const { score, trendPts, fundingPts, dirPts, longScore } = parts;
+      const { score, trendPts, trendLongPts, trendMedPts, crossPts, fundingPts, dirPts, longScore } = parts;
       const raw = classifyScore(parts, this.effective);
       const trendKnown = inputs.trendKnown !== false;
-      const complete = trendKnown && inputs.funding.known && inputs.direction.known;
-      this.lastGood = { at: now, inputs, score, trendPts, fundingPts, dirPts, longScore, rawRegime: raw, complete };
+      const sma50Known = Number.isFinite(inputs.sma50) && inputs.sma50! > 0;
+      const complete = trendKnown && sma50Known && inputs.funding.known && inputs.direction.known;
+      this.lastGood = {
+        at: now,
+        inputs,
+        score,
+        trendPts,
+        trendLongPts,
+        trendMedPts,
+        crossPts,
+        fundingPts,
+        dirPts,
+        longScore,
+        rawRegime: raw,
+        complete,
+      };
       this.lastEvalOk = true;
       this.lastFailure = "";
       changedNote = this.applyObservation(raw, score, longScore, complete, now, trendKnown && inputs.funding.known);
@@ -660,6 +780,7 @@ export class RegimeSentinel {
       const g = this.lastGood;
       const missing = [
         g && g.inputs.trendKnown === false ? "trend/SMA" : "",
+        g && g.inputs.trendKnown !== false && !(Number(g.inputs.sma50) > 0) ? "SMA50" : "",
         g && !g.inputs.funding.known ? "funding" : "",
         g && !g.inputs.direction.known ? "direction" : "",
       ]
@@ -677,7 +798,7 @@ export class RegimeSentinel {
       this.pending = { regime: raw, count: 1, lastAt: now };
     }
     const margin = regimeMargin(raw, score);
-    // Margin shortcut never applies to BULL: its band tops out 15 pts above the threshold, so a "full" bull
+    // Margin shortcut never applies to BULL: its band tops out 20 pts above the threshold, so a "full" bull
     // read always clears 10 — BULL (tightest stop for new deploys) always needs 2 consecutive reads.
     const marginOk = !this.provisional && raw !== "BULL_EXPANSION" && margin >= SWITCH_MARGIN_POINTS;
     const confirmed = this.pending.count >= 2 || marginOk;
@@ -731,7 +852,12 @@ export function formatRegimeLine(c: RegimeConfig, evalOk: boolean, changedNote: 
   const inputs = c.score != null
     ? ` | trend ${fmtPts(d.trendPts)}: ` +
       (d.trendKnown
-        ? `$${d.solPrice.toFixed(2)} vs SMA200 $${d.sma200.toFixed(2)} (${((d.solPrice / d.sma200 - 1) * 100).toFixed(1)}%) [${d.smaSource}]`
+        ? `$${d.solPrice.toFixed(2)} vs SMA200 $${d.sma200.toFixed(2)} (${fmtPct((d.solPrice / d.sma200 - 1) * 100, 1)}) ${fmtPts(d.trendLongPts)}, ` +
+          (Number.isFinite(d.sma50)
+            ? `vs SMA50 $${d.sma50.toFixed(2)} (${fmtPct((d.solPrice / d.sma50 - 1) * 100, 1)}) ${fmtPts(d.trendMedPts)}, ` +
+              `cross SMA50/200 ${fmtPct((d.sma50 / d.sma200 - 1) * 100, 1)} ${fmtPts(d.crossPts)}`
+            : `SMA50 unknown → 0`) +
+          ` [${d.smaSource}]`
         : `unknown → neutral [SMA ${d.smaSource}]`) +
       ` | funding ${fmtPts(d.fundingPts)}: ` +
       (d.fundingKnown
@@ -747,8 +873,8 @@ export function formatRegimeLine(c: RegimeConfig, evalOk: boolean, changedNote: 
   return `${head} | ${res}${inputs}${hold}${chg} | source ${c.source} | next eval ${fmtTime(c.nextEvalAt)}`;
 }
 
-function fmtPct(n: number): string {
-  return `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
+function fmtPct(n: number, digits = 2): string {
+  return `${n >= 0 ? "+" : ""}${n.toFixed(digits)}%`;
 }
 
 function fmtPts(n: number): string {

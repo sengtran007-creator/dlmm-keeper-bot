@@ -2244,11 +2244,16 @@ async function listenTelegramCommands() {
           const rMsg =
             `🌐 <b>Macro Sentinel State</b>\n\n` +
             `• <b>Regime:</b> <code>${config.regime}</code>${config.provisional ? " (provisional)" : ""} — ${config.source}\n` +
-            `• <b>Score:</b> ${haveRead ? `<b>${config.score!.toFixed(1)}</b>/100 → raw ${config.rawRegime}` : "n/a (no good read yet)"}\n` +
+            `• <b>Score:</b> ${haveRead ? `<b>${config.score!.toFixed(1)}</b> (BULL ≥90, BEAR <35) → raw ${config.rawRegime}` : "n/a (no good read yet)"}\n` +
             (haveRead
               ? `• <b>Trend:</b> ${d.trendPts >= 0 ? "+" : ""}${d.trendPts.toFixed(1)} — ` +
                 (d.trendKnown
-                  ? `$${d.solPrice.toFixed(2)} vs 200-SMA $${d.sma200.toFixed(2)} (${escapeHtml(d.smaSource)})`
+                  ? `$${d.solPrice.toFixed(2)} vs SMA200 $${d.sma200.toFixed(2)} (${d.trendLongPts >= 0 ? "+" : ""}${d.trendLongPts.toFixed(1)}), ` +
+                    (Number.isFinite(d.sma50)
+                      ? `vs SMA50 $${d.sma50.toFixed(2)} (${d.trendMedPts >= 0 ? "+" : ""}${d.trendMedPts.toFixed(1)}), ` +
+                        `cross ${(((d.sma50 / d.sma200) - 1) * 100).toFixed(1)}% (${d.crossPts >= 0 ? "+" : ""}${d.crossPts.toFixed(1)})`
+                      : `SMA50 unknown (0)`) +
+                    ` — ${escapeHtml(d.smaSource)}`
                   : `unknown → neutral (${escapeHtml(d.smaSource)})`) + `\n` +
                 `• <b>Funding:</b> ${d.fundingPts >= 0 ? "+" : ""}${d.fundingPts.toFixed(1)} — ` +
                 (d.fundingKnown ? `${d.fundingAnnual.toFixed(2)}% APR (${escapeHtml(d.fundingSource)})` : "unknown → neutral") + `\n` +
