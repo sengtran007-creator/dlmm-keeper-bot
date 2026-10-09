@@ -7,7 +7,6 @@ import {
   Connection,
   Keypair,
   PublicKey,
-  sendAndConfirmTransaction,
   SystemProgram,
   Transaction,
   TransactionInstruction,
@@ -63,6 +62,12 @@ import {
   resolveLanded,
   solSweepLamports,
 } from "./feesweep";
+import {
+  TxSendError,
+  recenterRetryAnchor,
+  retryTxWithChainCheck,
+  shortTxError,
+} from "./txretry";
 import {
   ATA_RENT_LAMPORTS,
   TRANSFER_OUT_CONFIRM_TTL_MS,
@@ -240,6 +245,24 @@ const MAX_DRAWDOWN_PCT = Number(process.env.MAX_DRAWDOWN_PCT ?? 0.05);
 const BELOW_RANGE_TICKS = Math.max(1, Number(process.env.BELOW_RANGE_TICKS ?? 3));
 // Min seconds between below-range (or TP) recenters that reopen a grid without a hard stop.
 const RECENTER_COOLDOWN_SEC = Math.max(0, Number(process.env.RECENTER_COOLDOWN_SEC ?? 1800));
+// After a recenter / take-profit whose close failed (position re-attached, nothing redeployed): retry it
+// this soon instead of waiting the full RECENTER_COOLDOWN_SEC (never longer than that cooldown).
+const RECENTER_FAIL_RETRY_SEC = Math.max(30, Number(process.env.RECENTER_FAIL_RETRY_SEC ?? 180) || 180);
+
+// ---- Close / withdraw tx resilience (all optional; defaults are safe for both instances) ----
+function envInt(name: string, dflt: number, min: number, max: number): number {
+  const v = Number(process.env[name]);
+  return Number.isFinite(v) && process.env[name]?.trim() ? Math.min(max, Math.max(min, Math.floor(v))) : dflt;
+}
+// Attempts per position close (rebuild + fresh blockhash each; chain re-read before every retry).
+const CLOSE_MAX_ATTEMPTS = envInt("CLOSE_MAX_ATTEMPTS", 4, 1, 8);
+// Exponential backoff between close attempts: base·2^(n−1) capped, ±20% jitter → ~2s, 4s, 8s (16s cap).
+const CLOSE_RETRY_BASE_MS = envInt("CLOSE_RETRY_BASE_MS", 2000, 250, 30_000);
+const CLOSE_RETRY_MAX_MS = envInt("CLOSE_RETRY_MAX_MS", 16_000, 1000, 120_000);
+// Attempts for the pre-close fee claim (only retried when the previous one provably did not land).
+const CLAIM_MAX_ATTEMPTS = envInt("CLAIM_MAX_ATTEMPTS", 3, 1, 6);
+// Pause between the pre-close fee sweep and the close so the two do not burst the RPC back to back.
+const CLOSE_AFTER_SWEEP_DELAY_MS = envInt("CLOSE_AFTER_SWEEP_DELAY_MS", 1500, 0, 15_000);
 // Optional entry PIN for restarts. Applied ONLY at boot-attach and ONLY when the attached
 // position pubkey equals ENTRY_POSITION_PUBKEY. After a take-profit / recenter / new deploy the
 // position pubkey changes, so a stale pin is ignored automatically (with a warning) on the next boot.
@@ -1518,6 +1541,46 @@ async function confirmOrResolveLanded(
   }, { pollMs: 2000, maxWaitMs: 150_000 });
 }
 
+const sleepMs = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * Send one tx resiliently: FRESH 'confirmed' blockhash, re-sign, send with preflight (skipPreflight=false),
+ * confirm by blockhash + lastValidBlockHeight (expiry detected correctly), and on an ambiguous confirm
+ * resolve from chain whether it landed. Returns the signature only when it LANDED without error; else
+ * throws TxSendError whose landedStatus tells the caller whether a resend could double it. Never retries
+ * by itself (callers decide; see retryTxWithChainCheck).
+ */
+async function sendTx(tx: Transaction | VersionedTransaction, signers: Keypair[], label: string): Promise<string> {
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+  let raw: Uint8Array;
+  let sig: string;
+  if (tx instanceof VersionedTransaction) {
+    tx.message.recentBlockhash = blockhash;
+    tx.sign(signers);
+    sig = bs58.encode(tx.signatures[0]);
+    raw = tx.serialize();
+  } else {
+    tx.recentBlockhash = blockhash;
+    tx.lastValidBlockHeight = lastValidBlockHeight;
+    if (!tx.feePayer) tx.feePayer = wallet.publicKey;
+    tx.sign(...signers);
+    sig = bs58.encode(tx.signature!);
+    raw = tx.serialize();
+  }
+  let sendErr: any = null;
+  try {
+    await connection.sendRawTransaction(raw, { skipPreflight: false, preflightCommitment: "confirmed" });
+  } catch (e: any) {
+    sendErr = e;
+  }
+  // HTTP 429 on the send itself = the RPC refused the request (never broadcast).
+  const rateLimited = sendErr && /\b429\b|too many requests/i.test(String(sendErr?.message || sendErr));
+  const status: LandedStatus = rateLimited ? "not_landed" : await confirmOrResolveLanded(sig, blockhash, lastValidBlockHeight, sendErr);
+  if (status === "landed") return sig;
+  const detail = sendErr ? `: ${shortTxError(sendErr, 400)}` : status === "failed" ? ": landed with a program error" : "";
+  throw new TxSendError(redactSecrets(`${label} tx ${sig.slice(0, 8)}… ${status}${detail}`), status, sig);
+}
+
 async function executeJupiterSwap(
   inputMint: PublicKey,
   outputMint: PublicKey,
@@ -1910,20 +1973,32 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
         console.warn("[FEE] Skipping claim — SOL below fee floor");
         return 0;
       }
-      const claimTx = await (dlmmPool as any).claimSwapFee({
-        owner: wallet.publicKey,
-        position: targetPos,
+      // Rebuilt (fresh blockhash) per attempt; retried only while the previous attempt provably did not
+      // land (no chain re-read here, so an "unknown" outcome is never resent).
+      const claimOutcome = await retryTxWithChainCheck({
+        maxAttempts: CLAIM_MAX_ATTEMPTS,
+        backoff: { baseMs: CLOSE_RETRY_BASE_MS, maxMs: CLOSE_RETRY_MAX_MS },
+        sleep: sleepMs,
+        onRetry: ({ nextAttempt, delayMs, error }) =>
+          console.warn(`[FEE] claim attempt ${nextAttempt - 1} failed (${redactSecrets(shortTxError(error))}) — retrying in ${(delayMs / 1000).toFixed(1)}s`),
+        attempt: async () => {
+          const before = claimSigs.length;
+          try {
+            const claimTx = await (dlmmPool as any).claimSwapFee({
+              owner: wallet.publicKey,
+              position: targetPos,
+            });
+            for (const tx of Array.isArray(claimTx) ? claimTx : claimTx ? [claimTx] : []) {
+              claimSigs.push(await sendTx(tx, [wallet], "fee claim"));
+            }
+          } catch (e: any) {
+            // Part of a multi-tx claim already landed: rebuilding would mix landed and unlanded halves.
+            if (claimSigs.length > before) throw new TxSendError(shortTxError(e, 400), "unknown");
+            throw e;
+          }
+        },
       });
-
-      if (Array.isArray(claimTx)) {
-        for (const tx of claimTx) {
-          const sig = await sendAndConfirmTransaction(connection, tx, [wallet]);
-          claimSigs.push(sig);
-        }
-      } else if (claimTx) {
-        const sig = await sendAndConfirmTransaction(connection, claimTx, [wallet]);
-        claimSigs.push(sig);
-      }
+      if (claimOutcome.status === "failed") throw claimOutcome.lastError;
     } catch (claimErr: any) {
       if (claimErr?.message?.includes("No fee to claim") || claimErr?.message?.includes("0x1771")) {
         return 0;
@@ -2010,7 +2085,7 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
           6
         )
       );
-      const sig = await sendAndConfirmTransaction(connection, sweepTx, [wallet]);
+      const sig = await sendTx(sweepTx, [wallet], "USDC fee sweep");
       usdcSweepSig = sig;
       const sweptAmountUsd = Number(freshlyClaimedUsdc) / 1e6;
       const sweepMeta = await fetchTxWalletDeltas(sig);
@@ -2072,10 +2147,24 @@ interface CloseReclaimResult {
   usdcReceivedRaw: number;
   feeLamports: number;
   isEstimate: boolean;
+  /** Close attempts sent (max over positions). */
+  attempts: number;
+  /** Last close error (redacted, short), "" if none. */
+  lastError: string;
 }
 
+/** Position account gone (closed: no account, System-owned, or no data) — a previous close landed. */
+async function isPositionAccountClosed(key: PublicKey): Promise<boolean> {
+  const info = await connection.getAccountInfo(key, "confirmed");
+  return !info || info.owner.equals(SystemProgram.programId) || info.data.length === 0;
+}
+
+const BENIGN_CLOSE_RACE_RE = /AccountOwnedByWrongProgram|3007|0xbbf|already been closed/i;
+
 async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResult> {
-  const empty: CloseReclaimResult = { ok: false, remaining: [], sigs: [], solReceivedLamports: 0, usdcReceivedRaw: 0, feeLamports: 0, isEstimate: true };
+  const empty: CloseReclaimResult = {
+    ok: false, remaining: [], sigs: [], solReceivedLamports: 0, usdcReceivedRaw: 0, feeLamports: 0, isEstimate: true, attempts: 0, lastError: "",
+  };
   try {
     await dlmmPool.refetchStates();
     const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
@@ -2083,82 +2172,118 @@ async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResu
 
     const pre = await snapshotWalletBalances();
     const sigs: string[] = [];
+    let maxAttempts = 0;
+    let lastError = "";
+    let lowGas = false;
+    let firstFloorCheck = true;
 
     for (const pos of userPositions) {
-      try {
-        // Re-check on-chain ownership before each close to avoid AccountOwnedByWrongProgram
-        // after a concurrent exit already closed the account (owner becomes System Program).
-        const info = await connection.getAccountInfo(pos.publicKey);
-        if (!info || info.owner.equals(SystemProgram.programId) || info.data.length === 0) {
-          console.warn(`[CLOSE] Skipping ${pos.publicKey.toBase58()}: already closed/absent`);
-          continue;
-        }
-
-        if (!(await ensureTxFeeFloor("close"))) {
+      if (lowGas) break;
+      // Per attempt: re-read the chain (the position account is gone → a previous attempt landed → done,
+      // nothing resent), rebuild from fresh position state (withdraw+claim+close if it still holds
+      // liquidity, else just close), fresh 'confirmed' blockhash, preflight on, blockhash-height confirm.
+      // Transient errors (blockhash not found / expired, 429, timeouts, network) back off ~2s, 4s, 8s…;
+      // program errors stop at once.
+      const outcome = await retryTxWithChainCheck({
+        maxAttempts: CLOSE_MAX_ATTEMPTS,
+        backoff: { baseMs: CLOSE_RETRY_BASE_MS, maxMs: CLOSE_RETRY_MAX_MS },
+        sleep: sleepMs,
+        isDone: () => isPositionAccountClosed(pos.publicKey),
+        onRetry: ({ nextAttempt, delayMs, error }) =>
+          console.warn(
+            `[CLOSE] ${pos.publicKey.toBase58().slice(0, 8)}… attempt ${nextAttempt - 1}/${CLOSE_MAX_ATTEMPTS} failed ` +
+              `(${redactSecrets(shortTxError(error))}) — re-reading chain and retrying in ${(delayMs / 1000).toFixed(1)}s`
+          ),
+        attempt: async (n) => {
+          // The pre-snapshot just read native SOL; reuse it for the first floor check (one fewer RPC read).
+          const floorOk = firstFloorCheck && pre.nativeLamports >= TX_FEE_FLOOR_LAMPORTS ? true : await ensureTxFeeFloor("close");
+          firstFloorCheck = false;
+          if (!floorOk) {
+            lowGas = true;
+            throw new Error("insufficient funds: native SOL below TX_FEE_FLOOR_LAMPORTS"); // non-retryable
+          }
+          const p = n === 1 ? pos : await dlmmPool.getPosition(pos.publicKey);
+          // closePosition (closePosition2) only closes an EMPTY position — on a funded one it fails with
+          // NonEmptyPosition (6030). Withdraw 100% + claim fees + close in one SDK call when it holds liquidity.
+          const closeTx = positionHasLiquidity(p.positionData)
+            ? await (dlmmPool as any).removeLiquidity({
+                user: wallet.publicKey,
+                position: pos.publicKey,
+                fromBinId: Number(p.positionData.lowerBinId),
+                toBinId: Number(p.positionData.upperBinId),
+                bps: new BN(10_000),
+                shouldClaimAndClose: true,
+              })
+            : await (dlmmPool as any).closePosition({
+                owner: wallet.publicKey,
+                position: p,
+              });
+          // Only LANDED sigs are recorded; a later chunk failing leaves earlier ones counted, and the next
+          // attempt rebuilds from the post-chunk state (withdrawn bins are not withdrawn again).
+          for (const tx of Array.isArray(closeTx) ? closeTx : closeTx ? [closeTx] : []) {
+            sigs.push(await sendTx(tx, [wallet], "close"));
+          }
+        },
+      });
+      maxAttempts = Math.max(maxAttempts, outcome.attempts);
+      if (outcome.status === "already_done") {
+        console.warn(`[CLOSE] ${pos.publicKey.toBase58()}: already closed on chain${outcome.attempts > 0 ? " (an earlier attempt landed)" : ""}`);
+        continue;
+      }
+      if (outcome.status === "failed") {
+        const msg = redactSecrets(shortTxError(outcome.lastError, 300));
+        if (lowGas) {
           console.warn("[CLOSE] Aborting further closes — SOL below fee floor");
+          lastError = msg;
           break;
         }
-
-        // closePosition (closePosition2) only closes an EMPTY position — on a funded one it fails with
-        // NonEmptyPosition (6030). Withdraw 100% + claim fees + close in one SDK call when it holds liquidity.
-        const closeTx = positionHasLiquidity(pos.positionData)
-          ? await (dlmmPool as any).removeLiquidity({
-              user: wallet.publicKey,
-              position: pos.publicKey,
-              fromBinId: Number(pos.positionData.lowerBinId),
-              toBinId: Number(pos.positionData.upperBinId),
-              bps: new BN(10_000),
-              shouldClaimAndClose: true,
-            })
-          : await (dlmmPool as any).closePosition({
-              owner: wallet.publicKey,
-              position: pos,
-            });
-
-        if (Array.isArray(closeTx)) {
-          for (const tx of closeTx) {
-            sigs.push(await sendAndConfirmTransaction(connection, tx, [wallet]));
-          }
-        } else if (closeTx) {
-          sigs.push(await sendAndConfirmTransaction(connection, closeTx, [wallet]));
-        }
-      } catch (closeErr: any) {
-        const msg = closeErr?.message || String(closeErr);
         // Benign if a racing exit already closed it.
-        if (/AccountOwnedByWrongProgram|3007|0xbbf|already been closed/i.test(msg)) {
+        if (BENIGN_CLOSE_RACE_RE.test(msg)) {
           console.warn("[CLOSE] Position already gone (benign race):", msg.slice(0, 160));
           continue;
         }
-        console.error("Close position error:", msg);
+        lastError = msg;
+        console.error(
+          `Close position error (${outcome.attempts} attempt(s), ${outcome.stopReason === "non_retryable" ? "non-retryable" : "retries exhausted"}): ${msg}`
+        );
+      } else if (outcome.attempts > 1) {
+        console.warn(`[CLOSE] ${pos.publicKey.toBase58().slice(0, 8)}… closed on attempt ${outcome.attempts}`);
       }
     }
 
-    const post = await snapshotWalletBalances();
-    let solReceived = Math.max(0, post.solEffectiveLamports - pre.solEffectiveLamports);
-    let usdcReceived = Math.max(0, post.usdcRaw - pre.usdcRaw);
+    // Ledger CLOSE only for txs that actually landed — failed attempts produce no (misleading) CLOSE row.
+    let solReceived = 0;
+    let usdcReceived = 0;
     let feeLamports = 0;
     let anyMeta = false;
-    for (const sig of sigs) {
-      const d = await fetchTxWalletDeltas(sig);
-      if (d.ok) {
-        anyMeta = true;
-        feeLamports += d.feeLamports ?? 0;
+    if (sigs.length > 0) {
+      const post = await snapshotWalletBalances();
+      solReceived = Math.max(0, post.solEffectiveLamports - pre.solEffectiveLamports);
+      usdcReceived = Math.max(0, post.usdcRaw - pre.usdcRaw);
+      for (const sig of sigs) {
+        const d = await fetchTxWalletDeltas(sig);
+        if (d.ok) {
+          anyMeta = true;
+          feeLamports += d.feeLamports ?? 0;
+        }
       }
-    }
-    if (feeLamports > 0) cumulativeGasSol += feeLamports / 1e9;
+      if (feeLamports > 0) cumulativeGasSol += feeLamports / 1e9;
 
-    void emitLedger({
-      event: "CLOSE",
-      tx_sig: sigs.join(",") || undefined,
-      gas_fee_sol: feeLamports > 0 ? feeLamports / 1e9 : undefined,
-      notes: `Close reclaim: +SOL=${(solReceived / 1e9).toFixed(6)} +USDC=${(usdcReceived / 1e6).toFixed(6)}`,
-      wallet_value_usd: undefined,
-      is_estimate: sigs.length > 0 ? !anyMeta : false,
-      // stash raw legs in swap_* columns for sheet visibility
-      swap_in_amount: solReceived / 1e9,
-      swap_out_amount: usdcReceived / 1e6,
-      swap_direction: "CLOSE→wallet",
-    });
+      void emitLedger({
+        event: "CLOSE",
+        tx_sig: sigs.join(","),
+        gas_fee_sol: feeLamports > 0 ? feeLamports / 1e9 : undefined,
+        notes:
+          `Close reclaim: +SOL=${(solReceived / 1e9).toFixed(6)} +USDC=${(usdcReceived / 1e6).toFixed(6)}` +
+          (maxAttempts > 1 ? ` (attempts: ${maxAttempts})` : ""),
+        wallet_value_usd: undefined,
+        is_estimate: !anyMeta,
+        // stash raw legs in swap_* columns for sheet visibility
+        swap_in_amount: solReceived / 1e9,
+        swap_out_amount: usdcReceived / 1e6,
+        swap_direction: "CLOSE→wallet",
+      });
+    }
 
     // Verify on chain: anything still open means the close did NOT happen (callers must not redeploy
     // on top of it or treat the funds as liquidated).
@@ -2169,15 +2294,22 @@ async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResu
       remaining = (after.userPositions || []).map((p: any) => p.publicKey);
     } catch (verifyErr: any) {
       console.warn("[CLOSE] post-close verification read failed:", verifyErr?.message || verifyErr);
+      // Could not verify: do not report a close that has not been proven (keeps the no-redeploy safety).
+      if (sigs.length === 0) remaining = userPositions.map((p: any) => p.publicKey);
     }
     if (remaining.length > 0) {
       const keys = remaining.map((k) => k.toBase58()).join(", ");
       console.error(`[CLOSE] INCOMPLETE — still open: ${keys}`);
       await notify(
-        `⚠️ <b>[CLOSE INCOMPLETE]</b> ${remaining.length} position(s) still open after close attempt: <code>${keys}</code>. ` +
-          `Keeping it tracked; no redeploy on top of it. Check Railway logs.`
+        `⚠️ <b>[CLOSE INCOMPLETE]</b> ${remaining.length} position(s) still open after ${maxAttempts} close attempt(s): <code>${keys}</code>.\n` +
+          (lastError ? `• Last error: <code>${escapeHtml(lastError.slice(0, 200))}</code>\n` : "") +
+          `• Keeping it tracked; no redeploy on top of it. Check Railway logs.`
       );
-      void emitLedger({ event: "ERROR", notes: `Close incomplete; still open: ${keys}`, is_estimate: true });
+      void emitLedger({
+        event: "ERROR",
+        notes: `Close incomplete after ${maxAttempts} attempt(s); still open: ${keys}${lastError ? `; last error: ${lastError.slice(0, 200)}` : ""}`,
+        is_estimate: true,
+      });
     }
 
     return {
@@ -2188,11 +2320,18 @@ async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResu
       usdcReceivedRaw: usdcReceived,
       feeLamports,
       isEstimate: !anyMeta,
+      attempts: maxAttempts,
+      lastError,
     };
   } catch (err: any) {
-    console.error("[CLOSE RECLAIM ERROR]:", err.message);
-    return empty;
+    console.error("[CLOSE RECLAIM ERROR]:", redactSecrets(String(err?.message || err)));
+    return { ...empty, lastError: redactSecrets(shortTxError(err)) };
   }
+}
+
+/** Short pause between the pre-close fee sweep and the close (RPC burst relief). */
+async function pauseAfterSweep(): Promise<void> {
+  if (CLOSE_AFTER_SWEEP_DELAY_MS > 0) await sleepMs(CLOSE_AFTER_SWEEP_DELAY_MS);
 }
 
 /**
@@ -2251,7 +2390,7 @@ async function topUpExistingPosition(dlmmPool: DLMM): Promise<void> {
         const unwrapTx = new Transaction().add(
           createCloseAccountInstruction(botWsolAta, wallet.publicKey, wallet.publicKey)
         );
-        await sendAndConfirmTransaction(connection, unwrapTx, [wallet]);
+        await sendTx(unwrapTx, [wallet], "WSOL unwrap");
       }
     } catch {}
 
@@ -2331,9 +2470,9 @@ async function topUpExistingPosition(dlmmPool: DLMM): Promise<void> {
       },
     });
     if (Array.isArray(addTx)) {
-      for (const tx of addTx) addSigs.push(await sendAndConfirmTransaction(connection, tx, [wallet]));
+      for (const tx of addTx) addSigs.push(await sendTx(tx, [wallet], "top-up"));
     } else if (addTx) {
-      addSigs.push(await sendAndConfirmTransaction(connection, addTx, [wallet]));
+      addSigs.push(await sendTx(addTx, [wallet], "top-up"));
     }
     const postAdd = await snapshotWalletBalances();
 
@@ -2411,7 +2550,7 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
         const unwrapTx = new Transaction().add(
           createCloseAccountInstruction(botWsolAta, wallet.publicKey, wallet.publicKey)
         );
-        await sendAndConfirmTransaction(connection, unwrapTx, [wallet]);
+        await sendTx(unwrapTx, [wallet], "WSOL unwrap");
         console.log(`[WSOL] Unwrapped ${(Number(wsolAcc.amount) / 1e9).toFixed(4)} WSOL to native SOL.`);
       }
     } catch {}
@@ -2502,10 +2641,10 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
 
     if (Array.isArray(createPositionTx)) {
       for (const tx of createPositionTx) {
-        deploySigs.push(await sendAndConfirmTransaction(connection, tx, [wallet, newPositionKeypair]));
+        deploySigs.push(await sendTx(tx, [wallet, newPositionKeypair], "deploy"));
       }
     } else {
-      deploySigs.push(await sendAndConfirmTransaction(connection, createPositionTx, [wallet, newPositionKeypair]));
+      deploySigs.push(await sendTx(createPositionTx, [wallet, newPositionKeypair], "deploy"));
     }
     const postDeploy = await snapshotWalletBalances();
 
@@ -2659,7 +2798,8 @@ async function withdrawPartial(dlmmPool: DLMM, pct: number): Promise<void> {
       shouldClaimAndClose: false,
     });
     const sigs: string[] = [];
-    for (const tx of Array.isArray(txs) ? txs : [txs]) sigs.push(await sendAndConfirmTransaction(connection, tx, [wallet]));
+    // Never auto-retried: a resent partial withdraw would take N% of what is left a second time.
+    for (const tx of Array.isArray(txs) ? txs : [txs]) sigs.push(await sendTx(tx, [wallet], "partial withdraw"));
     const post = await snapshotWalletBalances();
     const activeBin = await dlmmPool.getActiveBin();
     const spot = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
@@ -2966,6 +3106,7 @@ async function executeFullEmergencyExit(dlmmPool: DLMM) {
 
   if (activePositionPubkey) {
     await sweepRevenueToVault(dlmmPool);
+    await pauseAfterSweep();
   }
   const exitClose = await closePositionAndReclaim(dlmmPool);
   if (!exitClose.ok) {
@@ -3821,6 +3962,7 @@ async function runKeeper() {
             } catch (sweepErr: any) {
               console.warn("Pre-close fee sweep note:", sweepErr.message);
             }
+            await pauseAfterSweep();
           }
 
           if (dlmmPoolInstance) {
@@ -3830,7 +3972,9 @@ async function runKeeper() {
               // instead of reporting a liquidation that did not happen.
               await reattachAfterFailedClose(dlmmPoolInstance, cbClose, targetPos);
               inCooldownUntil = Math.floor(Date.now() / 1000) + 120;
-              await notify("🚨 <b>[CIRCUIT BREAKER INCOMPLETE]</b> Close failed — position still open; retrying the stop in ~2 min.");
+              await notify(
+                `🚨 <b>[CIRCUIT BREAKER INCOMPLETE]</b> Close failed after ${cbClose.attempts} attempt(s) — position still open; retrying the stop in ~2 min.`
+              );
               return;
             }
           }
@@ -3926,10 +4070,19 @@ async function runKeeper() {
           } catch (sweepErr: any) {
             console.warn("Below-range fee sweep note:", sweepErr.message);
           }
+          await pauseAfterSweep();
           const recClose = await closePositionAndReclaim(dlmmPoolInstance!);
           if (!recClose.ok) {
             await reattachAfterFailedClose(dlmmPoolInstance!, recClose, activePositionPubkey);
-            lastRecenterAt = now; // retry after RECENTER_COOLDOWN_SEC, never deploy on top of an open position
+            // Never deploy on top of an open position. Retry the recenter after a short cooldown
+            // (RECENTER_FAIL_RETRY_SEC, default 3 min) instead of the full RECENTER_COOLDOWN_SEC; it still
+            // needs BELOW_RANGE_TICKS fresh below-range ticks (re-attach resets the counter).
+            const nowAfter = Math.floor(Date.now() / 1000);
+            lastRecenterAt = recenterRetryAnchor(nowAfter, RECENTER_COOLDOWN_SEC, RECENTER_FAIL_RETRY_SEC);
+            await notify(
+              `↩️ <b>[RECENTER INCOMPLETE]</b> Close failed after ${recClose.attempts} attempt(s); position re-attached, nothing redeployed. ` +
+                `Retrying the recenter in ~${Math.round(Math.min(RECENTER_FAIL_RETRY_SEC, RECENTER_COOLDOWN_SEC) / 60)} min if still below range.`
+            );
             return;
           }
           activePositionPubkey = null;
@@ -3958,10 +4111,12 @@ async function runKeeper() {
         await notify(`🎯 <b>[TAKE-PROFIT]</b> Price ($${currentPrice.toFixed(2)}) cleared upper bins! Sweeping fees and unwinding...`);
         
         await sweepRevenueToVault(dlmmPoolInstance!);
+        await pauseAfterSweep();
         const tpClose = await closePositionAndReclaim(dlmmPoolInstance!);
         if (!tpClose.ok) {
           await reattachAfterFailedClose(dlmmPoolInstance!, tpClose, activePositionPubkey);
-          lastRecenterAt = now; // retry after RECENTER_COOLDOWN_SEC
+          // Retry after RECENTER_FAIL_RETRY_SEC (short) rather than the full RECENTER_COOLDOWN_SEC.
+          lastRecenterAt = recenterRetryAnchor(Math.floor(Date.now() / 1000), RECENTER_COOLDOWN_SEC, RECENTER_FAIL_RETRY_SEC);
           return;
         }
         

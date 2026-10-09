@@ -121,6 +121,14 @@ On restart the bot re-anchors entry (and therefore both stops) to the live spot/
 - Error text sent to Telegram / the sheet is scrubbed of URLs and keys (RPC errors can embed the RPC URL).
 - Ledger `realized_pnl_usd` (TAKE_PROFIT / CIRCUIT_BREAKER / EMERGENCY_EXIT) is per position cycle: exit equity + fees swept since entry − entry equity. `unrealized_pnl_usd` (SNAPSHOT) adds back fees swept since entry. Rows also carry `capital_baseline_usd`, `cumulative_swept_usd` and `total_pnl_usd` (ignored by the v2.1 Apps Script, which only writes its fixed columns).
 
+### Transaction sends and close retries
+
+- Every bot transaction (claims, sweeps, closes, withdrawals, deploys, top-ups) is signed with a **fresh `confirmed` blockhash**, sent with preflight on, and confirmed by blockhash + `lastValidBlockHeight`; an ambiguous confirm is resolved from chain (landed / expired unseen / unknown).
+- Position closes (withdraw 100% + claim + close) retry up to `CLOSE_MAX_ATTEMPTS` (4) with exponential backoff + jitter (`CLOSE_RETRY_BASE_MS` 2 s → 4 s → 8 s, capped at `CLOSE_RETRY_MAX_MS` 16 s) on transient errors (blockhash not found / expired, 429, timeouts, network). Program errors are not retried. Before every attempt the position account is re-read: if it is already closed (an earlier attempt landed) the close counts as done and nothing is resent; each retry is rebuilt from the current on-chain position.
+- The pre-close fee claim retries (`CLAIM_MAX_ATTEMPTS`, 3) only when the previous attempt provably did not land. `/withdraw_pct` is never auto-retried.
+- `CLOSE_AFTER_SWEEP_DELAY_MS` (1.5 s) spaces the pre-close fee sweep and the close.
+- If every attempt fails: **CLOSE INCOMPLETE** Telegram alert (attempt count + last error, scrubbed), one `ERROR` ledger row (no `CLOSE` row for failed attempts), the bot re-attaches to the still-open position and never redeploys on top of it. A failed recenter / take-profit is retried after `RECENTER_FAIL_RETRY_SEC` (180 s, never longer than `RECENTER_COOLDOWN_SEC`) once `BELOW_RANGE_TICKS` fresh ticks confirm it; a failed circuit-breaker close is retried after ~2 min.
+
 ## Deploy on Railway
 
 1. Create a service from this repo (worker / no public HTTP needed).
