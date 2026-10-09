@@ -44,8 +44,35 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID?.trim() || "";
 const GOOGLE_SHEET_WEBHOOK_URL = process.env.GOOGLE_SHEET_WEBHOOK_URL?.trim() || "";
 // Required: fee harvest destination. Fail fast — silent sweeps to a wrong/missing vault are worse.
 const REVENUE_WALLET_PUBKEY = requireEnv("REVENUE_WALLET_PUBKEY");
-// Optional startup baseline override (USD). If unset, computed from wallet equity after pool init.
-const BASELINE_USD_ENV = process.env.BASELINE_USD?.trim() || "";
+// ---- Capital baseline for P&L reporting (NOT used by any stop / trading decision) ----
+// The baseline is capital CONTRIBUTED to the LP wallet. Internal moves (top-ups, deploys,
+// recenters, swaps, wrap/unwrap, closes) never change it. Fee sweeps to the revenue wallet
+// are tracked separately and added back, so they never show up as a loss.
+//   P&L = live equity + swept to revenue − (STARTING_CAPITAL_USD + NET_DEPOSITS_USD)
+// STARTING_CAPITAL_USD: authoritative starting capital (USD). BASELINE_USD is a legacy alias.
+// If neither is set, falls back to mark-to-market equity at boot (P&L is then "since boot").
+function parseOptionalUsd(key: string, allowNegative = false): number | null {
+  const raw = process.env[key]?.trim();
+  if (!raw) return null;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || (!allowNegative && n < 0)) {
+    console.warn(`[CONFIG] Ignoring invalid ${key}=${JSON.stringify(raw)} (expected a ${allowNegative ? "" : "non-negative "}number)`);
+    return null;
+  }
+  return n;
+}
+const STARTING_CAPITAL_USD_ENV = (() => {
+  const v = parseOptionalUsd("STARTING_CAPITAL_USD");
+  if (v != null && v > 0) return v;
+  const legacy = parseOptionalUsd("BASELINE_USD");
+  return legacy != null && legacy > 0 ? legacy : null;
+})();
+// Net external capital flows AFTER the starting capital: deposits − withdrawals (may be negative).
+// Fee sweeps to REVENUE_WALLET_PUBKEY are NOT withdrawals — do not include them here.
+const NET_DEPOSITS_USD = parseOptionalUsd("NET_DEPOSITS_USD", true) ?? 0;
+// USD already swept to the revenue wallet BEFORE this process started (sweeps are counted
+// in-process from 0 on every boot). Only applied when STARTING_CAPITAL_USD/BASELINE_USD is set.
+const PRIOR_SWEPT_USD = parseOptionalUsd("PRIOR_SWEPT_USD") ?? 0;
 
 // Public Meteora SOL-USDC ~10bps DLMM pool + well-known mints (safe to keep in source).
 const SOL_USDC_POOL = new PublicKey("BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y");
@@ -108,7 +135,14 @@ let isLiquidating = false;
 let isExiting = false;
 /** Prevents overlapping setInterval keeper ticks (async re-entrancy). */
 let keeperTickRunning = false;
-let deployedCapitalBaselineUsd = 0;
+/**
+ * Capital contributed (USD) — set ONCE at boot (env or boot equity). Reporting only:
+ * no stop, take-profit, recenter or sizing decision reads it. Never mutated by
+ * top-ups, deploys, recenters, swaps, closes, take-profit, circuit breaker or emergency exit.
+ */
+let capitalBaselineUsd = 0;
+/** "env" when STARTING_CAPITAL_USD/BASELINE_USD is set, else "boot-equity". */
+let capitalBaselineSource: "env" | "boot-equity" = "boot-equity";
 let lastExitPriceUsd = 0;
 /** Spot USD at position entry (deploy or attach). Hard price-stop is measured from this, not range bottom. */
 let entrySpotUsd = 0;
@@ -123,6 +157,8 @@ let lastSnapshotAt = 0;
 /** In-memory cumulative fees claimed (USD) this process lifetime — sheet is source of truth long-term. */
 let cumulativeFeesUsd = 0;
 let cumulativeSweptUsd = 0;
+/** USD swept to revenue since the current entry (reset with entry state). Used so per-cycle P&L isn't reduced by sweeps. */
+let sweptSinceEntryUsd = 0;
 let cumulativeGasSol = 0;
 
 // ==================== NOTIFICATIONS & LOGS ====================
@@ -587,16 +623,73 @@ function clearEntryState() {
   entrySpotUsd = 0;
   entryEquityUsd = 0;
   belowRangeTickCount = 0;
+  sweptSinceEntryUsd = 0;
 }
 
-async function recordEntryAfterOpen(dlmmPool: DLMM, spotUsd: number, note: string) {
+/**
+ * @param fallbackEquityUsd used only if the MTM probe throws (previously the per-deploy
+ *   baseline, i.e. the USD value just deposited — preserved so stop behavior is unchanged).
+ */
+async function recordEntryAfterOpen(dlmmPool: DLMM, spotUsd: number, note: string, fallbackEquityUsd: number) {
   entrySpotUsd = spotUsd;
+  sweptSinceEntryUsd = 0;
   try {
     entryEquityUsd = await getMarkToMarketEquityUsd(dlmmPool, spotUsd);
   } catch {
-    entryEquityUsd = deployedCapitalBaselineUsd || 0;
+    entryEquityUsd = fallbackEquityUsd || 0;
   }
   console.log(`[ENTRY] ${note} spot=$${entrySpotUsd.toFixed(2)} equity=$${entryEquityUsd.toFixed(2)}`);
+}
+
+// ==================== CAPITAL BASELINE / P&L (reporting only) ====================
+/** Swept to revenue that counts toward P&L vs the capital baseline. */
+function sweptForPnlUsd(): number {
+  // Prior sweeps only make sense against an env (true starting capital) baseline;
+  // a boot-equity baseline already excludes everything swept before boot.
+  return (capitalBaselineSource === "env" ? PRIOR_SWEPT_USD : 0) + cumulativeSweptUsd;
+}
+
+/** Net P&L vs contributed capital: equity + swept to revenue − baseline. */
+function totalPnlUsd(equityUsd: number): number {
+  return Number((equityUsd + sweptForPnlUsd() - capitalBaselineUsd).toFixed(2));
+}
+
+function fmtSignedUsd(v: number): string {
+  return `${v >= 0 ? "+" : "-"}$${Math.abs(v).toFixed(2)}`;
+}
+
+function fmtPct(num: number, den: number): string {
+  if (!(den > 0)) return "n/a";
+  const p = (num / den) * 100;
+  return `${p >= 0 ? "+" : ""}${p.toFixed(2)}%`;
+}
+
+function capitalBaselineLabel(): string {
+  if (capitalBaselineSource === "env") {
+    const parts = [`starting $${(capitalBaselineUsd - NET_DEPOSITS_USD).toFixed(2)}`];
+    if (NET_DEPOSITS_USD !== 0) parts.push(`net deposits ${fmtSignedUsd(NET_DEPOSITS_USD)}`);
+    return `$${capitalBaselineUsd.toFixed(2)} (${parts.join(", ")})`;
+  }
+  return `$${capitalBaselineUsd.toFixed(2)} (equity at boot — set STARTING_CAPITAL_USD for true PnL)`;
+}
+
+/**
+ * Per-position-cycle realized P&L: exit equity + fees swept since entry − entry equity.
+ * Top-ups are equity-neutral, so they do not distort this.
+ */
+function cycleRealizedPnlUsd(exitEquityUsd: number, entryEqUsd: number, sweptDuringCycleUsd: number): number | null {
+  if (!(entryEqUsd > 0)) return null;
+  return Number((exitEquityUsd + sweptDuringCycleUsd - entryEqUsd).toFixed(2));
+}
+
+/** Common P&L fields for ledger rows (extra keys are ignored by the v2.1 Apps Script). */
+function pnlLedgerExtras(equityUsd: number | null): Record<string, number | string | undefined> {
+  return {
+    capital_baseline_usd: capitalBaselineUsd || undefined,
+    capital_baseline_source: capitalBaselineSource,
+    cumulative_swept_usd: Number(sweptForPnlUsd().toFixed(2)),
+    total_pnl_usd: equityUsd != null && capitalBaselineUsd > 0 ? totalPnlUsd(equityUsd) : undefined,
+  };
 }
 
 
@@ -1054,6 +1147,7 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
       const feeSol = sweepMeta.feeLamports != null ? sweepMeta.feeLamports / 1e9 : await getTxFeeSol(sig);
       cumulativeFeesUsd += sweptUsdFinal;
       cumulativeSweptUsd += sweptUsdFinal;
+      sweptSinceEntryUsd += sweptUsdFinal;
       if (feeSol != null) cumulativeGasSol += feeSol;
       await emitLedger({
         event: "FEE_SWEEP",
@@ -1310,7 +1404,8 @@ async function topUpExistingPosition(dlmmPool: DLMM): Promise<void> {
 
     lastTopupAt = now;
     const addedUsd = (depositedSol / 1e9) * spotPriceUsd + depositedUsdc / 1e6;
-    deployedCapitalBaselineUsd = Number((deployedCapitalBaselineUsd + addedUsd).toFixed(2));
+    // Wallet → position move is equity-neutral: capitalBaselineUsd and entryEquityUsd are
+    // intentionally NOT changed (those funds were already counted in equity).
     await notify(
       `➕ <b>[TOP-UP]</b> Added ~$${addedUsd.toFixed(2)} idle capital to <code>${activePositionPubkey.toBase58()}</code>\n` +
       `• SOL: ${(depositedSol / 1e9).toFixed(4)} | USDC: $${(depositedUsdc / 1e6).toFixed(2)}`
@@ -1500,15 +1595,20 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     const deployedSolValueUsd = (depositedSol / 1e9) * spotPriceUsd;
     const deployedUsdcValueUsd = depositedUsdc / 1e6;
     // Fall back to intended amounts if deltas look empty (shouldn't happen)
-    const baselineFallback = (usableSolLamports / 1e9) * spotPriceUsd + usableUsdcRaw / 1e6;
-    deployedCapitalBaselineUsd = Number(
-      ((depositedSol > 0 || depositedUsdc > 0) ? deployedSolValueUsd + deployedUsdcValueUsd : baselineFallback).toFixed(2)
+    const intendedDeployUsd = (usableSolLamports / 1e9) * spotPriceUsd + usableUsdcRaw / 1e6;
+    // USD moved wallet → position by THIS deploy. Internal move: does NOT touch capitalBaselineUsd.
+    const deployedValueUsd = Number(
+      ((depositedSol > 0 || depositedUsdc > 0) ? deployedSolValueUsd + deployedUsdcValueUsd : intendedDeployUsd).toFixed(2)
     );
     if (entrySpotUsd > 0) {
       console.log(`[ENTRY] Recenter deploy: keeping original entry spot=$${entrySpotUsd.toFixed(2)} equity=$${entryEquityUsd.toFixed(2)}`);
     } else {
-      await recordEntryAfterOpen(dlmmPool, spotPriceUsd, "deploy");
+      await recordEntryAfterOpen(dlmmPool, spotPriceUsd, "deploy", deployedValueUsd);
     }
+    let postDeployEquityUsd: number | null = null;
+    try {
+      postDeployEquityUsd = await getMarkToMarketEquityUsd(dlmmPool, spotPriceUsd);
+    } catch {}
 
     const allSigs = [swapSig, ...deploySigs].filter(Boolean).join(",") || "ON-CHAIN";
     await notify(
@@ -1517,14 +1617,17 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
       `• Spot / Entry: $${spotPriceUsd.toFixed(2)}\n` +
       `• Range: $${lowestBinPrice.toFixed(2)} ➔ $${highestBinPrice.toFixed(2)}\n` +
       `• Floor Stop: ${formatFloorStopLine(config.floorStopPct)}\n` +
-      `• Baseline Capital: <b>$${deployedCapitalBaselineUsd.toFixed(2)} USDC</b>`
+      `• Deployed: <b>$${deployedValueUsd.toFixed(2)}</b>` +
+      (postDeployEquityUsd != null ? ` | Equity: $${postDeployEquityUsd.toFixed(2)}` : "") + `\n` +
+      `• Capital Baseline: ${capitalBaselineLabel()}`
     );
     await emitLedger({
       event: "DEPLOY",
       regime: config.regime,
       spot_usd: spotPriceUsd,
-      position_value_usd: deployedCapitalBaselineUsd,
-      total_equity_usd: deployedCapitalBaselineUsd,
+      position_value_usd: deployedValueUsd,
+      total_equity_usd: postDeployEquityUsd ?? deployedValueUsd,
+      ...pnlLedgerExtras(postDeployEquityUsd),
       gas_fee_sol: deployFee > 0 ? deployFee / 1e9 : undefined,
       tx_sig: allSigs,
       notes: `Grid deployed (${config.regime}) DEPLOY_PCT=${DEPLOY_PCT} SOL=${(depositedSol / 1e9).toFixed(6)} USDC=${(depositedUsdc / 1e6).toFixed(6)}`,
@@ -1579,8 +1682,9 @@ async function executeFullEmergencyExit(dlmmPool: DLMM) {
     postLiquidationUsdc = Number(accAfter.amount) / 1e6;
   } catch {}
 
-  const realizedDrawdownUsd = Number((postLiquidationUsdc - deployedCapitalBaselineUsd).toFixed(2));
-  const pnlSign = realizedDrawdownUsd >= 0 ? "+$" : "-$";
+  // Capture cycle entry BEFORE clearing entry state (per-cycle realized P&L).
+  const cycleEntryEquityUsd = entryEquityUsd;
+  const cycleSweptUsd = sweptSinceEntryUsd;
 
   activePositionPubkey = null;
   lowestBinPrice = 0;
@@ -1591,21 +1695,34 @@ async function executeFullEmergencyExit(dlmmPool: DLMM) {
   const activeBin = await dlmmPool.getActiveBin();
   lastExitPriceUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
 
+  // Exit equity = full wallet (USDC + SOL gas reserve), same basis as entry equity.
+  let exitEquityUsd = postLiquidationUsdc;
+  try {
+    exitEquityUsd = Number((await getWalletLiquidEquityUsd(lastExitPriceUsd)).totalUsd.toFixed(2));
+  } catch {}
+  const cyclePnl = cycleRealizedPnlUsd(exitEquityUsd, cycleEntryEquityUsd, cycleSweptUsd);
+  const totalPnl = totalPnlUsd(exitEquityUsd);
+  const cyclePnlText = cyclePnl != null
+    ? `${fmtSignedUsd(cyclePnl)} (${fmtPct(cyclePnl, cycleEntryEquityUsd)} vs entry equity $${cycleEntryEquityUsd.toFixed(2)})`
+    : "n/a (no entry recorded)";
+
   await notify(
     `🛡️ <b>[EMERGENCY EXIT COMPLETE]</b> Bot is paused. Funds held in USDC.\n` +
-    `• Recovered: $${postLiquidationUsdc.toFixed(2)}\n` +
-    `• Net PnL: ${pnlSign}${Math.abs(realizedDrawdownUsd).toFixed(2)}\n` +
+    `• Recovered: $${postLiquidationUsdc.toFixed(2)} USDC (equity $${exitEquityUsd.toFixed(2)})\n` +
+    `• Cycle PnL: ${cyclePnlText}\n` +
+    `• Net PnL vs capital: ${fmtSignedUsd(totalPnl)} (${fmtPct(totalPnl, capitalBaselineUsd)} of ${capitalBaselineLabel()}, incl. $${sweptForPnlUsd().toFixed(2)} swept)\n` +
     `• Tx: <code>${swapSig || "N/A"}</code>`
   );
   await emitLedger({
     event: "EMERGENCY_EXIT",
-    realized_pnl_usd: realizedDrawdownUsd,
+    realized_pnl_usd: cyclePnl ?? undefined,
+    total_equity_usd: exitEquityUsd,
+    entry_equity: cycleEntryEquityUsd || undefined,
+    ...pnlLedgerExtras(exitEquityUsd),
     tx_sig: swapSig || "N/A",
-    notes: `Manual Emergency Exit. Net PnL: ${pnlSign}${Math.abs(realizedDrawdownUsd).toFixed(2)}`,
+    notes: `Manual Emergency Exit. Cycle PnL: ${cyclePnlText}. Net PnL vs capital: ${fmtSignedUsd(totalPnl)}`,
     is_estimate: false,
   });
-  
-  deployedCapitalBaselineUsd = postLiquidationUsdc;
   } finally {
     isExiting = false;
     isLiquidating = false;
@@ -1686,7 +1803,8 @@ async function listenTelegramCommands() {
             `• <b>Address:</b> <code>${wallet.publicKey.toBase58()}</code>\n` +
             `• <b>Liquid SOL:</b> ${solBal} SOL\n` +
             `• <b>Liquid USDC:</b> $${usdcBal} USDC\n` +
-            `• <b>Tracked Baseline:</b> $${deployedCapitalBaselineUsd.toFixed(2)} USDC\n` +
+            `• <b>Capital Baseline:</b> ${capitalBaselineLabel()}\n` +
+            `• <b>Swept to Revenue (counted in PnL):</b> $${sweptForPnlUsd().toFixed(2)}\n` +
             `• <b>Bot State:</b> ${isBotPaused ? "⏸️ PAUSED" : "🟢 ACTIVE"}\n` +
             `• <b>Gas Buffer:</b> ${gasBufferLabel(rawSolBal)}`;
           await notify(balMsg);
@@ -1774,13 +1892,21 @@ async function listenTelegramCommands() {
               `  • <b>Gate 4 (Execution):</b> ${g4Status}`;
           }
 
+          let statusEquityUsd: number | null = null;
+          try {
+            statusEquityUsd = await getMarkToMarketEquityUsd(dlmmPoolInstance, currentPrice);
+          } catch {}
+          const statusPnl = statusEquityUsd != null ? totalPnlUsd(statusEquityUsd) : null;
+
           const statusMsg =
             `📊 <b>DLMM Keeper Status</b>\n\n` +
             `• <b>Regime:</b> <code>${config.regime}</code>\n` +
             `• <b>Spot:</b> $${currentPrice.toFixed(2)}\n` +
             `• <b>Exact On-Chain Range:</b> ${rangeDisplay}\n` +
             `• <b>Floor Stop:</b> ${stopDisplay}\n` +
-            `• <b>Tracked Baseline:</b> $${deployedCapitalBaselineUsd.toFixed(2)}\n` +
+            `• <b>Equity (MTM):</b> ${statusEquityUsd != null ? `$${statusEquityUsd.toFixed(2)}` : "n/a"}\n` +
+            `• <b>Capital Baseline:</b> ${capitalBaselineLabel()}\n` +
+            `• <b>Net PnL:</b> ${statusPnl != null ? `${fmtSignedUsd(statusPnl)} (${fmtPct(statusPnl, capitalBaselineUsd)}, incl. $${sweptForPnlUsd().toFixed(2)} swept)` : "n/a"}\n` +
             `• <b>Position NFT:</b> <code>${activePositionPubkey ? activePositionPubkey.toBase58() : "None (Holding Cash)"}</code>\n\n` +
             `${gateTelemetry}`;
           await notify(statusMsg);
@@ -1816,24 +1942,34 @@ async function runKeeper() {
   void emitLedger({ event: "BOOT", notes: "Keeper process started", is_estimate: true });
   dlmmPoolInstance = await DLMM.create(connection, SOL_USDC_POOL);
 
-  // Baseline: BASELINE_USD env, else live wallet equity (USDC + native SOL + WSOL ATA)*spot.
+  // Capital baseline (reporting only — never read by stops/TP/recenter/sizing), set ONCE here:
+  // STARTING_CAPITAL_USD (+ NET_DEPOSITS_USD), else full MTM equity at boot (position + wallet).
+  // Recomputed from scratch on every boot, so restarts can never accumulate/double it.
+  let bootEquityUsd: number | null = null;
   try {
-    if (BASELINE_USD_ENV && Number(BASELINE_USD_ENV) > 0) {
-      deployedCapitalBaselineUsd = Number(BASELINE_USD_ENV);
-    } else {
-      const activeBin = await dlmmPoolInstance.getActiveBin();
-      const spotUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
-      // Include open position inventory so boot baseline isn't understated while LPing.
-      deployedCapitalBaselineUsd = await getMarkToMarketEquityUsd(dlmmPoolInstance, spotUsd);
-    }
+    const activeBin = await dlmmPoolInstance.getActiveBin();
+    const spotUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
+    // Include open position inventory so boot equity isn't understated while LPing.
+    bootEquityUsd = await getMarkToMarketEquityUsd(dlmmPoolInstance, spotUsd);
   } catch (err: any) {
     console.warn("[BASELINE] Equity probe failed:", err?.message || err);
-    if (BASELINE_USD_ENV && Number(BASELINE_USD_ENV) > 0) {
-      deployedCapitalBaselineUsd = Number(BASELINE_USD_ENV);
-    } else {
-      throw new Error("Unable to derive startup baseline. Set BASELINE_USD or ensure RPC + USDC ATA are reachable.");
-    }
   }
+  if (STARTING_CAPITAL_USD_ENV != null) {
+    capitalBaselineUsd = Number((STARTING_CAPITAL_USD_ENV + NET_DEPOSITS_USD).toFixed(2));
+    capitalBaselineSource = "env";
+  } else if (bootEquityUsd != null) {
+    capitalBaselineUsd = bootEquityUsd;
+    capitalBaselineSource = "boot-equity";
+    if (NET_DEPOSITS_USD !== 0 || PRIOR_SWEPT_USD !== 0) {
+      console.warn("[BASELINE] NET_DEPOSITS_USD / PRIOR_SWEPT_USD ignored: STARTING_CAPITAL_USD unset (boot equity already reflects them).");
+    }
+  } else {
+    throw new Error("Unable to derive startup baseline. Set STARTING_CAPITAL_USD or ensure RPC + USDC ATA are reachable.");
+  }
+  console.log(
+    `[BASELINE] Capital baseline ${capitalBaselineLabel()}` +
+      (bootEquityUsd != null ? ` | boot equity $${bootEquityUsd.toFixed(2)} | net P&L ${fmtSignedUsd(totalPnlUsd(bootEquityUsd))}` : "")
+  );
 
   listenTelegramCommands().catch((e) => console.error("Command listener error:", e));
 
@@ -1876,15 +2012,18 @@ async function runKeeper() {
       `• Spot: $${spotPriceUsd.toFixed(2)} (entry $${entrySpotUsd.toFixed(2)})\n` +
       `• Exact Range: $${lowestBinPrice.toFixed(2)} ➔ $${highestBinPrice.toFixed(2)}\n` +
       `• Floor Stop: ${formatFloorStopLine(config.floorStopPct)}\n` +
-      `• Baseline Capital: $${deployedCapitalBaselineUsd.toFixed(2)}`
+      `• Equity: ${bootEquityUsd != null ? `$${bootEquityUsd.toFixed(2)}` : "n/a"}\n` +
+      `• Capital Baseline: ${capitalBaselineLabel()}` +
+      (bootEquityUsd != null ? `\n• Net PnL: ${fmtSignedUsd(totalPnlUsd(bootEquityUsd))}` : "")
     );
     void emitLedger({
       event: "ATTACH",
       regime: config.regime,
       spot_usd: spotPriceUsd,
-      total_equity_usd: deployedCapitalBaselineUsd,
+      total_equity_usd: bootEquityUsd ?? entryEquityUsd,
       entry_spot: entrySpotUsd,
       entry_equity: entryEquityUsd,
+      ...pnlLedgerExtras(bootEquityUsd ?? entryEquityUsd),
       notes: `Attached to ${activePositionPubkey.toBase58()}`,
       is_estimate: false,
     });
@@ -1896,7 +2035,10 @@ async function runKeeper() {
     clearEntryState();
     const activeBin = await dlmmPoolInstance.getActiveBin();
     lastExitPriceUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR; // Anchor price to prevent premature Gate 3 bypass
-    await notify(`🟢 <b>[BOOTED IN 100% USDC]</b> Baseline: $${deployedCapitalBaselineUsd.toFixed(2)}. Standing by for Gate 1-3 clearance.`);
+    await notify(
+      `🟢 <b>[BOOTED IN 100% USDC]</b> Equity: ${bootEquityUsd != null ? `$${bootEquityUsd.toFixed(2)}` : "n/a"} | ` +
+      `Capital Baseline: ${capitalBaselineLabel()}. Standing by for Gate 1-3 clearance.`
+    );
   }
 
   // Master Strategy Polling Loop (Every 15s)
@@ -1932,7 +2074,8 @@ async function runKeeper() {
           const mtm = await getMarkToMarketEquityUsd(dlmmPoolInstance!, currentPrice);
           const walletEq = await getWalletLiquidEquityUsd(currentPrice);
           let posUsd = Math.max(0, mtm - walletEq.totalUsd);
-          const uPnL = entryEquityUsd > 0 ? mtm - entryEquityUsd : 0;
+          // Unrealized vs entry; fees swept since entry are added back (a sweep is not a loss).
+          const uPnL = entryEquityUsd > 0 ? Number((mtm + sweptSinceEntryUsd - entryEquityUsd).toFixed(2)) : 0;
           await emitLedger({
             event: "SNAPSHOT",
             regime: currentConfig.regime,
@@ -1942,7 +2085,8 @@ async function runKeeper() {
             total_equity_usd: mtm,
             unrealized_pnl_usd: uPnL,
             cumulative_fees_usd: cumulativeFeesUsd,
-            notes: "Periodic equity snapshot",
+            ...pnlLedgerExtras(mtm),
+            notes: `Periodic equity snapshot. Net PnL vs capital $${capitalBaselineUsd.toFixed(2)} (${capitalBaselineSource}): ${fmtSignedUsd(totalPnlUsd(mtm))}`,
             is_estimate: false,
           });
         } catch (snapErr: any) {
@@ -2046,18 +2190,24 @@ async function runKeeper() {
             postLiquidationUsdc = Number(accAfter.amount) / 1e6;
           } catch {}
 
-          const realizedDrawdownUsd = Number((postLiquidationUsdc - deployedCapitalBaselineUsd).toFixed(2));
-          const drawdownPct = deployedCapitalBaselineUsd > 0
-            ? ((realizedDrawdownUsd / deployedCapitalBaselineUsd) * 100).toFixed(2)
-            : "0.00";
+          // Exit equity = full wallet (USDC + SOL gas reserve), same basis as entry equity.
+          let exitEquityUsd = postLiquidationUsdc;
+          try {
+            exitEquityUsd = Number((await getWalletLiquidEquityUsd(currentPrice)).totalUsd.toFixed(2));
+          } catch {}
+          const cycleEntryEquityUsd = entryEquityUsd;
+          const cyclePnl = cycleRealizedPnlUsd(exitEquityUsd, cycleEntryEquityUsd, sweptSinceEntryUsd);
+          const drawdownPct = cyclePnl != null ? fmtPct(cyclePnl, cycleEntryEquityUsd) : "n/a";
+          const totalPnl = totalPnlUsd(exitEquityUsd);
 
           lastExitPriceUsd = currentPrice;
           clearEntryState();
 
           await notify(
             `🛡️ <b>[CIRCUIT BREAKER COMPLETE]</b>\n` +
-            `• Liquidated Balance: <b>$${postLiquidationUsdc.toFixed(2)} USDC</b>\n` +
-            `• Realized Drawdown: <b>-$${Math.abs(realizedDrawdownUsd).toFixed(2)} (${drawdownPct}%)</b>\n` +
+            `• Liquidated Balance: <b>$${postLiquidationUsdc.toFixed(2)} USDC</b> (equity $${exitEquityUsd.toFixed(2)})\n` +
+            `• Realized (cycle): <b>${cyclePnl != null ? fmtSignedUsd(cyclePnl) : "n/a"} (${drawdownPct} vs entry equity $${cycleEntryEquityUsd.toFixed(2)})</b>\n` +
+            `• Net PnL vs capital: ${fmtSignedUsd(totalPnl)} (${fmtPct(totalPnl, capitalBaselineUsd)})\n` +
             `• Cooldown: Locked for ${currentConfig.cooldownSec / 60} minutes\n` +
             `• Swap Tx: <code>${swapSig || "N/A"}</code>`
           );
@@ -2065,14 +2215,14 @@ async function runKeeper() {
           await emitLedger({
             event: "CIRCUIT_BREAKER",
             spot_usd: currentPrice,
-            realized_pnl_usd: realizedDrawdownUsd,
-            total_equity_usd: postLiquidationUsdc,
+            realized_pnl_usd: cyclePnl ?? undefined,
+            total_equity_usd: exitEquityUsd,
+            entry_equity: cycleEntryEquityUsd || undefined,
+            ...pnlLedgerExtras(exitEquityUsd),
             tx_sig: swapSig || "N/A",
-            notes: `Stop: ${stopReason}. Ending USDC: $${postLiquidationUsdc.toFixed(2)} (${drawdownPct}%)`,
+            notes: `Stop: ${stopReason}. Ending USDC: $${postLiquidationUsdc.toFixed(2)}, equity $${exitEquityUsd.toFixed(2)} (${drawdownPct} vs entry). Net PnL vs capital: ${fmtSignedUsd(totalPnl)}`,
             is_estimate: false,
           });
-
-          deployedCapitalBaselineUsd = postLiquidationUsdc;
         } finally {
           isLiquidating = false;
           isExiting = false;
@@ -2147,25 +2297,35 @@ async function runKeeper() {
           postTpUsdc = Number(acc.amount) / 1e6;
         } catch {}
 
-        const realizedGainUsd = Number((postTpUsdc - deployedCapitalBaselineUsd).toFixed(2));
-        const pnlSign = realizedGainUsd >= 0 ? "+$" : "-$";
-        const gainPct = deployedCapitalBaselineUsd > 0 ? ((realizedGainUsd / deployedCapitalBaselineUsd) * 100).toFixed(2) : "0.00";
+        // Exit equity = full wallet (USDC + SOL), same basis as entry equity.
+        let exitEquityUsd = postTpUsdc;
+        try {
+          exitEquityUsd = Number((await getWalletLiquidEquityUsd(currentPrice)).totalUsd.toFixed(2));
+        } catch {}
+        const cycleEntryEquityUsd = entryEquityUsd;
+        const cyclePnl = cycleRealizedPnlUsd(exitEquityUsd, cycleEntryEquityUsd, sweptSinceEntryUsd);
+        const gainPct = cyclePnl != null ? fmtPct(cyclePnl, cycleEntryEquityUsd) : "n/a";
+        const totalPnl = totalPnlUsd(exitEquityUsd);
         
         lastExitPriceUsd = currentPrice;
 
         await notify(
           `📈 <b>[REBALANCING GRID]</b>\n` +
-          `• Capital Returned: $${postTpUsdc.toFixed(2)}\n` +
-          `• Net PnL: ${pnlSign}${Math.abs(realizedGainUsd).toFixed(2)} (${realizedGainUsd >= 0 ? "+" : ""}${gainPct}%)\n` +
+          `• Capital Returned: $${postTpUsdc.toFixed(2)} USDC (equity $${exitEquityUsd.toFixed(2)})\n` +
+          `• Cycle PnL: ${cyclePnl != null ? fmtSignedUsd(cyclePnl) : "n/a"} (${gainPct} vs entry equity $${cycleEntryEquityUsd.toFixed(2)})\n` +
+          `• Net PnL vs capital: ${fmtSignedUsd(totalPnl)} (${fmtPct(totalPnl, capitalBaselineUsd)})\n` +
           `Recycling grid higher...`
         );
         
-        if (realizedGainUsd !== 0) {
+        if (cyclePnl != null) {
           await emitLedger({
             event: "TAKE_PROFIT",
             spot_usd: currentPrice,
-            realized_pnl_usd: realizedGainUsd,
-            notes: `Grid cleared upper bound at $${currentPrice.toFixed(2)}. Net PnL: ${pnlSign}${Math.abs(realizedGainUsd).toFixed(2)}`,
+            realized_pnl_usd: cyclePnl,
+            total_equity_usd: exitEquityUsd,
+            entry_equity: cycleEntryEquityUsd || undefined,
+            ...pnlLedgerExtras(exitEquityUsd),
+            notes: `Grid cleared upper bound at $${currentPrice.toFixed(2)}. Cycle PnL: ${fmtSignedUsd(cyclePnl)} (${gainPct}). Net PnL vs capital: ${fmtSignedUsd(totalPnl)}`,
             is_estimate: true,
           });
         }
