@@ -3,6 +3,10 @@
  *
  * Score = 50 + trend term (±25) + funding term (±25).
  *   trend:   25 × clamp((price / SMA200 − 1) / 10%, −1, 1)        (full ±25 at ≥10% above/below the 200-day mean)
+ *            SMA200 = mean of the last 200 CLOSED Hyperliquid SOL daily candles (UTC days; in-progress day
+ *            excluded; ≥150 closed days required), cached 6h. Fallback: CoinGecko daily (same definition),
+ *            then a cached SMA up to 24h old, else trend unknown → 0 (partial read; can't switch).
+ *            Price = latest HL 1h candle close (same feed as the direction term).
  *   funding: Hyperliquid SOL funding, 24h average of SETTLED hourly rates, annualized
  *            (hourly rate × 24 × 365 × 100). Fallback: HL predicted rate normalized by its interval.
  *            |APR| < 3%            → 0   (deadband: sign noise around zero never moves the score)
@@ -65,6 +69,13 @@ export const FUNDING_FULL_BULL_APR = 8;
 export const FUNDING_OVERHEATED_APR = 40;
 export const FUNDING_FULL_BEAR_APR = -10;
 export const FUNDING_WINDOW_HOURS = 24;
+export const SMA_DAYS = 200;
+export const SMA_MIN_DAYS = 150;
+export const SMA_CACHE_SEC = 6 * 3600;
+export const SMA_FALLBACK_CACHE_SEC = 3600;
+export const SMA_STALE_MAX_SEC = 24 * 3600;
+export const SMA_HL_RETRY_SEC = 900;
+export const SMA_CG_RETRY_SEC = 1800;
 export const DIRECTION_MAX_POINTS = 20;
 export const DIRECTION_FULL_EMA_GAP = 0.015;
 export const DIRECTION_FULL_MOM4H = 0.015;
@@ -127,6 +138,9 @@ export interface MarketInputs {
   solPrice: number;
   sma200: number;
   smaPoints: number;
+  /** False when the SMA or the price is unavailable → trend term 0 and the read is partial. */
+  trendKnown?: boolean;
+  smaSource?: string;
   funding: FundingReading;
   direction: DirectionReading;
 }
@@ -135,15 +149,36 @@ export function annualizeFunding(rate: number, intervalHours: number): number {
   return rate * (24 / intervalHours) * 365 * 100;
 }
 
-/** CoinGecko market_chart (daily, 200d) → current price + mean of all points. null if unusable. */
+/**
+ * CoinGecko market_chart (daily) → live price (last point) + mean of the last 200 daily points before it
+ * (same "closed days only" definition as the Hyperliquid SMA). null if unusable.
+ */
 export function smaFromCoinGecko(data: any): { solPrice: number; sma200: number; smaPoints: number } | null {
   const raw = data?.prices;
-  if (!Array.isArray(raw) || raw.length < 150) return null;
+  if (!Array.isArray(raw) || raw.length < SMA_MIN_DAYS + 1) return null;
   const prices = raw.map((p: any) => Number(Array.isArray(p) ? p[1] : NaN));
   if (prices.some((p: number) => !Number.isFinite(p) || p <= 0)) return null;
   const solPrice = prices[prices.length - 1];
-  const sma200 = prices.reduce((a: number, b: number) => a + b, 0) / prices.length;
-  return { solPrice, sma200, smaPoints: prices.length };
+  const closed = prices.slice(0, -1).slice(-SMA_DAYS);
+  const sma200 = closed.reduce((a: number, b: number) => a + b, 0) / closed.length;
+  return { solPrice, sma200, smaPoints: closed.length };
+}
+
+/**
+ * Hyperliquid candleSnapshot (1d) → mean of the last 200 CLOSED daily closes (candle end T < now; the
+ * in-progress UTC day is excluded). Requires ≥150 closed days and a close within the last 48h.
+ */
+export function smaFromDailyCandles(rows: any, nowMs: number): { sma200: number; smaPoints: number; lastClose: number } | null {
+  if (!Array.isArray(rows)) return null;
+  const closed = rows
+    .map((r: any) => ({ t: Number(r?.t), T: Number(r?.T), close: Number(r?.c) }))
+    .filter((r: any) => Number.isFinite(r.t) && Number.isFinite(r.T) && r.close > 0 && r.T < nowMs)
+    .sort((a: any, b: any) => a.t - b.t);
+  if (closed.length < SMA_MIN_DAYS) return null;
+  if (nowMs - closed[closed.length - 1].T > 48 * 3600 * 1000) return null;
+  const win = closed.slice(-SMA_DAYS);
+  const sma200 = win.reduce((a: number, r: any) => a + r.close, 0) / win.length;
+  return { sma200, smaPoints: win.length, lastClose: closed[closed.length - 1].close };
 }
 
 /** Hyperliquid fundingHistory rows (hourly, settled) → 24h average. null if too few valid samples. */
@@ -274,7 +309,7 @@ export interface ScoreParts {
 }
 
 export function scoreInputs(inp: MarketInputs): ScoreParts {
-  const trendPts = trendPoints(inp.solPrice, inp.sma200);
+  const trendPts = inp.trendKnown === false ? 0 : trendPoints(inp.solPrice, inp.sma200);
   const fundingPts = fundingPoints(inp.funding);
   const dirPts = directionPoints(inp.direction ?? UNKNOWN_DIRECTION);
   const longScore = 50 + trendPts + fundingPts;
@@ -322,6 +357,9 @@ export interface RegimeConfig extends RegimeProfile {
   details: {
     solPrice: number;
     sma200: number;
+    smaSource: string;
+    smaPoints: number;
+    trendKnown: boolean;
     fundingAnnual: number;
     fundingRawRate: number;
     fundingIntervalHours: number;
@@ -341,7 +379,10 @@ export interface RegimeConfig extends RegimeProfile {
 }
 
 export interface RegimeFetchers {
+  /** Secondary SMA source (fallback only). */
   fetchCoinGecko(): Promise<any>;
+  /** Hyperliquid candleSnapshot rows (1d) between startMs and endMs — primary SMA source. */
+  fetchDailyCandles(startMs: number, endMs: number): Promise<any>;
   fetchFundingHistory(startTimeMs: number): Promise<any>;
   fetchPredictedFundings(): Promise<any>;
   /** Hyperliquid candleSnapshot rows (1h) between startMs and endMs. */
@@ -389,6 +430,11 @@ export class RegimeSentinel {
   private inflight: Promise<RegimeConfig> | null = null;
   private lastLogAt = 0;
   private lastLogKey = "";
+  private smaCache: { sma200: number; smaPoints: number; source: string; at: number; validSec: number } | null = null;
+  private smaNextHlAt = 0;
+  private smaNextCgAt = 0;
+  /** Last SMA-source error (for logs); cleared on success. */
+  private smaError = "";
 
   constructor(private fetchers: RegimeFetchers, opts: SentinelOptions = {}) {
     this.o = {
@@ -431,6 +477,9 @@ export class RegimeSentinel {
       details: {
         solPrice: g ? g.inputs.solPrice : NaN,
         sma200: g ? g.inputs.sma200 : NaN,
+        smaSource: g ? g.inputs.smaSource ?? "n/a" : "n/a",
+        smaPoints: g ? g.inputs.smaPoints : 0,
+        trendKnown: g ? g.inputs.trendKnown !== false : false,
         fundingAnnual: g ? g.inputs.funding.apr : NaN,
         fundingRawRate: g ? g.inputs.funding.rawRate : NaN,
         fundingIntervalHours: g ? g.inputs.funding.intervalHours : 1,
@@ -457,7 +506,9 @@ export class RegimeSentinel {
     const extra =
       c.source === "held" ? `, raw ${c.rawRegime} held` : c.source === "last-good" ? ", last good read" : c.source === "default" ? ", default" : "";
     const dir =
-      c.score == null ? "" : c.details.directionKnown ? `, dir ${fmtPts(c.details.dirPts)}` : ", dir unknown";
+      c.score == null
+        ? ""
+        : (c.details.directionKnown ? `, dir ${fmtPts(c.details.dirPts)}` : ", dir unknown") + (c.details.trendKnown ? "" : ", trend unknown");
     return `${c.regime} (score ${sc}${dir}${extra})`;
   }
 
@@ -472,16 +523,57 @@ export class RegimeSentinel {
     return this.inflight;
   }
 
+  /**
+   * 200-day SMA with its own cache (6h for Hyperliquid, 1h for the CoinGecko fallback) and per-source
+   * backoff (HL 15 min, CoinGecko 30 min) so a failing source is never hit on every tick or every eval.
+   */
+  private async getSma(nowSec: number): Promise<{ sma200: number; smaPoints: number; source: string } | null> {
+    const c = this.smaCache;
+    if (c && nowSec - c.at < c.validSec) return { sma200: c.sma200, smaPoints: c.smaPoints, source: c.source };
+    const nowMs = nowSec * 1000;
+    const errs: string[] = [];
+    if (nowSec >= this.smaNextHlAt) {
+      try {
+        const rows = await this.fetchers.fetchDailyCandles(nowMs - (SMA_DAYS + 30) * 86400 * 1000, nowMs);
+        const r = smaFromDailyCandles(rows, nowMs);
+        if (!r) throw new Error("fewer than 150 closed daily candles / stale");
+        this.smaCache = { sma200: r.sma200, smaPoints: r.smaPoints, source: `HL 1d closes (${r.smaPoints})`, at: nowSec, validSec: SMA_CACHE_SEC };
+        this.smaNextHlAt = nowSec + SMA_CACHE_SEC;
+        this.smaError = "";
+        return { sma200: r.sma200, smaPoints: r.smaPoints, source: this.smaCache.source };
+      } catch (e: any) {
+        this.smaNextHlAt = nowSec + SMA_HL_RETRY_SEC;
+        errs.push(`HL 1d: ${errMsg(e)}`);
+      }
+    }
+    if (nowSec >= this.smaNextCgAt) {
+      try {
+        const r = smaFromCoinGecko(await this.fetchers.fetchCoinGecko());
+        if (!r) throw new Error("unusable price series");
+        this.smaCache = { sma200: r.sma200, smaPoints: r.smaPoints, source: `CoinGecko fallback (${r.smaPoints})`, at: nowSec, validSec: SMA_FALLBACK_CACHE_SEC };
+        this.smaNextCgAt = nowSec + SMA_FALLBACK_CACHE_SEC;
+        this.smaError = errs.join("; ");
+        return { sma200: r.sma200, smaPoints: r.smaPoints, source: this.smaCache.source };
+      } catch (e: any) {
+        this.smaNextCgAt = nowSec + SMA_CG_RETRY_SEC;
+        errs.push(`CoinGecko: ${errMsg(e)}`);
+      }
+    }
+    if (errs.length) this.smaError = errs.join("; ");
+    if (c && nowSec - c.at < SMA_STALE_MAX_SEC) {
+      return { sma200: c.sma200, smaPoints: c.smaPoints, source: `${c.source}, cached ${((nowSec - c.at) / 3600).toFixed(1)}h` };
+    }
+    return null;
+  }
+
   private async fetchInputs(nowSec: number): Promise<MarketInputs> {
     const nowMs = nowSec * 1000;
-    const [cg, hist, candles] = await Promise.allSettled([
-      this.fetchers.fetchCoinGecko(),
+    const [smaRes, hist, candles] = await Promise.allSettled([
+      this.getSma(nowSec),
       this.fetchers.fetchFundingHistory(nowMs - (FUNDING_WINDOW_HOURS + 1) * 3600 * 1000),
       this.fetchers.fetchCandles(nowMs - DIRECTION_CANDLE_HOURS * 3600 * 1000, nowMs),
     ]);
-    if (cg.status !== "fulfilled") throw new Error(`CoinGecko: ${errMsg(cg.reason)}`);
-    const trend = smaFromCoinGecko(cg.value);
-    if (!trend) throw new Error("CoinGecko: unusable price series");
+    const sma = smaRes.status === "fulfilled" ? smaRes.value : null;
     let funding: FundingReading | null = hist.status === "fulfilled" ? fundingFromHistory(hist.value, nowMs) : null;
     if (!funding) {
       try {
@@ -491,7 +583,20 @@ export class RegimeSentinel {
       }
     }
     const direction = candles.status === "fulfilled" ? directionFromCandles(candles.value, nowMs) : null;
-    return { ...trend, funding: funding ?? UNKNOWN_FUNDING, direction: direction ?? UNKNOWN_DIRECTION };
+    const price = direction ? direction.price : NaN;
+    const trendKnown = !!sma && price > 0;
+    if (!trendKnown && !funding && !direction) {
+      throw new Error(`all inputs unavailable${this.smaError ? ` (${this.smaError})` : ""}`);
+    }
+    return {
+      solPrice: price,
+      sma200: sma ? sma.sma200 : NaN,
+      smaPoints: sma ? sma.smaPoints : 0,
+      trendKnown,
+      smaSource: sma ? sma.source : `unknown${this.smaError ? ` (${this.smaError})` : ""}`,
+      funding: funding ?? UNKNOWN_FUNDING,
+      direction: direction ?? UNKNOWN_DIRECTION,
+    };
   }
 
   private async runEvaluation(now: number): Promise<RegimeConfig> {
@@ -503,11 +608,12 @@ export class RegimeSentinel {
       const parts = scoreInputs(inputs);
       const { score, trendPts, fundingPts, dirPts, longScore } = parts;
       const raw = classifyScore(parts, this.effective);
-      const complete = inputs.funding.known && inputs.direction.known;
+      const trendKnown = inputs.trendKnown !== false;
+      const complete = trendKnown && inputs.funding.known && inputs.direction.known;
       this.lastGood = { at: now, inputs, score, trendPts, fundingPts, dirPts, longScore, rawRegime: raw, complete };
       this.lastEvalOk = true;
       this.lastFailure = "";
-      changedNote = this.applyObservation(raw, score, longScore, complete, now);
+      changedNote = this.applyObservation(raw, score, longScore, complete, now, trendKnown && inputs.funding.known);
       this.nextEvalAt = now + (this.pending ? this.o.confirmSec : this.o.evalSec);
     } catch (e: any) {
       this.lastEvalOk = false;
@@ -529,7 +635,14 @@ export class RegimeSentinel {
   }
 
   /** Returns a note when the effective regime changed. */
-  private applyObservation(raw: MarketRegime, score: number, longScore: number, complete: boolean, now: number): string {
+  private applyObservation(
+    raw: MarketRegime,
+    score: number,
+    longScore: number,
+    complete: boolean,
+    now: number,
+    longSideKnown: boolean
+  ): string {
     if (raw === this.effective) {
       this.pending = null;
       if (this.provisional && complete) this.provisional = false;
@@ -537,13 +650,19 @@ export class RegimeSentinel {
       return "";
     }
     // Safety shortcut uses the LONG-SIDE score (trend + funding) so short-term direction alone can't trip it.
-    if (raw === "BEAR_DEFENSIVE" && longScore < SCORE_BEAR_IMMEDIATE_BELOW) {
+    // Requires both long-side inputs: an unknown trend (0 pts) must not let funding alone trip it.
+    if (raw === "BEAR_DEFENSIVE" && longSideKnown && longScore < SCORE_BEAR_IMMEDIATE_BELOW) {
       this.switchTo(raw, now);
       this.holdReason = "";
       return `immediate switch to BEAR (long-side score ${longScore.toFixed(1)} < ${SCORE_BEAR_IMMEDIATE_BELOW})`;
     }
     if (!complete) {
-      const missing = [this.lastGood && !this.lastGood.inputs.funding.known ? "funding" : "", this.lastGood && !this.lastGood.inputs.direction.known ? "direction" : ""]
+      const g = this.lastGood;
+      const missing = [
+        g && g.inputs.trendKnown === false ? "trend/SMA" : "",
+        g && !g.inputs.funding.known ? "funding" : "",
+        g && !g.inputs.direction.known ? "direction" : "",
+      ]
         .filter(Boolean)
         .join("+");
       this.holdReason = `raw ${raw} not acted on — ${missing || "input"} unknown (partial read can't switch)`;
@@ -610,7 +729,10 @@ export function formatRegimeLine(c: RegimeConfig, evalOk: boolean, changedNote: 
     ? `raw ${c.rawRegime} score ${c.score != null ? c.score.toFixed(1) : "n/a"}`
     : `EVAL FAILED (${c.lastFailure})`;
   const inputs = c.score != null
-    ? ` | trend ${fmtPts(d.trendPts)}: $${d.solPrice.toFixed(2)} vs SMA200 $${d.sma200.toFixed(2)} (${((d.solPrice / d.sma200 - 1) * 100).toFixed(1)}%)` +
+    ? ` | trend ${fmtPts(d.trendPts)}: ` +
+      (d.trendKnown
+        ? `$${d.solPrice.toFixed(2)} vs SMA200 $${d.sma200.toFixed(2)} (${((d.solPrice / d.sma200 - 1) * 100).toFixed(1)}%) [${d.smaSource}]`
+        : `unknown → neutral [SMA ${d.smaSource}]`) +
       ` | funding ${fmtPts(d.fundingPts)}: ` +
       (d.fundingKnown
         ? `${d.fundingRawRate.toExponential(3)}/${d.fundingIntervalHours}h → ${d.fundingAnnual.toFixed(2)}% APR [${d.fundingSource}]`

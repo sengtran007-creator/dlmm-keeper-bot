@@ -16,18 +16,29 @@ import {
   directionPoints,
   classifyScore,
   scoreInputs,
+  smaFromDailyCandles,
+  smaFromCoinGecko,
 } from "../regime";
 
 const T0 = 1_791_500_000; // ~Oct 8 2026
 const SMA = 86.65;
 
-/** 201 daily points averaging exactly `sma`, last point = `price`. */
+/** CoinGecko-style: 200 daily points at `sma`, then the live point `price`. */
 function cgSeries(price: number, sma = SMA) {
-  const n = 201;
-  const rest = (sma * n - price) / (n - 1);
-  const prices = Array.from({ length: n - 1 }, (_, i) => [i, rest]);
-  prices.push([n, price]);
+  const prices = Array.from({ length: 200 }, (_, i) => [i, sma]);
+  prices.push([200, price]);
   return { prices };
+}
+
+/** HL-style daily candles: `closedDays` closed UTC days closing at `sma`, plus the in-progress day at `live`. */
+function dailyCandles(nowSec: number, sma = SMA, closedDays = 230, live = 999) {
+  const today = Math.floor(nowSec / 86400) * 86400;
+  const rows = Array.from({ length: closedDays }, (_, i) => {
+    const t = (today - (closedDays - i) * 86400) * 1000;
+    return { t, T: t + 86400 * 1000 - 1, s: "SOL", i: "1d", o: "0", c: String(sma), h: "0", l: "0", v: "0", n: 1 };
+  });
+  rows.push({ t: today * 1000, T: today * 1000 + 86400 * 1000 - 1, s: "SOL", i: "1d", o: "0", c: String(live), h: "0", l: "0", v: "0", n: 1 });
+  return rows;
 }
 
 /** 25 hourly settled rows ending at nowSec, each rate from fn(hourIndex). */
@@ -52,34 +63,44 @@ const drift = (pctTotal: number, end = 109) => (now: number) => candles(now, (i)
 function harness(opts: {
   price?: number | (() => number);
   hourly?: (now: number) => any;
+  failAll?: () => boolean;
+  failDaily?: () => boolean;
   failCg?: () => boolean;
   failHist?: boolean;
   predicted?: any;
   candles?: ((now: number) => any) | null;
 }) {
   let now = T0;
-  const calls = { cg: 0, hist: 0, pred: 0 };
+  const calls = { cg: 0, hist: 0, pred: 0, daily: 0, candles: 0 };
   const logs: string[] = [];
+  const price = () => (typeof opts.price === "function" ? opts.price() : opts.price ?? 109);
+  const all = () => !!(opts.failAll && opts.failAll());
+  const http429 = () => Object.assign(new Error("Request failed with status code 429"), { response: { status: 429 } });
   const fetchers: RegimeFetchers = {
     fetchCoinGecko: async () => {
       calls.cg++;
-      if (opts.failCg && opts.failCg()) throw Object.assign(new Error("Request failed with status code 429"), { response: { status: 429 } });
-      const p = typeof opts.price === "function" ? opts.price() : opts.price ?? 109;
-      return cgSeries(p);
+      if (all() || (opts.failCg && opts.failCg())) throw http429();
+      return cgSeries(price());
+    },
+    fetchDailyCandles: async () => {
+      calls.daily++;
+      if (all() || (opts.failDaily && opts.failDaily())) throw new Error("timeout");
+      return dailyCandles(now);
     },
     fetchFundingHistory: async () => {
       calls.hist++;
-      if (opts.failHist) throw new Error("timeout");
+      if (all() || opts.failHist) throw new Error("timeout");
       return opts.hourly ? opts.hourly(now) : hist(now, () => aprToHourly(10.95));
     },
     fetchPredictedFundings: async () => {
       calls.pred++;
-      if (opts.predicted === undefined) throw new Error("timeout");
+      if (all() || opts.predicted === undefined) throw new Error("timeout");
       return opts.predicted;
     },
     fetchCandles: async () => {
-      if (opts.candles === null) throw new Error("timeout");
-      return (opts.candles ?? flat())(now);
+      calls.candles++;
+      if (all() || opts.candles === null) throw new Error("timeout");
+      return (opts.candles ?? flat(price()))(now);
     },
   };
   const s = new RegimeSentinel(fetchers, { nowSec: () => now, log: (l) => logs.push(l), fmtTime: (x) => String(x) });
@@ -110,7 +131,7 @@ test("funding units: HL hourly and Binance 8h baselines both annualize to 10.95%
 });
 
 test("API failure at boot → RANGE_CHOP / 5%, never BULL; failures back off (no per-tick hammering)", async () => {
-  const h = harness({ failCg: () => true });
+  const h = harness({ failAll: () => true });
   const c = await h.s.evaluate();
   assert.equal(c.regime, "RANGE_CHOP");
   assert.equal(c.floorStopPct, 0.05);
@@ -119,11 +140,13 @@ test("API failure at boot → RANGE_CHOP / 5%, never BULL; failures back off (no
     h.advance(15); // 19 keeper ticks within 5 min
     await h.s.evaluate();
   }
-  assert.equal(h.calls.cg, 1, "no retry inside the 5-min backoff");
+  assert.equal(h.calls.hist, 1, "no retry inside the 5-min backoff");
+  assert.equal(h.calls.cg, 1);
   h.advance(30);
   await h.s.evaluate();
-  assert.equal(h.calls.cg, 2, "retries after backoff");
-  assert.match(h.logs[0], /EVAL FAILED \(CoinGecko: HTTP 429/);
+  assert.equal(h.calls.hist, 2, "retries after backoff");
+  assert.equal(h.calls.cg, 1, "CoinGecko has its own 30-min backoff");
+  assert.match(h.logs[0], /EVAL FAILED \(all inputs unavailable \(HL 1d: timeout; CoinGecko: HTTP 429/);
   // attach with no pin → RANGE 5% lock (not the live regime)
   const { lock } = resolveAttachStopLock("", false);
   assert.equal(lock.stopPct, 0.05);
@@ -222,7 +245,7 @@ test("score < 30 → immediate BEAR (safety), no confirmation or dwell", async (
 
 test("eval failure keeps last good regime < 6h, then falls back to RANGE (never BULL)", async () => {
   let fail = false;
-  const h = harness({ price: 109, failCg: () => fail, hourly: (now) => hist(now, () => aprToHourly(9)) });
+  const h = harness({ price: 109, failAll: () => fail, hourly: (now) => hist(now, () => aprToHourly(9)) });
   await h.s.evaluate();
   h.advance(1800);
   assert.equal((await h.s.evaluate()).regime, "BULL_EXPANSION");
@@ -320,18 +343,19 @@ test("flat market with neutral funding → RANGE", async () => {
   }
 });
 
-test("direction data missing → neutral, and a partial read can't switch", async () => {
+test("direction data missing → neutral (and trend price unknown) — partial read, no BULL", async () => {
   const h = harness({ price: 109, hourly: (now) => hist(now, () => aprToHourly(9)), candles: null });
   let c = await h.s.evaluate();
   assert.equal(c.details.directionKnown, false);
   assert.equal(c.details.dirPts, 0);
-  assert.equal(c.rawRegime, "BULL_EXPANSION"); // score 100 with neutral direction…
+  assert.equal(c.details.trendKnown, false); // price comes from the same 1h feed
   for (let i = 0; i < 4; i++) {
     h.advance(3600);
     c = await h.s.evaluate();
-    assert.equal(c.regime, "RANGE_CHOP"); // …but never acted on while direction is unknown
+    assert.equal(c.regime, "RANGE_CHOP");
   }
-  assert.match(c.holdReason, /direction unknown \(partial read can't switch\)/);
+  const p = scoreInputs({ solPrice: 109, sma200: SMA, smaPoints: 200, funding: { ...UNKNOWN_FUNDING, known: true, apr: 9 }, direction: { known: false } as any });
+  assert.equal(p.dirPts, 0); // unknown direction scores 0
 });
 
 test("short-term crash alone can't trigger BEAR; long side must agree", () => {
@@ -344,4 +368,60 @@ test("short-term crash alone can't trigger BEAR; long side must agree", () => {
   const bearish = scoreInputs({ ...base, solPrice: 102, direction: crash }); // 6.4% below the 200-day → trend −16
   assert.equal(classifyScore(bearish), "BEAR_DEFENSIVE"); // long side agrees → BEAR (via normal confirmation)
   assert.ok(bearish.longScore > 30, "long-side score above 30 → not the immediate shortcut");
+});
+
+test("HL daily SMA: closed days only, ≥150 required, last 200 used", () => {
+  const nowMs = T0 * 1000;
+  const r = smaFromDailyCandles(dailyCandles(T0, 86.54, 230, 5000), nowMs)!;
+  assert.equal(r.sma200.toFixed(4), "86.5400"); // in-progress day (close 5000) excluded
+  assert.equal(r.smaPoints, 200);
+  assert.equal(smaFromDailyCandles(dailyCandles(T0, 86.54, 149), nowMs), null);
+  assert.equal(smaFromDailyCandles(dailyCandles(T0, 86.54, 150), nowMs)!.smaPoints, 150);
+  assert.equal(smaFromDailyCandles("bad", nowMs), null);
+  // CoinGecko fallback uses the same definition (live point excluded)
+  assert.equal(smaFromCoinGecko(cgSeries(5000, 86.54))!.sma200.toFixed(4), "86.5400");
+});
+
+test("SMA cached 6h: one HL daily fetch across hourly evals, CoinGecko never called", async () => {
+  const h = harness({ price: 109 });
+  for (let i = 0; i < 6; i++) {
+    const c = await h.s.evaluate();
+    assert.equal(c.details.trendKnown, true);
+    assert.match(c.details.smaSource, /^HL 1d closes \(200\)/);
+    h.advance(3600);
+  }
+  assert.equal(h.calls.daily, 1);
+  assert.equal(h.calls.cg, 0);
+  await h.s.evaluate();
+  assert.equal(h.calls.daily, 2, "refetched after 6h");
+});
+
+test("HL daily down → CoinGecko fallback; both down → trend unknown/neutral, partial, no hammering", async () => {
+  const h1 = harness({ price: 109, failDaily: () => true });
+  const c1 = await h1.s.evaluate();
+  assert.match(c1.details.smaSource, /CoinGecko fallback/);
+  assert.equal(c1.details.trendPts, 25);
+
+  // both SMA sources down; funding +25 and a strong rally (+20) → raw would be BULL without trend…
+  const h2 = harness({ price: 109, failDaily: () => true, failCg: () => true, hourly: (now) => hist(now, () => aprToHourly(9)), candles: drift(+30) });
+  let c2 = await h2.s.evaluate();
+  assert.equal(c2.details.trendKnown, false);
+  assert.equal(c2.details.trendPts, 0);
+  assert.match(c2.details.smaSource, /unknown \(HL 1d: timeout; CoinGecko: HTTP 429/);
+  for (let i = 0; i < 480; i++) {
+    // 2h of 15s keeper ticks
+    h2.advance(15);
+    c2 = await h2.s.evaluate();
+  }
+  assert.equal(c2.regime, "RANGE_CHOP", "partial read (trend unknown) can't switch");
+  assert.ok(h2.calls.daily <= 9, `HL daily backoff 15 min (${h2.calls.daily})`);
+  assert.ok(h2.calls.cg <= 5, `CoinGecko backoff 30 min (${h2.calls.cg})`);
+});
+
+test("immediate BEAR shortcut needs the trend known (funding alone can't trip it)", async () => {
+  const h = harness({ price: 109, failDaily: () => true, failCg: () => true, hourly: (now) => hist(now, () => aprToHourly(-15)) });
+  const c = await h.s.evaluate();
+  assert.equal(c.details.trendKnown, false);
+  assert.equal(c.rawRegime, "BEAR_DEFENSIVE"); // score 25 with trend unknown…
+  assert.equal(c.regime, "RANGE_CHOP"); // …but no immediate switch on a partial read
 });

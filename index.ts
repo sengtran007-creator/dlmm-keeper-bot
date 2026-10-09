@@ -1262,6 +1262,9 @@ const regimeSentinel = new RegimeSentinel(
     fetchFundingHistory: async (startTime: number) =>
       (await axios.post(HL_INFO_URL, { type: "fundingHistory", coin: "SOL", startTime }, { timeout: 8000 })).data,
     fetchPredictedFundings: async () => (await axios.post(HL_INFO_URL, { type: "predictedFundings" }, { timeout: 8000 })).data,
+    fetchDailyCandles: async (startTime: number, endTime: number) =>
+      (await axios.post(HL_INFO_URL, { type: "candleSnapshot", req: { coin: "SOL", interval: "1d", startTime, endTime } }, { timeout: 8000 }))
+        .data,
     fetchCandles: async (startTime: number, endTime: number) =>
       (await axios.post(HL_INFO_URL, { type: "candleSnapshot", req: { coin: "SOL", interval: "1h", startTime, endTime } }, { timeout: 8000 }))
         .data,
@@ -2243,7 +2246,10 @@ async function listenTelegramCommands() {
             `• <b>Regime:</b> <code>${config.regime}</code>${config.provisional ? " (provisional)" : ""} — ${config.source}\n` +
             `• <b>Score:</b> ${haveRead ? `<b>${config.score!.toFixed(1)}</b>/100 → raw ${config.rawRegime}` : "n/a (no good read yet)"}\n` +
             (haveRead
-              ? `• <b>Trend:</b> ${d.trendPts >= 0 ? "+" : ""}${d.trendPts.toFixed(1)} — $${d.solPrice.toFixed(2)} vs 200-SMA $${d.sma200.toFixed(2)}\n` +
+              ? `• <b>Trend:</b> ${d.trendPts >= 0 ? "+" : ""}${d.trendPts.toFixed(1)} — ` +
+                (d.trendKnown
+                  ? `$${d.solPrice.toFixed(2)} vs 200-SMA $${d.sma200.toFixed(2)} (${escapeHtml(d.smaSource)})`
+                  : `unknown → neutral (${escapeHtml(d.smaSource)})`) + `\n` +
                 `• <b>Funding:</b> ${d.fundingPts >= 0 ? "+" : ""}${d.fundingPts.toFixed(1)} — ` +
                 (d.fundingKnown ? `${d.fundingAnnual.toFixed(2)}% APR (${escapeHtml(d.fundingSource)})` : "unknown → neutral") + `\n` +
                 `• <b>Direction:</b> ${d.dirPts >= 0 ? "+" : ""}${d.dirPts.toFixed(1)} — ` +
@@ -2643,7 +2649,10 @@ async function runKeeper() {
         return;
       }
 
-      const currentConfig = await macroSentinel.evaluateRegime(SOL_USDC_POOL.toBase58());
+      // Regime is refreshed in the background (cached; may take seconds when an API is slow) so the stop
+      // checks below are never delayed by external API calls. The tick only needs the cached label.
+      void regimeSentinel.evaluate().catch((e: any) => console.warn("[REGIME] eval error:", e?.message || e));
+      const currentConfig = regimeSentinel.current();
 
       // Scheduled sweep (before idle top-up so top-up doesn't absorb USDC about to be swept).
       // lastSweepTime only advances on an actual sweep (inside sweepRevenueToVault); if a due sweep
