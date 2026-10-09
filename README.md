@@ -48,7 +48,20 @@ Net PnL = live equity (position + wallet) + swept to revenue − (STARTING_CAPIT
 
 - Top-ups, deploys, recenters, swaps, wrap/unwrap, closes, take-profit, circuit breaker and emergency exit never change the baseline; it is set once per boot, so restarts cannot double it.
 - Fee sweeps to the revenue wallet are added back, so they never show as a loss.
-- The baseline is **reporting only**. Stops use the entry state: price stop = `entry spot × (1 − floorStopPct)`, equity stop = `entry equity × (1 − MAX_DRAWDOWN_PCT)`. To keep the original entry across a restart, set `ENTRY_SPOT_USD` / `ENTRY_EQUITY_USD`.
+- The baseline is **reporting only**. Stops use the entry state: price stop = `entry spot × (1 − floorStopPct)`, equity stop = `entry equity × (1 − MAX_DRAWDOWN_PCT)`.
+
+### Entry pin across restarts
+
+On restart the bot re-anchors entry (and therefore both stops) to the live spot/equity unless pinned. To keep the original entry, set all three: `ENTRY_POSITION_PUBKEY`, `ENTRY_SPOT_USD`, `ENTRY_EQUITY_USD`. The pin is applied only when attaching at boot and only if the attached position equals `ENTRY_POSITION_PUBKEY`; otherwise it is ignored with a warning (so it can never be re-applied to a later position after a take-profit / recenter / new deploy). After every deploy/attach the bot logs the exact values to copy (`[ENTRY] To keep this entry across restarts set: ...`).
+
+### Read guard (stop safety)
+
+- Equity for the equity stop comes from a probe that fails closed: RPC error/timeout, the open position missing from the result, missing/non-finite amounts (partial read) or an invalid spot → that tick's equity stop is **skipped**, never evaluated on wallet-only equity.
+- Spot that is zero/NaN, or jumps more than `SPOT_JUMP_MAX_PCT` in one tick, skips the whole tick (price stop, take-profit, below-range recenter, top-up, re-entry) until it is confirmed by `SUSPECT_CONFIRM_TICKS` consecutive reads.
+- An open position read as $0 is always rejected; a one-tick position-value drop over `POS_DROP_MAX_PCT` while spot moved less than `POS_DROP_SPOT_MOVE_PCT` is rejected until confirmed by `SUSPECT_CONFIRM_TICKS` consecutive reads.
+- Failed reads are logged every tick and written to the ledger as `ERROR` at most once per `READ_ERROR_LEDGER_SEC`. A watchdog sends a Telegram **STOPS BLIND** alert if a stop has had no trustworthy read for `STOP_BLIND_ALERT_SEC` (default 5 min), and **STOPS RESTORED** when reads recover.
+- `/status` never clears the tracked position or rewrites the range from a bad/empty read.
+- Error text sent to Telegram / the sheet is scrubbed of URLs and keys (RPC errors can embed the RPC URL).
 - Ledger `realized_pnl_usd` (TAKE_PROFIT / CIRCUIT_BREAKER / EMERGENCY_EXIT) is per position cycle: exit equity + fees swept since entry − entry equity. `unrealized_pnl_usd` (SNAPSHOT) adds back fees swept since entry. Rows also carry `capital_baseline_usd`, `cumulative_swept_usd` and `total_pnl_usd` (ignored by the v2.1 Apps Script, which only writes its fixed columns).
 
 ## Deploy on Railway

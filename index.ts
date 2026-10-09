@@ -111,9 +111,25 @@ const MAX_DRAWDOWN_PCT = Number(process.env.MAX_DRAWDOWN_PCT ?? 0.05);
 const BELOW_RANGE_TICKS = Math.max(1, Number(process.env.BELOW_RANGE_TICKS ?? 3));
 // Min seconds between below-range (or TP) recenters that reopen a grid without a hard stop.
 const RECENTER_COOLDOWN_SEC = Math.max(0, Number(process.env.RECENTER_COOLDOWN_SEC ?? 1800));
-// Optional attach overrides when restarting against an already-open position.
+// Optional entry PIN for restarts. Applied ONLY at boot-attach and ONLY when the attached
+// position pubkey equals ENTRY_POSITION_PUBKEY. After a take-profit / recenter / new deploy the
+// position pubkey changes, so a stale pin is ignored automatically (with a warning) on the next boot.
 const ENTRY_SPOT_USD_ENV = process.env.ENTRY_SPOT_USD?.trim() || "";
 const ENTRY_EQUITY_USD_ENV = process.env.ENTRY_EQUITY_USD?.trim() || "";
+const ENTRY_POSITION_PUBKEY_ENV = process.env.ENTRY_POSITION_PUBKEY?.trim() || "";
+
+// ---- Read guard (stop safety). Thresholds of the stops themselves are unchanged. ----
+// Consecutive suspicious reads required before a suspicious value is accepted as real.
+const SUSPECT_CONFIRM_TICKS = Math.max(2, Number(process.env.SUSPECT_CONFIRM_TICKS ?? 3));
+// One-tick spot move larger than this vs the last good spot is treated as a suspect read.
+const SPOT_JUMP_MAX_PCT = Number(process.env.SPOT_JUMP_MAX_PCT ?? 0.2);
+// Position value drop larger than this in one tick while spot moved < POS_DROP_SPOT_MOVE_PCT is a suspect read.
+const POS_DROP_MAX_PCT = Number(process.env.POS_DROP_MAX_PCT ?? 0.5);
+const POS_DROP_SPOT_MOVE_PCT = Number(process.env.POS_DROP_SPOT_MOVE_PCT ?? 0.05);
+// Telegram alert when a stop has had no trustworthy read for this long while a position is open.
+const STOP_BLIND_ALERT_SEC = Math.max(60, Number(process.env.STOP_BLIND_ALERT_SEC ?? 300));
+// At most one ERROR ledger row per this many seconds for failed reads.
+const READ_ERROR_LEDGER_SEC = Math.max(60, Number(process.env.READ_ERROR_LEDGER_SEC ?? 900));
 
 // Meteora initializePosition width = maxBinId - minBinId + 1 must be in [1, DEFAULT_BIN_PER_POSITION].
 const MAX_POSITION_WIDTH = DEFAULT_BIN_PER_POSITION.toNumber(); // 70
@@ -161,8 +177,41 @@ let cumulativeSweptUsd = 0;
 let sweptSinceEntryUsd = 0;
 let cumulativeGasSol = 0;
 
+// ---- Read-guard state ----
+/** Set when entry equity could not be measured at attach; filled on the first good equity read. */
+let entryEquityPending = false;
+/** Set when the boot-equity baseline could not be measured; filled on the first good equity read. */
+let capitalBaselinePending = false;
+let lastGoodSpotUsd = 0;
+let spotSuspectTicks = 0;
+let lastGoodPosKey = "";
+let lastGoodPosUsd = 0;
+let lastGoodPosSpotUsd = 0;
+let posSuspectTicks = 0;
+/** Unix seconds of the last tick where each stop was evaluated on a trustworthy read. */
+let lastPriceStopEvalAt = Math.floor(Date.now() / 1000);
+let lastEquityStopEvalAt = Math.floor(Date.now() / 1000);
+let stopBlindAlerted = false;
+let lastReadFailureReason = "";
+let lastReadErrorLedgerAt = 0;
+
 // ==================== NOTIFICATIONS & LOGS ====================
-async function notify(msg: string) {
+/**
+ * Strip URLs / keys from free text before it leaves the process (Telegram, sheet).
+ * RPC error messages can embed the full RPC URL including its API key.
+ */
+function redactSecrets(text: string): string {
+  let out = String(text ?? "");
+  for (const secret of [RPC_URL, TELEGRAM_BOT_TOKEN, GOOGLE_SHEET_WEBHOOK_URL]) {
+    if (secret && secret.length >= 8) out = out.split(secret).join("<redacted>");
+  }
+  out = out.replace(/\b(?:https?|wss?):\/\/[^\s"'<>)]+/gi, "<url>");
+  out = out.replace(/((?:api[-_]?key|token|secret)=)[^&\s"']+/gi, "$1<redacted>");
+  return out;
+}
+
+async function notify(rawMsg: string) {
+  const msg = redactSecrets(rawMsg);
   console.log(msg);
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
 
@@ -421,6 +470,7 @@ async function emitLedger(fields: LedgerFields): Promise<void> {
     range_low: fields.range_low ?? (lowestBinPrice || undefined),
     range_high: fields.range_high ?? (highestBinPrice || undefined),
   };
+  if (typeof payload.notes === "string") payload.notes = redactSecrets(payload.notes);
   if (payload.tx_sig && !payload.tx_signature) payload.tx_signature = payload.tx_sig;
   if (payload.swept_to_revenue_usd != null && payload.swept_usd == null) payload.swept_usd = payload.swept_to_revenue_usd;
   if (payload.realized_pnl_usd != null && payload.net_pnl_usd == null) payload.net_pnl_usd = payload.realized_pnl_usd;
@@ -553,22 +603,57 @@ function gasBufferLabel(lamports: number): string {
 }
 
 // ==================== EQUITY / STOP HELPERS ====================
-/** Wallet liquid USD: USDC ATA + native SOL + WSOL ATA, marked at spot. */
-async function getWalletLiquidEquityUsd(spotUsd: number): Promise<{ usdcUsd: number; solUsd: number; totalUsd: number }> {
-  let usdcUsd = 0;
-  let solLamports = await connection.getBalance(wallet.publicKey);
+function isValidSpot(p: number): boolean {
+  return typeof p === "number" && Number.isFinite(p) && p > 0;
+}
+
+/** A missing ATA is a legitimate zero balance; any other token-account error is a failed read. */
+function isTokenAccountMissing(err: any): boolean {
+  const name = String(err?.name || err?.constructor?.name || "");
+  return /TokenAccountNotFound/i.test(name);
+}
+
+interface WalletProbe {
+  ok: boolean;
+  reason?: string;
+  usdcUsd?: number;
+  solUsd?: number;
+  totalUsd?: number;
+}
+
+/** Wallet liquid USD (USDC ATA + native SOL + WSOL ATA at spot). Returns ok:false on ANY failed read. */
+async function probeWalletEquity(spotUsd: number): Promise<WalletProbe> {
+  if (!isValidSpot(spotUsd)) return { ok: false, reason: `invalid spot ${spotUsd}` };
   try {
+    let solLamports = await connection.getBalance(wallet.publicKey);
+    let usdcRaw = 0;
     const usdcAta = await getAssociatedTokenAddress(USDC_MINT, wallet.publicKey);
-    const usdcAcc = await getAccount(connection, usdcAta);
-    usdcUsd = Number(usdcAcc.amount) / 1e6;
-  } catch {}
-  try {
+    try {
+      usdcRaw = Number((await getAccount(connection, usdcAta)).amount);
+    } catch (e: any) {
+      if (!isTokenAccountMissing(e)) throw e;
+    }
     const wsolAta = await getAssociatedTokenAddress(WSOL_MINT, wallet.publicKey);
-    const wsolAcc = await getAccount(connection, wsolAta);
-    solLamports += Number(wsolAcc.amount);
-  } catch {}
-  const solUsd = (solLamports / 1e9) * spotUsd;
-  return { usdcUsd, solUsd, totalUsd: usdcUsd + solUsd };
+    try {
+      solLamports += Number((await getAccount(connection, wsolAta)).amount);
+    } catch (e: any) {
+      if (!isTokenAccountMissing(e)) throw e;
+    }
+    const usdcUsd = usdcRaw / 1e6;
+    const solUsd = (solLamports / 1e9) * spotUsd;
+    const totalUsd = usdcUsd + solUsd;
+    if (!Number.isFinite(totalUsd)) return { ok: false, reason: "wallet read produced non-finite value" };
+    return { ok: true, usdcUsd, solUsd, totalUsd };
+  } catch (err: any) {
+    return { ok: false, reason: `wallet read failed: ${err?.message || err}` };
+  }
+}
+
+/** Wallet liquid USD. Throws on a failed read (callers fall back explicitly). */
+async function getWalletLiquidEquityUsd(spotUsd: number): Promise<{ usdcUsd: number; solUsd: number; totalUsd: number }> {
+  const w = await probeWalletEquity(spotUsd);
+  if (!w.ok) throw new Error(w.reason);
+  return { usdcUsd: w.usdcUsd!, solUsd: w.solUsd!, totalUsd: w.totalUsd! };
 }
 
 /** Position inventory + unclaimed fees in USD (X=SOL, Y=USDC). */
@@ -582,19 +667,204 @@ function getPositionInventoryUsd(pos: any, spotUsd: number): number {
   return (x + feeX) * spotUsd + (y + feeY);
 }
 
-/** Full mark-to-market: open position (if any) + wallet liquids. */
-async function getMarkToMarketEquityUsd(dlmmPool: DLMM, spotUsd: number): Promise<number> {
-  const walletEq = await getWalletLiquidEquityUsd(spotUsd);
-  let posUsd = 0;
+interface EquityProbe {
+  ok: boolean;
+  /** Set when ok === false. */
+  reason?: string;
+  totalUsd?: number;
+  walletUsd?: number;
+  positionsUsd?: number;
+  /** Value of the expected (active) position, or 0 when none expected. */
+  activePositionUsd?: number;
+  positionCount?: number;
+}
+
+function numField(v: any): number {
+  if (v == null) return NaN;
+  return Number(v?.toString?.() ?? v);
+}
+
+/**
+ * Full mark-to-market (open positions + wallet) that NEVER silently degrades to wallet-only.
+ * ok:false on: invalid spot, wallet RPC error, position RPC error/timeout, the expected open
+ * position missing from the result (null read), or a position with missing/non-finite amounts
+ * (partial read).
+ */
+async function probeEquity(dlmmPool: DLMM, spotUsd: number, expectedPosition: PublicKey | null): Promise<EquityProbe> {
+  if (!isValidSpot(spotUsd)) return { ok: false, reason: `invalid spot ${spotUsd}` };
+  const w = await probeWalletEquity(spotUsd);
+  if (!w.ok) return { ok: false, reason: w.reason };
+  let userPositions: any[];
   try {
-    const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
-    for (const pos of userPositions) {
-      posUsd += getPositionInventoryUsd(pos, spotUsd);
-    }
+    ({ userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey));
   } catch (err: any) {
-    console.warn("[MTM] position probe failed:", err?.message || err);
+    return { ok: false, reason: `position read failed: ${err?.message || err}` };
   }
-  return Number((walletEq.totalUsd + posUsd).toFixed(2));
+  if (!Array.isArray(userPositions)) return { ok: false, reason: "position read returned no list" };
+  let positionsUsd = 0;
+  let activePositionUsd = 0;
+  let activeFound = false;
+  for (const pos of userPositions) {
+    const pd = pos?.positionData;
+    const key = pos?.publicKey?.toBase58?.() ?? "?";
+    if (!pd) return { ok: false, reason: `position ${key.slice(0, 8)} has no positionData (partial read)` };
+    const x = numField(pd.totalXAmount);
+    const y = numField(pd.totalYAmount);
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      return { ok: false, reason: `position ${key.slice(0, 8)} amounts missing/non-finite (partial read)` };
+    }
+    const v = getPositionInventoryUsd(pos, spotUsd);
+    if (!Number.isFinite(v) || v < 0) return { ok: false, reason: `position ${key.slice(0, 8)} value ${v} invalid` };
+    positionsUsd += v;
+    if (expectedPosition && pos.publicKey?.equals?.(expectedPosition)) {
+      activeFound = true;
+      activePositionUsd = v;
+    }
+  }
+  if (expectedPosition && !activeFound) {
+    return {
+      ok: false,
+      reason: `open position ${expectedPosition.toBase58().slice(0, 8)} missing from read (${userPositions.length} returned)`,
+    };
+  }
+  return {
+    ok: true,
+    totalUsd: Number((w.totalUsd + positionsUsd).toFixed(2)),
+    walletUsd: w.totalUsd,
+    positionsUsd,
+    activePositionUsd,
+    positionCount: userPositions.length,
+  };
+}
+
+/** Full mark-to-market. Throws on any failed/partial read (never returns wallet-only by accident). */
+async function getMarkToMarketEquityUsd(dlmmPool: DLMM, spotUsd: number): Promise<number> {
+  const p = await probeEquity(dlmmPool, spotUsd, activePositionPubkey);
+  if (!p.ok) throw new Error(p.reason);
+  return p.totalUsd;
+}
+
+/** Retry a probe a few times (boot/attach only — the keeper loop just retries next tick). */
+async function probeEquityWithRetry(dlmmPool: DLMM, spotUsd: number, expected: PublicKey | null, attempts = 3): Promise<EquityProbe> {
+  let last: EquityProbe = { ok: false, reason: "not attempted" };
+  for (let i = 0; i < attempts; i++) {
+    last = await probeEquity(dlmmPool, spotUsd, expected);
+    if (last.ok) return last;
+    console.warn(`[READ] equity probe attempt ${i + 1}/${attempts} failed: ${last.reason}`);
+    if (i < attempts - 1) await new Promise((r) => setTimeout(r, 2000));
+  }
+  return last;
+}
+
+/**
+ * Plausibility filter for spot used by stops / TP / recenter. Rejects zero/NaN, and a one-tick
+ * jump > SPOT_JUMP_MAX_PCT vs the last good spot until it persists SUSPECT_CONFIRM_TICKS ticks.
+ */
+function vetSpot(spotUsd: number): { ok: boolean; reason?: string } {
+  if (!isValidSpot(spotUsd)) return { ok: false, reason: `invalid spot ${spotUsd}` };
+  if (lastGoodSpotUsd > 0) {
+    const move = Math.abs(spotUsd / lastGoodSpotUsd - 1);
+    if (move > SPOT_JUMP_MAX_PCT) {
+      spotSuspectTicks += 1;
+      if (spotSuspectTicks < SUSPECT_CONFIRM_TICKS) {
+        return {
+          ok: false,
+          reason: `spot $${spotUsd.toFixed(2)} moved ${(move * 100).toFixed(1)}% vs last good $${lastGoodSpotUsd.toFixed(2)} in one tick (suspect ${spotSuspectTicks}/${SUSPECT_CONFIRM_TICKS})`,
+        };
+      }
+      console.warn(`[READ] Accepting spot $${spotUsd.toFixed(2)} after ${spotSuspectTicks} consecutive confirming reads.`);
+    }
+  }
+  spotSuspectTicks = 0;
+  lastGoodSpotUsd = spotUsd;
+  return { ok: true };
+}
+
+/**
+ * Plausibility filter for the equity-stop read. Requires an ok probe; rejects an open position read
+ * as $0; rejects a > POS_DROP_MAX_PCT one-tick drop in position value while spot moved
+ * < POS_DROP_SPOT_MOVE_PCT until it persists SUSPECT_CONFIRM_TICKS ticks.
+ */
+function vetEquityProbe(p: EquityProbe, spotUsd: number): { ok: boolean; reason?: string; totalUsd?: number } {
+  if (!p.ok) return { ok: false, reason: p.reason || "unknown read failure" };
+  const key = activePositionPubkey ? activePositionPubkey.toBase58() : "";
+  if (!key) return { ok: true, totalUsd: p.totalUsd };
+  if (!(p.activePositionUsd > 0)) {
+    return { ok: false, reason: `open position ${key.slice(0, 8)} read as $0 (bad read)` };
+  }
+  if (lastGoodPosKey === key && lastGoodPosUsd > 0 && lastGoodPosSpotUsd > 0) {
+    const drop = 1 - p.activePositionUsd / lastGoodPosUsd;
+    const spotMove = Math.abs(spotUsd / lastGoodPosSpotUsd - 1);
+    if (drop > POS_DROP_MAX_PCT && spotMove < POS_DROP_SPOT_MOVE_PCT) {
+      posSuspectTicks += 1;
+      if (posSuspectTicks < SUSPECT_CONFIRM_TICKS) {
+        return {
+          ok: false,
+          reason:
+            `position value $${p.activePositionUsd.toFixed(2)} dropped ${(drop * 100).toFixed(1)}% vs last good ` +
+            `$${lastGoodPosUsd.toFixed(2)} while spot moved ${(spotMove * 100).toFixed(1)}% (suspect ${posSuspectTicks}/${SUSPECT_CONFIRM_TICKS})`,
+        };
+      }
+      console.warn(`[READ] Accepting position value $${p.activePositionUsd.toFixed(2)} after ${posSuspectTicks} consecutive confirming reads.`);
+    }
+  }
+  posSuspectTicks = 0;
+  lastGoodPosKey = key;
+  lastGoodPosUsd = p.activePositionUsd;
+  lastGoodPosSpotUsd = spotUsd;
+  return { ok: true, totalUsd: p.totalUsd };
+}
+
+/** Log every failed read; emit at most one ERROR ledger row per READ_ERROR_LEDGER_SEC. */
+function noteReadFailure(what: string, rawReason: string, nowSec: number) {
+  const reason = redactSecrets(rawReason).slice(0, 300);
+  lastReadFailureReason = `${what}: ${reason}`;
+  console.warn(`[READ GUARD] ${what} skipped this tick — ${reason}`);
+  if (nowSec - lastReadErrorLedgerAt >= READ_ERROR_LEDGER_SEC) {
+    lastReadErrorLedgerAt = nowSec;
+    void emitLedger({ event: "ERROR", notes: `Read guard: ${what} skipped — ${reason}`, is_estimate: true });
+  }
+}
+
+/** Reset read-guard references when a (new) position becomes active (attach / deploy / resume). */
+function markStopsArmed() {
+  const now = Math.floor(Date.now() / 1000);
+  lastPriceStopEvalAt = now;
+  lastEquityStopEvalAt = now;
+  posSuspectTicks = 0;
+  lastGoodPosKey = "";
+  lastGoodPosUsd = 0;
+  lastGoodPosSpotUsd = 0;
+}
+
+/** Watchdog: alert if a stop has been blind (no trustworthy read) for STOP_BLIND_ALERT_SEC. Independent of the keeper tick. */
+async function checkStopBlindness() {
+  const now = Math.floor(Date.now() / 1000);
+  if (!activePositionPubkey || isBotPaused || isExiting || isLiquidating) return;
+  const priceBlind = now - lastPriceStopEvalAt;
+  const equityBlind = entryEquityUsd > 0 || entryEquityPending ? now - lastEquityStopEvalAt : 0;
+  const worst = Math.max(priceBlind, equityBlind);
+  if (worst >= STOP_BLIND_ALERT_SEC && !stopBlindAlerted) {
+    stopBlindAlerted = true;
+    const which = [
+      priceBlind >= STOP_BLIND_ALERT_SEC ? `price stop ${Math.round(priceBlind / 60)}m` : "",
+      equityBlind >= STOP_BLIND_ALERT_SEC ? `equity stop ${Math.round(equityBlind / 60)}m` : "",
+    ].filter(Boolean).join(", ");
+    await notify(
+      `⚠️ <b>[STOPS BLIND]</b> No trustworthy on-chain read for: ${which}. Stops are NOT being evaluated.\n` +
+      `• Position: <code>${activePositionPubkey.toBase58()}</code>\n` +
+      `• Last error: ${escapeHtml(lastReadFailureReason || "keeper tick not completing")}\n` +
+      `• Check RPC / Railway logs. Use /emergency_exit if you need to unwind manually.`
+    );
+    void emitLedger({ event: "ERROR", notes: `Stops blind: ${which}. Last: ${lastReadFailureReason}`, is_estimate: true });
+  } else if (worst < STOP_BLIND_ALERT_SEC && stopBlindAlerted) {
+    stopBlindAlerted = false;
+    await notify("✅ <b>[STOPS RESTORED]</b> On-chain reads healthy again; price and equity stops are being evaluated.");
+  }
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function priceStopFromEntry(floorStopPct: number): number {
@@ -633,12 +903,25 @@ function clearEntryState() {
 async function recordEntryAfterOpen(dlmmPool: DLMM, spotUsd: number, note: string, fallbackEquityUsd: number) {
   entrySpotUsd = spotUsd;
   sweptSinceEntryUsd = 0;
-  try {
-    entryEquityUsd = await getMarkToMarketEquityUsd(dlmmPool, spotUsd);
-  } catch {
+  entryEquityPending = false;
+  const p = await probeEquityWithRetry(dlmmPool, spotUsd, activePositionPubkey, 2);
+  if (p.ok) {
+    entryEquityUsd = p.totalUsd;
+  } else {
+    // Same fallback as before (USD just deposited); a failed read can no longer yield wallet-only equity.
+    console.warn(`[ENTRY] equity probe failed (${p.reason}) — using deployed value $${(fallbackEquityUsd || 0).toFixed(2)}`);
     entryEquityUsd = fallbackEquityUsd || 0;
   }
   console.log(`[ENTRY] ${note} spot=$${entrySpotUsd.toFixed(2)} equity=$${entryEquityUsd.toFixed(2)}`);
+}
+
+/** Logs the exact env values that would pin the CURRENT entry across a restart. */
+function logEntryPinHint() {
+  if (!activePositionPubkey || !(entrySpotUsd > 0)) return;
+  console.log(
+    `[ENTRY] To keep this entry across restarts set: ENTRY_POSITION_PUBKEY=${activePositionPubkey.toBase58()} ` +
+      `ENTRY_SPOT_USD=${entrySpotUsd.toFixed(2)} ENTRY_EQUITY_USD=${entryEquityUsd > 0 ? entryEquityUsd.toFixed(2) : "(pending)"}`
+  );
 }
 
 // ==================== CAPITAL BASELINE / P&L (reporting only) ====================
@@ -649,22 +932,25 @@ function sweptForPnlUsd(): number {
   return (capitalBaselineSource === "env" ? PRIOR_SWEPT_USD : 0) + cumulativeSweptUsd;
 }
 
-/** Net P&L vs contributed capital: equity + swept to revenue − baseline. */
+/** Net P&L vs contributed capital: equity + swept to revenue − baseline. NaN while the baseline is pending. */
 function totalPnlUsd(equityUsd: number): number {
+  if (capitalBaselinePending || !Number.isFinite(equityUsd)) return NaN;
   return Number((equityUsd + sweptForPnlUsd() - capitalBaselineUsd).toFixed(2));
 }
 
 function fmtSignedUsd(v: number): string {
+  if (!Number.isFinite(v)) return "n/a";
   return `${v >= 0 ? "+" : "-"}$${Math.abs(v).toFixed(2)}`;
 }
 
 function fmtPct(num: number, den: number): string {
-  if (!(den > 0)) return "n/a";
+  if (!(den > 0) || !Number.isFinite(num)) return "n/a";
   const p = (num / den) * 100;
   return `${p >= 0 ? "+" : ""}${p.toFixed(2)}%`;
 }
 
 function capitalBaselineLabel(): string {
+  if (capitalBaselinePending) return "pending (equity at boot unreadable; set STARTING_CAPITAL_USD)";
   if (capitalBaselineSource === "env") {
     const parts = [`starting $${(capitalBaselineUsd - NET_DEPOSITS_USD).toFixed(2)}`];
     if (NET_DEPOSITS_USD !== 0) parts.push(`net deposits ${fmtSignedUsd(NET_DEPOSITS_USD)}`);
@@ -688,7 +974,7 @@ function pnlLedgerExtras(equityUsd: number | null): Record<string, number | stri
     capital_baseline_usd: capitalBaselineUsd || undefined,
     capital_baseline_source: capitalBaselineSource,
     cumulative_swept_usd: Number(sweptForPnlUsd().toFixed(2)),
-    total_pnl_usd: equityUsd != null && capitalBaselineUsd > 0 ? totalPnlUsd(equityUsd) : undefined,
+    total_pnl_usd: equityUsd != null && capitalBaselineUsd > 0 && !capitalBaselinePending ? totalPnlUsd(equityUsd) : undefined,
   };
 }
 
@@ -1284,6 +1570,10 @@ async function topUpExistingPosition(dlmmPool: DLMM): Promise<void> {
     await dlmmPool.refetchStates();
     const activeBin = await dlmmPool.getActiveBin();
     const spotPriceUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
+    if (!isValidSpot(spotPriceUsd)) {
+      console.warn(`[TOPUP] Skipping — invalid spot read ${spotPriceUsd}`);
+      return;
+    }
     if (lowestBinPrice > 0 && spotPriceUsd < lowestBinPrice) return; // about to soft-recenter
     if (highestBinPrice > 0 && spotPriceUsd >= highestBinPrice) return; // about to take-profit
 
@@ -1438,6 +1728,7 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     await dlmmPool.refetchStates();
     const activeBin = await dlmmPool.getActiveBin();
     const spotPriceUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
+    if (!isValidSpot(spotPriceUsd)) throw new Error(`Invalid spot read ${spotPriceUsd} — refusing deploy`);
     const config = await macroSentinel.evaluateRegime(SOL_USDC_POOL.toBase58());
 
     // Unwrap any stranded WSOL back to native SOL first. The Meteora SDK wraps
@@ -1591,6 +1882,7 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     lowestBinPrice = calculateBinPriceUsd(spotPriceUsd, activeBin.binId, minBinId, 10);
     highestBinPrice = calculateBinPriceUsd(spotPriceUsd, activeBin.binId, maxBinId, 10);
     belowRangeTickCount = 0;
+    markStopsArmed();
 
     const deployedSolValueUsd = (depositedSol / 1e9) * spotPriceUsd;
     const deployedUsdcValueUsd = depositedUsdc / 1e6;
@@ -1605,6 +1897,7 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     } else {
       await recordEntryAfterOpen(dlmmPool, spotPriceUsd, "deploy", deployedValueUsd);
     }
+    logEntryPinHint();
     let postDeployEquityUsd: number | null = null;
     try {
       postDeployEquityUsd = await getMarkToMarketEquityUsd(dlmmPool, spotPriceUsd);
@@ -1783,6 +2076,7 @@ async function listenTelegramCommands() {
         } else if (text === "/resume") {
           isBotPaused = false;
           inCooldownUntil = 0;
+          markStopsArmed(); // don't fire a "stops blind" alert for the paused period
           await notify("▶️ <b>[RESUMED]</b> Keeper active. Re-centering liquidity grid...");
           if (dlmmPoolInstance && !activePositionPubkey) {
             await deployAsymmetricPosition(dlmmPoolInstance);
@@ -1818,30 +2112,45 @@ async function listenTelegramCommands() {
 
           const { userPositions } = await dlmmPoolInstance.getPositionsByUserAndLbPair(wallet.publicKey);
           const hasActivePosition = userPositions.length > 0;
+          let statusReadWarning = "";
 
+          // /status is display-only for read results: a flaky/empty/partial read must never clear the
+          // active position (that would disable stops and arm a second deploy) or corrupt the range.
           if (hasActivePosition) {
             const pos = userPositions.find((p: any) => activePositionPubkey && p.publicKey.equals(activePositionPubkey)) || userPositions[0];
-            activePositionPubkey = pos.publicKey;
-            lowestBinPrice = calculateBinPriceUsd(currentPrice, activeBin.binId, pos.positionData.lowerBinId, 10);
-            highestBinPrice = calculateBinPriceUsd(currentPrice, activeBin.binId, pos.positionData.upperBinId, 10);
-          } else {
-            activePositionPubkey = null;
-            lowestBinPrice = 0;
-            highestBinPrice = 0;
+            if (!activePositionPubkey) activePositionPubkey = pos.publicKey;
+            if (isValidSpot(currentPrice) && pos?.positionData && pos.publicKey.equals(activePositionPubkey)) {
+              const lo = calculateBinPriceUsd(currentPrice, activeBin.binId, pos.positionData.lowerBinId, 10);
+              const hi = calculateBinPriceUsd(currentPrice, activeBin.binId, pos.positionData.upperBinId, 10);
+              if (isValidSpot(lo) && isValidSpot(hi) && hi > lo) {
+                lowestBinPrice = lo;
+                highestBinPrice = hi;
+              }
+            }
+          } else if (activePositionPubkey) {
+            statusReadWarning = "⚠️ Position lookup returned none — keeping tracked position (possible bad read).\n";
           }
 
-          const rangeDisplay = hasActivePosition
+          const trackingPosition = hasActivePosition || !!activePositionPubkey;
+          const rangeDisplay = trackingPosition
             ? `$${lowestBinPrice.toFixed(2)} ➔ $${highestBinPrice.toFixed(2)}`
             : "None (Liquidated to 100% USDC)";
-          const stopDisplay = hasActivePosition ? formatFloorStopLine(config.floorStopPct) : "N/A";
+          const stopDisplay = trackingPosition ? formatFloorStopLine(config.floorStopPct) : "N/A";
 
           const nowSec = Math.floor(Date.now() / 1000);
           let gateTelemetry = "";
 
           if (isBotPaused) {
             gateTelemetry = "⏸️ <b>PAUSED:</b> Deployments frozen by operator.";
-          } else if (hasActivePosition) {
-            gateTelemetry = "🟢 <b>Active:</b> Monitoring open on-chain grid.";
+          } else if (trackingPosition) {
+            const nowS = Math.floor(Date.now() / 1000);
+            const blindFor = Math.max(nowS - lastPriceStopEvalAt, entryEquityUsd > 0 || entryEquityPending ? nowS - lastEquityStopEvalAt : 0);
+            gateTelemetry =
+              statusReadWarning +
+              (blindFor >= 60
+                ? `⚠️ <b>Active, stops degraded:</b> last trustworthy stop read ${Math.round(blindFor)}s ago (${escapeHtml(lastReadFailureReason || "n/a")}).`
+                : "🟢 <b>Active:</b> Monitoring open on-chain grid.") +
+              (entryEquityPending ? "\n⏳ Entry equity pending first good read (equity stop not armed yet)." : "");
           } else {
             const g1Remaining = Math.max(0, inCooldownUntil - nowSec);
             const g1Passed = g1Remaining === 0;
@@ -1946,25 +2255,43 @@ async function runKeeper() {
   // STARTING_CAPITAL_USD (+ NET_DEPOSITS_USD), else full MTM equity at boot (position + wallet).
   // Recomputed from scratch on every boot, so restarts can never accumulate/double it.
   let bootEquityUsd: number | null = null;
-  try {
-    const activeBin = await dlmmPoolInstance.getActiveBin();
-    const spotUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
+  // Spot at boot: retry a few times; refuse to start on a garbage price (Railway restarts the worker).
+  let bootSpotUsd = NaN;
+  for (let i = 0; i < 3 && !isValidSpot(bootSpotUsd); i++) {
+    try {
+      if (i > 0) await dlmmPoolInstance.refetchStates();
+      const activeBin = await dlmmPoolInstance.getActiveBin();
+      bootSpotUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
+    } catch (err: any) {
+      console.warn(`[BOOT] spot read attempt ${i + 1} failed:`, err?.message || err);
+    }
+    if (!isValidSpot(bootSpotUsd) && i < 2) await new Promise((r) => setTimeout(r, 2000));
+  }
+  if (!isValidSpot(bootSpotUsd)) throw new Error(`Unable to read a valid spot price at boot (${bootSpotUsd}).`);
+  lastGoodSpotUsd = bootSpotUsd;
+  {
     // Include open position inventory so boot equity isn't understated while LPing.
-    bootEquityUsd = await getMarkToMarketEquityUsd(dlmmPoolInstance, spotUsd);
-  } catch (err: any) {
-    console.warn("[BASELINE] Equity probe failed:", err?.message || err);
+    // probeEquity never degrades to wallet-only on a failed position read.
+    const p = await probeEquityWithRetry(dlmmPoolInstance, bootSpotUsd, null, 3);
+    if (p.ok) bootEquityUsd = p.totalUsd;
+    else console.warn("[BASELINE] Equity probe failed:", p.reason);
   }
   if (STARTING_CAPITAL_USD_ENV != null) {
     capitalBaselineUsd = Number((STARTING_CAPITAL_USD_ENV + NET_DEPOSITS_USD).toFixed(2));
     capitalBaselineSource = "env";
-  } else if (bootEquityUsd != null) {
-    capitalBaselineUsd = bootEquityUsd;
+  } else {
     capitalBaselineSource = "boot-equity";
     if (NET_DEPOSITS_USD !== 0 || PRIOR_SWEPT_USD !== 0) {
       console.warn("[BASELINE] NET_DEPOSITS_USD / PRIOR_SWEPT_USD ignored: STARTING_CAPITAL_USD unset (boot equity already reflects them).");
     }
-  } else {
-    throw new Error("Unable to derive startup baseline. Set STARTING_CAPITAL_USD or ensure RPC + USDC ATA are reachable.");
+    if (bootEquityUsd != null) {
+      capitalBaselineUsd = bootEquityUsd;
+    } else {
+      // Don't crash-loop (that would leave an open position with no stops at all): fill on first good read.
+      capitalBaselineUsd = 0;
+      capitalBaselinePending = true;
+      console.warn("[BASELINE] Boot equity unavailable — baseline pending first good equity read.");
+    }
   }
   console.log(
     `[BASELINE] Capital baseline ${capitalBaselineLabel()}` +
@@ -1973,37 +2300,80 @@ async function runKeeper() {
 
   listenTelegramCommands().catch((e) => console.error("Command listener error:", e));
 
-  const { userPositions } = await dlmmPoolInstance.getPositionsByUserAndLbPair(wallet.publicKey);
+  let { userPositions } = await dlmmPoolInstance.getPositionsByUserAndLbPair(wallet.publicKey);
+  if (userPositions.length === 0) {
+    // Re-check once: a flaky empty read here would boot "in cash" and later open a second grid.
+    await new Promise((r) => setTimeout(r, 3000));
+    ({ userPositions } = await dlmmPoolInstance.getPositionsByUserAndLbPair(wallet.publicKey));
+  }
   const config = await macroSentinel.evaluateRegime(SOL_USDC_POOL.toBase58());
 
   if (userPositions.length > 0) {
     // Attach to existing on-chain position — do NOT open a second grid on restart/redeploy.
-    const activePos = userPositions[0];
+    const pinnedPos = ENTRY_POSITION_PUBKEY_ENV
+      ? userPositions.find((p: any) => p.publicKey.toBase58() === ENTRY_POSITION_PUBKEY_ENV)
+      : undefined;
+    const activePos = pinnedPos || userPositions[0];
     activePositionPubkey = activePos.publicKey;
+    const attachedKey = activePositionPubkey.toBase58();
 
     const activeBin = await dlmmPoolInstance.getActiveBin();
-    const spotPriceUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
+    const attachBinId = activeBin.binId;
+    const freshSpotUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
+    const spotPriceUsd = isValidSpot(freshSpotUsd) ? freshSpotUsd : bootSpotUsd;
 
-    lowestBinPrice = calculateBinPriceUsd(spotPriceUsd, activeBin.binId, activePos.positionData.lowerBinId, 10);
-    highestBinPrice = calculateBinPriceUsd(spotPriceUsd, activeBin.binId, activePos.positionData.upperBinId, 10);
+    lowestBinPrice = calculateBinPriceUsd(spotPriceUsd, attachBinId, activePos.positionData.lowerBinId, 10);
+    highestBinPrice = calculateBinPriceUsd(spotPriceUsd, attachBinId, activePos.positionData.upperBinId, 10);
     belowRangeTickCount = 0;
+    markStopsArmed();
 
-    if (ENTRY_SPOT_USD_ENV && Number(ENTRY_SPOT_USD_ENV) > 0) {
-      entrySpotUsd = Number(ENTRY_SPOT_USD_ENV);
+    // Entry pin: only at boot-attach, only for the exact pinned position (stale pins are ignored).
+    const pinSpot = parseOptionalUsd("ENTRY_SPOT_USD");
+    const pinEquity = parseOptionalUsd("ENTRY_EQUITY_USD");
+    const pinRequested = !!(ENTRY_SPOT_USD_ENV || ENTRY_EQUITY_USD_ENV);
+    let pinStatus = "none (entry = live values at attach)";
+    let pinApplies = false;
+    if (pinRequested) {
+      if (!ENTRY_POSITION_PUBKEY_ENV) {
+        pinStatus = "IGNORED — ENTRY_POSITION_PUBKEY unset (required so a pin can't go stale)";
+      } else if (ENTRY_POSITION_PUBKEY_ENV !== attachedKey) {
+        pinStatus = `IGNORED — stale: pinned ${ENTRY_POSITION_PUBKEY_ENV.slice(0, 8)}… ≠ attached ${attachedKey.slice(0, 8)}…`;
+      } else {
+        pinApplies = true;
+        pinStatus = "applied (ENTRY_POSITION_PUBKEY matches)";
+      }
+      if (!pinApplies) console.warn(`[ENTRY] ENTRY_SPOT_USD/ENTRY_EQUITY_USD ${pinStatus}`);
+    } else if (ENTRY_POSITION_PUBKEY_ENV && ENTRY_POSITION_PUBKEY_ENV !== attachedKey) {
+      console.warn(`[ENTRY] ENTRY_POSITION_PUBKEY ${ENTRY_POSITION_PUBKEY_ENV} not found among open positions; attached ${attachedKey}.`);
+    }
+
+    if (pinApplies && pinSpot != null && pinSpot > 0) {
+      entrySpotUsd = pinSpot;
     } else {
       entrySpotUsd = spotPriceUsd;
       console.warn(
-        `[ENTRY] ENTRY_SPOT_USD unset on attach — using current spot $${spotPriceUsd.toFixed(2)} as entry (entry reset on restart).`
+        `[ENTRY] Entry spot not pinned — using current spot $${spotPriceUsd.toFixed(2)} as entry (entry reset on restart).`
       );
     }
-    if (ENTRY_EQUITY_USD_ENV && Number(ENTRY_EQUITY_USD_ENV) > 0) {
-      entryEquityUsd = Number(ENTRY_EQUITY_USD_ENV);
+    if (pinApplies && pinEquity != null && pinEquity > 0) {
+      entryEquityUsd = pinEquity;
+      entryEquityPending = false;
     } else {
-      entryEquityUsd = await getMarkToMarketEquityUsd(dlmmPoolInstance, spotPriceUsd);
-      console.warn(
-        `[ENTRY] ENTRY_EQUITY_USD unset on attach — using current MTM $${entryEquityUsd.toFixed(2)} as entry equity (entry reset on restart).`
-      );
+      const p = await probeEquityWithRetry(dlmmPoolInstance, spotPriceUsd, activePositionPubkey, 3);
+      if (p.ok) {
+        entryEquityUsd = p.totalUsd;
+        entryEquityPending = false;
+        console.warn(
+          `[ENTRY] Entry equity not pinned — using current MTM $${entryEquityUsd.toFixed(2)} as entry equity (entry reset on restart).`
+        );
+      } else {
+        // Never use a wallet-only number as entry equity. Equity stop arms on the first good read.
+        entryEquityUsd = 0;
+        entryEquityPending = true;
+        console.warn(`[ENTRY] Entry equity unavailable (${p.reason}) — equity stop arms on first good read.`);
+      }
     }
+    logEntryPinHint();
 
     await notify(
       `🔗 <b>[ATTACHED TO LIVE ON-CHAIN POSITION]</b>\n` +
@@ -2014,7 +2384,9 @@ async function runKeeper() {
       `• Floor Stop: ${formatFloorStopLine(config.floorStopPct)}\n` +
       `• Equity: ${bootEquityUsd != null ? `$${bootEquityUsd.toFixed(2)}` : "n/a"}\n` +
       `• Capital Baseline: ${capitalBaselineLabel()}` +
-      (bootEquityUsd != null ? `\n• Net PnL: ${fmtSignedUsd(totalPnlUsd(bootEquityUsd))}` : "")
+      (bootEquityUsd != null && !capitalBaselinePending ? `\n• Net PnL: ${fmtSignedUsd(totalPnlUsd(bootEquityUsd))}` : "") +
+      `\n• Entry pin: ${pinStatus}` +
+      (entryEquityPending ? `\n• ⏳ Entry equity pending first good read (equity stop not armed yet)` : "")
     );
     void emitLedger({
       event: "ATTACH",
@@ -2024,7 +2396,7 @@ async function runKeeper() {
       entry_spot: entrySpotUsd,
       entry_equity: entryEquityUsd,
       ...pnlLedgerExtras(bootEquityUsd ?? entryEquityUsd),
-      notes: `Attached to ${activePositionPubkey.toBase58()}`,
+      notes: `Attached to ${activePositionPubkey.toBase58()}. Entry pin: ${pinStatus}`,
       is_estimate: false,
     });
   } else {
@@ -2033,13 +2405,20 @@ async function runKeeper() {
     highestBinPrice = 0;
     activePositionPubkey = null;
     clearEntryState();
-    const activeBin = await dlmmPoolInstance.getActiveBin();
-    lastExitPriceUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR; // Anchor price to prevent premature Gate 3 bypass
+    lastExitPriceUsd = bootSpotUsd; // Anchor price to prevent premature Gate 3 bypass
+    if (ENTRY_SPOT_USD_ENV || ENTRY_EQUITY_USD_ENV || ENTRY_POSITION_PUBKEY_ENV) {
+      console.warn("[ENTRY] ENTRY_* pin ignored — no open position at boot (stale pin; safe to remove).");
+    }
     await notify(
       `🟢 <b>[BOOTED IN 100% USDC]</b> Equity: ${bootEquityUsd != null ? `$${bootEquityUsd.toFixed(2)}` : "n/a"} | ` +
       `Capital Baseline: ${capitalBaselineLabel()}. Standing by for Gate 1-3 clearance.`
     );
   }
+
+  // Stop-blindness watchdog (independent of the keeper tick so a hung tick is also caught).
+  setInterval(() => {
+    checkStopBlindness().catch((e) => console.error("[WATCHDOG]", e?.message || e));
+  }, 30000);
 
   // Master Strategy Polling Loop (Every 15s)
   setInterval(async () => {
@@ -2055,6 +2434,14 @@ async function runKeeper() {
       await dlmmPoolInstance!.refetchStates();
       const activeBin = await dlmmPoolInstance!.getActiveBin();
       const currentPrice = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
+
+      // READ GUARD (spot): zero/NaN or an unconfirmed one-tick jump never reaches the price stop,
+      // take-profit, below-range recenter, top-up or re-entry. Skip the tick; re-check next tick.
+      const spotCheck = vetSpot(currentPrice);
+      if (!spotCheck.ok) {
+        noteReadFailure("spot (all stops/TP/recenter)", spotCheck.reason, now);
+        return;
+      }
 
       const currentConfig = await macroSentinel.evaluateRegime(SOL_USDC_POOL.toBase58());
 
@@ -2121,19 +2508,39 @@ async function runKeeper() {
       }
 
       // ---- Hard stops: measured from ENTRY (not range bottom) ----
-      const priceStop = priceStopFromEntry(currentConfig.floorStopPct);
-      const equityStop = equityStopFromEntry();
+      // Spot was vetted above, so the price stop is evaluated on a trustworthy read this tick.
+      lastPriceStopEvalAt = now;
+      // READ GUARD (equity): the equity stop is evaluated ONLY on an ok, plausible full read
+      // (wallet + the open position). Any failure / missing position / partial read / implausible
+      // drop skips the equity stop for this tick — wallet-only equity can never fire it.
       let liveEquityUsd = 0;
       let equityStopHit = false;
-      if (equityStop > 0 && activePositionPubkey) {
-        try {
-          liveEquityUsd = await getMarkToMarketEquityUsd(dlmmPoolInstance!, currentPrice);
-          equityStopHit = liveEquityUsd <= equityStop;
-        } catch (eqErr: any) {
-          console.warn("[STOP] equity MTM failed:", eqErr?.message || eqErr);
+      let equityReadOk = false;
+      if (activePositionPubkey) {
+        const eq = vetEquityProbe(await probeEquity(dlmmPoolInstance!, currentPrice, activePositionPubkey), currentPrice);
+        if (eq.ok) {
+          equityReadOk = true;
+          liveEquityUsd = eq.totalUsd;
+          lastEquityStopEvalAt = now;
+          if (entryEquityPending) {
+            entryEquityUsd = liveEquityUsd;
+            entryEquityPending = false;
+            console.log(`[ENTRY] Entry equity armed from first good read: $${entryEquityUsd.toFixed(2)}`);
+            logEntryPinHint();
+          }
+          if (capitalBaselinePending) {
+            capitalBaselineUsd = liveEquityUsd;
+            capitalBaselinePending = false;
+            console.log(`[BASELINE] Boot-equity baseline set from first good read: $${capitalBaselineUsd.toFixed(2)}`);
+          }
+        } else {
+          noteReadFailure("equity stop", eq.reason, now);
         }
       }
-      const priceStopHit = entrySpotUsd > 0 && priceStop > 0 && currentPrice <= priceStop;
+      const priceStop = priceStopFromEntry(currentConfig.floorStopPct);
+      const equityStop = equityStopFromEntry();
+      if (equityReadOk && equityStop > 0) equityStopHit = liveEquityUsd <= equityStop;
+      const priceStopHit = entrySpotUsd > 0 && priceStop > 0 && isValidSpot(currentPrice) && currentPrice <= priceStop;
 
       if (priceStopHit || equityStopHit) {
         // Atomic in-flight lock: set BEFORE any await to stop double-trigger races.
@@ -2344,6 +2751,8 @@ async function runKeeper() {
       }
     } catch (err: any) {
       console.error("[Keeper Loop Error]:", err.message);
+      // A tick that throws before the stop block leaves stops unevaluated; the watchdog alerts if it persists.
+      noteReadFailure("keeper tick", String(err?.message || err), Math.floor(Date.now() / 1000));
     } finally {
       keeperTickRunning = false;
     }
