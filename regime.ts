@@ -53,7 +53,8 @@ export interface RegimeProfile {
 export const REGIME_PROFILES: Record<MarketRegime, RegimeProfile> = {
   BULL_EXPANSION: { bidBins: 25, askBins: 35, floorStopPct: 0.04, cooldownSec: 1800, capitalDeployPct: 0.85 },
   RANGE_CHOP: { bidBins: 30, askBins: 30, floorStopPct: 0.05, cooldownSec: 3600, capitalDeployPct: 0.85 },
-  BEAR_DEFENSIVE: { bidBins: 45, askBins: 15, floorStopPct: 0.06, cooldownSec: 14400, capitalDeployPct: 0.6 },
+  // BEAR is symmetric (was 45/15): 90-day backtest showed 45/15 kept buying SOL into the stop; 30/30 won in every window.
+  BEAR_DEFENSIVE: { bidBins: 30, askBins: 30, floorStopPct: 0.06, cooldownSec: 14400, capitalDeployPct: 0.6 },
 };
 
 export const DEFAULT_REGIME: MarketRegime = "RANGE_CHOP";
