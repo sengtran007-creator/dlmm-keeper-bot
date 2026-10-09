@@ -24,6 +24,17 @@ import { BN } from "@coral-xyz/anchor";
 import bs58 from "bs58";
 import axios from "axios";
 import dotenv from "dotenv";
+import {
+  RegimeSentinel,
+  REGIME_PROFILES,
+  DEFAULT_REGIME,
+  EntryStopLock,
+  MarketRegime,
+  lockFromRegime,
+  resolveAttachStopLock,
+  priceStopFromLock,
+  entryPinLine,
+} from "./regime";
 
 dotenv.config();
 
@@ -130,6 +141,9 @@ const RECENTER_COOLDOWN_SEC = Math.max(0, Number(process.env.RECENTER_COOLDOWN_S
 const ENTRY_SPOT_USD_ENV = process.env.ENTRY_SPOT_USD?.trim() || "";
 const ENTRY_EQUITY_USD_ENV = process.env.ENTRY_EQUITY_USD?.trim() || "";
 const ENTRY_POSITION_PUBKEY_ENV = process.env.ENTRY_POSITION_PUBKEY?.trim() || "";
+// Optional price-stop % pin (fraction, e.g. 0.05). Same rules as ENTRY_SPOT_USD: applied only at
+// boot-attach when ENTRY_POSITION_PUBKEY matches. Unpinned attach → RANGE_CHOP 5% (not the live regime).
+const ENTRY_STOP_PCT_ENV = process.env.ENTRY_STOP_PCT?.trim() || "";
 
 // ---- Read guard (stop safety). Thresholds of the stops themselves are unchanged. ----
 // Consecutive suspicious reads required before a suspicious value is accepted as real.
@@ -184,6 +198,12 @@ let lastExitPriceUsd = 0;
 let entrySpotUsd = 0;
 /** Mark-to-market equity USD at entry. Equity stop uses entryEquityUsd * (1 - MAX_DRAWDOWN_PCT). */
 let entryEquityUsd = 0;
+/**
+ * Price-stop % (+ post-stop cooldown and the regime they came from) LOCKED for the life of the current
+ * position: captured from the regime at deploy, or ENTRY_STOP_PCT / RANGE 5% at attach. Kept across
+ * below-range recenters (like entry spot/equity); cleared with entry state. Regime changes never move it.
+ */
+let entryStopLock: EntryStopLock | null = null;
 /** Consecutive keeper ticks with spot below lowestBinPrice (out of range downside). */
 let belowRangeTickCount = 0;
 /** Unix seconds of last soft recenter (below-range or take-profit recycle). */
@@ -887,9 +907,22 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function priceStopFromEntry(floorStopPct: number): number {
-  if (!(entrySpotUsd > 0)) return 0;
-  return entrySpotUsd * (1 - floorStopPct);
+/** Locked price-stop fraction for the current position (RANGE 5% if somehow unset). */
+function lockedStopPct(): number {
+  return entryStopLock && entryStopLock.stopPct > 0 ? entryStopLock.stopPct : REGIME_PROFILES[DEFAULT_REGIME].floorStopPct;
+}
+
+function lockedCooldownSec(): number {
+  return entryStopLock && entryStopLock.cooldownSec > 0 ? entryStopLock.cooldownSec : REGIME_PROFILES[DEFAULT_REGIME].cooldownSec;
+}
+
+function stopLockLabel(): string {
+  if (!entryStopLock) return `${(lockedStopPct() * 100).toFixed(1)}% (default — no lock yet)`;
+  return `${(entryStopLock.stopPct * 100).toFixed(1)}% locked (${entryStopLock.source})`;
+}
+
+function priceStopFromEntry(): number {
+  return priceStopFromLock(entrySpotUsd, entryStopLock);
 }
 
 function equityStopFromEntry(): number {
@@ -897,8 +930,9 @@ function equityStopFromEntry(): number {
   return entryEquityUsd * (1 - MAX_DRAWDOWN_PCT);
 }
 
-function formatFloorStopLine(floorStopPct: number): string {
-  const pStop = priceStopFromEntry(floorStopPct);
+function formatFloorStopLine(): string {
+  const floorStopPct = lockedStopPct();
+  const pStop = priceStopFromEntry();
   const eStop = equityStopFromEntry();
   if (!(entrySpotUsd > 0)) return "N/A (no entry)";
   const pct = (floorStopPct * 100).toFixed(1);
@@ -914,14 +948,22 @@ function clearEntryState() {
   entryEquityUsd = 0;
   belowRangeTickCount = 0;
   sweptSinceEntryUsd = 0;
+  entryStopLock = null;
 }
 
 /**
  * @param fallbackEquityUsd used only if the MTM probe throws (previously the per-deploy
  *   baseline, i.e. the USD value just deposited — preserved so stop behavior is unchanged).
  */
-async function recordEntryAfterOpen(dlmmPool: DLMM, spotUsd: number, note: string, fallbackEquityUsd: number) {
+async function recordEntryAfterOpen(
+  dlmmPool: DLMM,
+  spotUsd: number,
+  note: string,
+  fallbackEquityUsd: number,
+  regime: MarketRegime
+) {
   entrySpotUsd = spotUsd;
+  entryStopLock = lockFromRegime(regime, note);
   sweptSinceEntryUsd = 0;
   entryEquityPending = false;
   const p = await probeEquityWithRetry(dlmmPool, spotUsd, activePositionPubkey, 2);
@@ -932,7 +974,7 @@ async function recordEntryAfterOpen(dlmmPool: DLMM, spotUsd: number, note: strin
     console.warn(`[ENTRY] equity probe failed (${p.reason}) — using deployed value $${(fallbackEquityUsd || 0).toFixed(2)}`);
     entryEquityUsd = fallbackEquityUsd || 0;
   }
-  console.log(`[ENTRY] ${note} spot=$${entrySpotUsd.toFixed(2)} equity=$${entryEquityUsd.toFixed(2)}`);
+  console.log(`[ENTRY] ${note} spot=$${entrySpotUsd.toFixed(2)} equity=$${entryEquityUsd.toFixed(2)} stop ${stopLockLabel()}`);
 }
 
 // ==================== FEE-SWEEP CLOCK (on-chain, survives restarts) ====================
@@ -1130,8 +1172,8 @@ async function initSweepClock(): Promise<void> {
 function logEntryPinHint() {
   if (!activePositionPubkey || !(entrySpotUsd > 0)) return;
   console.log(
-    `[ENTRY] To keep this entry across restarts set: ENTRY_POSITION_PUBKEY=${activePositionPubkey.toBase58()} ` +
-      `ENTRY_SPOT_USD=${entrySpotUsd.toFixed(2)} ENTRY_EQUITY_USD=${entryEquityUsd > 0 ? entryEquityUsd.toFixed(2) : "(pending)"}`
+    `[ENTRY] To keep this entry across restarts set: ` +
+      entryPinLine(activePositionPubkey.toBase58(), entrySpotUsd, entryEquityUsd, entryStopLock)
   );
 }
 
@@ -1210,112 +1252,24 @@ async function fetchRecent15mKlines(): Promise<number[][] | null> {
 }
 
 // ==================== MACRO REGIME SENTINEL ====================
-export type MarketRegime = "BULL_EXPANSION" | "RANGE_CHOP" | "BEAR_DEFENSIVE";
+// Classifier, hysteresis and failure handling live in regime.ts (pure, unit-tested).
+// Regime drives bin shape for NEW deploys only; the price stop of an open position is locked at entry.
+const HL_INFO_URL = "https://api.hyperliquid.xyz/info";
+const regimeSentinel = new RegimeSentinel(
+  {
+    fetchCoinGecko: async () =>
+      (await axios.get("https://api.coingecko.com/api/v3/coins/solana/market_chart?vs_currency=usd&days=200&interval=daily", { timeout: 8000 })).data,
+    fetchFundingHistory: async (startTime: number) =>
+      (await axios.post(HL_INFO_URL, { type: "fundingHistory", coin: "SOL", startTime }, { timeout: 8000 })).data,
+    fetchPredictedFundings: async () => (await axios.post(HL_INFO_URL, { type: "predictedFundings" }, { timeout: 8000 })).data,
+  },
+  { fmtTime: (sec: number) => formatUnixPt(sec), log: (line: string) => console.log(line) }
+);
 
-export interface RegimeConfig {
-  regime: MarketRegime;
-  score: number;
-  bidBins: number;
-  askBins: number;
-  floorStopPct: number;
-  cooldownSec: number;
-  capitalDeployPct: number;
-  details: {
-    solPrice: number;
-    sma200: number;
-    fundingAnnual: number;
-    turnoverRatio: number;
-  };
-}
-
-class MacroSentinel {
-  private lastEvaluationTime: number = 0;
-  private cachedConfig: RegimeConfig | null = null;
-
-  async evaluateRegime(dlmmPoolAddress: string, force: boolean = false): Promise<RegimeConfig> {
-    const now = Math.floor(Date.now() / 1000);
-    if (!force && this.cachedConfig && now - this.lastEvaluationTime < 3600) {
-      return this.cachedConfig;
-    }
-
-    try {
-      const [cgRes, hlRes] = await Promise.all([
-        axios.get("https://api.coingecko.com/api/v3/coins/solana/market_chart?vs_currency=usd&days=200&interval=daily", { timeout: 8000 }),
-        axios.post("https://api.hyperliquid.xyz/info", { type: "predictedFundings" }, { timeout: 8000 }),
-      ]);
-
-      const prices: number[] = cgRes.data.prices.map((p: any) => p[1]);
-      const currentSolPrice = prices[prices.length - 1];
-      const sma200 = prices.reduce((a, b) => a + b, 0) / prices.length;
-      const isAbove200Sma = currentSolPrice > sma200;
-
-      let fundingAnnual = 10.0;
-      try {
-        const solEntry = hlRes.data.find((item: any) => item[0] === "SOL");
-        if (solEntry && solEntry[1]?.[0]?.[1]?.fundingRate) {
-          const hlFundingRate = parseFloat(solEntry[1][0][1].fundingRate);
-          fundingAnnual = hlFundingRate * 24 * 365 * 100;
-        }
-      } catch {}
-
-      let score = 50;
-      score += isAbove200Sma ? 25 : -25;
-      if (fundingAnnual > 5 && fundingAnnual < 40) score += 25;
-      else if (fundingAnnual <= 0) score -= 25;
-
-      let regime: MarketRegime = "RANGE_CHOP";
-      let bidBins = 30;
-      let askBins = 30;
-      let floorStopPct = 0.05;
-      let cooldownSec = 3600;
-      let capitalDeployPct = 0.85;
-
-      if (score >= 70) {
-        regime = "BULL_EXPANSION";
-        bidBins = 25;
-        askBins = 35;
-        floorStopPct = 0.04;
-        cooldownSec = 1800;
-        capitalDeployPct = 0.85;
-      } else if (score < 40) {
-        regime = "BEAR_DEFENSIVE";
-        bidBins = 45;
-        askBins = 15;
-        floorStopPct = 0.06;
-        cooldownSec = 14400;
-        capitalDeployPct = 0.60;
-      }
-
-      this.cachedConfig = {
-        regime,
-        score,
-        bidBins,
-        askBins,
-        floorStopPct,
-        cooldownSec,
-        capitalDeployPct,
-        details: { solPrice: currentSolPrice, sma200, fundingAnnual, turnoverRatio: 0.15 },
-      };
-
-      this.lastEvaluationTime = now;
-      return this.cachedConfig;
-    } catch (err: any) {
-      if (this.cachedConfig) return this.cachedConfig;
-      return {
-        regime: "BULL_EXPANSION",
-        score: 65,
-        bidBins: 25,
-        askBins: 35,
-        floorStopPct: 0.04,
-        cooldownSec: 1800,
-        capitalDeployPct: 0.85,
-        details: { solPrice: 110, sma200: 105, fundingAnnual: 10, turnoverRatio: 0.15 },
-      };
-    }
-  }
-}
-
-const macroSentinel = new MacroSentinel();
+const macroSentinel = {
+  /** Cached (1h; 15 min while a switch is pending; 5 min backoff after a failure). */
+  evaluateRegime: (_pool: string, force = false) => regimeSentinel.evaluate(force),
+};
 
 // ==================== JUPITER SWAP EXECUTION ====================
 interface SwapResult {
@@ -1815,7 +1769,10 @@ async function topUpExistingPosition(dlmmPool: DLMM): Promise<void> {
     const idleUsd = usdcUsd + idleSolUsd;
     if (idleUsd < TOPUP_MIN_USD) return;
 
-    const config = await macroSentinel.evaluateRegime(SOL_USDC_POOL.toBase58());
+    // Split follows the regime LOCKED at entry (the shape the position was opened with), not the live
+    // regime: idle capital tops up the existing bins, and a regime flip shouldn't trigger rebalancing swaps.
+    const splitRegime: MarketRegime = entryStopLock?.regime ?? DEFAULT_REGIME;
+    const config = { regime: splitRegime, ...REGIME_PROFILES[splitRegime] };
     const totalBins = Math.max(1, config.bidBins + config.askBins);
     const askRatio = config.askBins / totalBins;
     const bidRatio = config.bidBins / totalBins;
@@ -2110,8 +2067,9 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     if (entrySpotUsd > 0) {
       console.log(`[ENTRY] Recenter deploy: keeping original entry spot=$${entrySpotUsd.toFixed(2)} equity=$${entryEquityUsd.toFixed(2)}`);
     } else {
-      await recordEntryAfterOpen(dlmmPool, spotPriceUsd, "deploy", deployedValueUsd);
+      await recordEntryAfterOpen(dlmmPool, spotPriceUsd, "deploy", deployedValueUsd, config.regime);
     }
+    if (!entryStopLock) entryStopLock = resolveAttachStopLock("", false).lock; // defensive: never run unlocked
     logEntryPinHint();
     let postDeployEquityUsd: number | null = null;
     try {
@@ -2124,7 +2082,8 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
       `• Position: <code>${activePositionPubkey.toBase58()}</code>\n` +
       `• Spot / Entry: $${spotPriceUsd.toFixed(2)}\n` +
       `• Range: $${lowestBinPrice.toFixed(2)} ➔ $${highestBinPrice.toFixed(2)}\n` +
-      `• Floor Stop: ${formatFloorStopLine(config.floorStopPct)}\n` +
+      `• Floor Stop: ${formatFloorStopLine()}\n` +
+      `• Stop lock: ${stopLockLabel()}\n` +
       `• Deployed: <b>$${deployedValueUsd.toFixed(2)}</b>` +
       (postDeployEquityUsd != null ? ` | Equity: $${postDeployEquityUsd.toFixed(2)}` : "") + `\n` +
       `• Capital Baseline: ${capitalBaselineLabel()}`
@@ -2274,12 +2233,20 @@ async function listenTelegramCommands() {
         } else if (text === "/regime") {
           await notify("🔍 Querying Macro Sentinel feeds...");
           const config = await macroSentinel.evaluateRegime(SOL_USDC_POOL.toBase58(), true);
+          const d = config.details;
+          const haveRead = config.score != null;
           const rMsg =
             `🌐 <b>Macro Sentinel State</b>\n\n` +
-            `• <b>Regime:</b> <code>${config.regime}</code> (Score: <b>${config.score}/100</b>)\n` +
-            `• <b>SOL Spot:</b> $${config.details.solPrice.toFixed(2)} (200-SMA: $${config.details.sma200.toFixed(2)})\n` +
-            `• <b>Trend:</b> ${config.details.solPrice > config.details.sma200 ? "🟢 Above 200-SMA" : "🔴 Below 200-SMA"}\n` +
-            `• <b>Perp Funding:</b> ${config.details.fundingAnnual.toFixed(1)}% APR\n` +
+            `• <b>Regime:</b> <code>${config.regime}</code>${config.provisional ? " (provisional)" : ""} — ${config.source}\n` +
+            `• <b>Score:</b> ${haveRead ? `<b>${config.score!.toFixed(1)}</b>/100 → raw ${config.rawRegime}` : "n/a (no good read yet)"}\n` +
+            (haveRead
+              ? `• <b>Trend:</b> ${d.trendPts >= 0 ? "+" : ""}${d.trendPts.toFixed(1)} — $${d.solPrice.toFixed(2)} vs 200-SMA $${d.sma200.toFixed(2)}\n` +
+                `• <b>Funding:</b> ${d.fundingPts >= 0 ? "+" : ""}${d.fundingPts.toFixed(1)} — ` +
+                (d.fundingKnown ? `${d.fundingAnnual.toFixed(2)}% APR (${escapeHtml(d.fundingSource)})` : "unknown → neutral") + `\n`
+              : "") +
+            (config.holdReason ? `• <b>Hysteresis:</b> ${escapeHtml(config.holdReason)}\n` : "") +
+            (config.lastFailure ? `• <b>Last error:</b> ${escapeHtml(redactSecrets(config.lastFailure))}\n` : "") +
+            `• <b>Price stop (open position):</b> ${activePositionPubkey ? stopLockLabel() : "N/A"}\n` +
             `• <b>Active Profile:</b> -${(config.bidBins * 0.1).toFixed(1)}% Bids / +${(config.askBins * 0.1).toFixed(1)}% Asks\n` +
             `• <b>Target Deploy:</b> ${(DEPLOY_PCT * 100).toFixed(0)}% (env DEPLOY_PCT; regime table kept for bins/stops)`;
           await notify(rMsg);
@@ -2350,7 +2317,7 @@ async function listenTelegramCommands() {
           const rangeDisplay = trackingPosition
             ? `$${lowestBinPrice.toFixed(2)} ➔ $${highestBinPrice.toFixed(2)}`
             : "None (Liquidated to 100% USDC)";
-          const stopDisplay = trackingPosition ? formatFloorStopLine(config.floorStopPct) : "N/A";
+          const stopDisplay = trackingPosition ? `${formatFloorStopLine()}\n• <b>Stop Lock:</b> ${stopLockLabel()}` : "N/A";
 
           const nowSec = Math.floor(Date.now() / 1000);
           let gateTelemetry = "";
@@ -2424,7 +2391,7 @@ async function listenTelegramCommands() {
 
           const statusMsg =
             `📊 <b>DLMM Keeper Status</b>\n\n` +
-            `• <b>Regime:</b> <code>${config.regime}</code>\n` +
+            `• <b>Regime:</b> <code>${config.regime}</code> (${escapeHtml(regimeSentinel.summary())})\n` +
             `• <b>Spot:</b> $${currentPrice.toFixed(2)}\n` +
             `• <b>Exact On-Chain Range:</b> ${rangeDisplay}\n` +
             `• <b>Floor Stop:</b> ${stopDisplay}\n` +
@@ -2548,7 +2515,7 @@ async function runKeeper() {
     // Entry pin: only at boot-attach, only for the exact pinned position (stale pins are ignored).
     const pinSpot = parseOptionalUsd("ENTRY_SPOT_USD");
     const pinEquity = parseOptionalUsd("ENTRY_EQUITY_USD");
-    const pinRequested = !!(ENTRY_SPOT_USD_ENV || ENTRY_EQUITY_USD_ENV);
+    const pinRequested = !!(ENTRY_SPOT_USD_ENV || ENTRY_EQUITY_USD_ENV || ENTRY_STOP_PCT_ENV);
     let pinStatus = "none (entry = live values at attach)";
     let pinApplies = false;
     if (pinRequested) {
@@ -2560,10 +2527,15 @@ async function runKeeper() {
         pinApplies = true;
         pinStatus = "applied (ENTRY_POSITION_PUBKEY matches)";
       }
-      if (!pinApplies) console.warn(`[ENTRY] ENTRY_SPOT_USD/ENTRY_EQUITY_USD ${pinStatus}`);
+      if (!pinApplies) console.warn(`[ENTRY] ENTRY_SPOT_USD/ENTRY_EQUITY_USD/ENTRY_STOP_PCT ${pinStatus}`);
     } else if (ENTRY_POSITION_PUBKEY_ENV && ENTRY_POSITION_PUBKEY_ENV !== attachedKey) {
       console.warn(`[ENTRY] ENTRY_POSITION_PUBKEY ${ENTRY_POSITION_PUBKEY_ENV} not found among open positions; attached ${attachedKey}.`);
     }
+
+    // Price-stop % lock: pinned value, else RANGE 5% (never the live regime — a restart can't move the stop).
+    const stopLockRes = resolveAttachStopLock(ENTRY_STOP_PCT_ENV, pinApplies);
+    entryStopLock = stopLockRes.lock;
+    if (stopLockRes.warning) console.warn(`[ENTRY] ${stopLockRes.warning}`);
 
     if (pinApplies && pinSpot != null && pinSpot > 0) {
       entrySpotUsd = pinSpot;
@@ -2596,10 +2568,11 @@ async function runKeeper() {
     await notify(
       `🔗 <b>[ATTACHED TO LIVE ON-CHAIN POSITION]</b>\n` +
       `• Position: <code>${activePositionPubkey.toBase58()}</code>\n` +
-      `• Regime: <code>${config.regime}</code>\n` +
+      `• Regime: <code>${config.regime}</code> (${escapeHtml(regimeSentinel.summary())}; bin shape for new deploys only)\n` +
       `• Spot: $${spotPriceUsd.toFixed(2)} (entry $${entrySpotUsd.toFixed(2)})\n` +
       `• Exact Range: $${lowestBinPrice.toFixed(2)} ➔ $${highestBinPrice.toFixed(2)}\n` +
-      `• Floor Stop: ${formatFloorStopLine(config.floorStopPct)}\n` +
+      `• Floor Stop: ${formatFloorStopLine()}\n` +
+      `• Stop lock: ${stopLockLabel()}\n` +
       `• Equity: ${bootEquityUsd != null ? `$${bootEquityUsd.toFixed(2)}` : "n/a"}\n` +
       `• Capital Baseline: ${capitalBaselineLabel()}` +
       (bootEquityUsd != null && !capitalBaselinePending ? `\n• Net PnL: ${fmtSignedUsd(totalPnlUsd(bootEquityUsd))}` : "") +
@@ -2615,7 +2588,7 @@ async function runKeeper() {
       entry_spot: entrySpotUsd,
       entry_equity: entryEquityUsd,
       ...pnlLedgerExtras(bootEquityUsd ?? entryEquityUsd),
-      notes: `Attached to ${activePositionPubkey.toBase58()}. Entry pin: ${pinStatus}`,
+      notes: `Attached to ${activePositionPubkey.toBase58()}. Entry pin: ${pinStatus}. Stop lock: ${stopLockLabel()}. Regime ${regimeSentinel.summary()}`,
       is_estimate: false,
     });
   } else {
@@ -2699,7 +2672,9 @@ async function runKeeper() {
             unrealized_pnl_usd: uPnL,
             cumulative_fees_usd: cumulativeFeesUsd,
             ...pnlLedgerExtras(mtm),
-            notes: `Periodic equity snapshot. Net PnL vs capital $${capitalBaselineUsd.toFixed(2)} (${capitalBaselineSource}): ${fmtSignedUsd(totalPnlUsd(mtm))}`,
+            notes:
+              `Periodic equity snapshot. Net PnL vs capital $${capitalBaselineUsd.toFixed(2)} (${capitalBaselineSource}): ${fmtSignedUsd(totalPnlUsd(mtm))}. ` +
+              `Regime ${regimeSentinel.summary()}. Stop ${stopLockLabel()}`,
             is_estimate: false,
           });
         } catch (snapErr: any) {
@@ -2763,7 +2738,7 @@ async function runKeeper() {
           noteReadFailure("equity stop", eq.reason, now);
         }
       }
-      const priceStop = priceStopFromEntry(currentConfig.floorStopPct);
+      const priceStop = priceStopFromEntry(); // locked at entry; regime changes don't move it
       const equityStop = equityStopFromEntry();
       if (equityReadOk && equityStop > 0) equityStopHit = liveEquityUsd <= equityStop;
       const priceStopHit = entrySpotUsd > 0 && priceStop > 0 && isValidSpot(currentPrice) && currentPrice <= priceStop;
@@ -2774,7 +2749,8 @@ async function runKeeper() {
         isLiquidating = true;
         isExiting = true;
 
-        inCooldownUntil = now + currentConfig.cooldownSec;
+        const stopCooldownSec = lockedCooldownSec();
+        inCooldownUntil = now + stopCooldownSec;
         const targetPos = activePositionPubkey;
         activePositionPubkey = null;
         lowestBinPrice = 0;
@@ -2782,7 +2758,7 @@ async function runKeeper() {
         belowRangeTickCount = 0;
 
         const stopReason = priceStopHit
-          ? `spot $${currentPrice.toFixed(2)} ≤ entry stop $${priceStop.toFixed(2)} (−${(currentConfig.floorStopPct * 100).toFixed(1)}% vs entry $${entrySpotUsd.toFixed(2)})`
+          ? `spot $${currentPrice.toFixed(2)} ≤ entry stop $${priceStop.toFixed(2)} (−${(lockedStopPct() * 100).toFixed(1)}% locked vs entry $${entrySpotUsd.toFixed(2)})`
           : `equity $${liveEquityUsd.toFixed(2)} ≤ $${equityStop.toFixed(2)} (−${(MAX_DRAWDOWN_PCT * 100).toFixed(1)}% vs entry equity $${entryEquityUsd.toFixed(2)})`;
 
         try {
@@ -2841,7 +2817,7 @@ async function runKeeper() {
             `• Liquidated Balance: <b>$${postLiquidationUsdc.toFixed(2)} USDC</b> (equity $${exitEquityUsd.toFixed(2)})\n` +
             `• Realized (cycle): <b>${cyclePnl != null ? fmtSignedUsd(cyclePnl) : "n/a"} (${drawdownPct} vs entry equity $${cycleEntryEquityUsd.toFixed(2)})</b>\n` +
             `• Net PnL vs capital: ${fmtSignedUsd(totalPnl)} (${fmtPct(totalPnl, capitalBaselineUsd)})\n` +
-            `• Cooldown: Locked for ${currentConfig.cooldownSec / 60} minutes\n` +
+            `• Cooldown: Locked for ${stopCooldownSec / 60} minutes\n` +
             `• Swap Tx: <code>${swapSig || "N/A"}</code>`
           );
 

@@ -48,15 +48,32 @@ Net PnL = live equity (position + wallet) + swept to revenue − (STARTING_CAPIT
 
 - Top-ups, deploys, recenters, swaps, wrap/unwrap, closes, take-profit, circuit breaker and emergency exit never change the baseline; it is set once per boot, so restarts cannot double it.
 - Fee sweeps to the revenue wallet are added back, so they never show as a loss.
-- The baseline is **reporting only**. Stops use the entry state: price stop = `entry spot × (1 − floorStopPct)`, equity stop = `entry equity × (1 − MAX_DRAWDOWN_PCT)`.
+- The baseline is **reporting only**. Stops use the entry state: price stop = `entry spot × (1 − locked stop %)`, equity stop = `entry equity × (1 − MAX_DRAWDOWN_PCT)`.
 
 ### Fee-sweep schedule
 
 Fees are claimed and swept to `REVENUE_WALLET_PUBKEY` every `SWEEP_INTERVAL_SEC` (24h). The clock survives restarts: at boot the bot scans the revenue wallet's USDC ATA and uses the block time of the latest transfer whose source is the LP wallet's USDC ATA, signed by the LP wallet (address-poisoning dust from lookalike wallets and transfers from anyone else are ignored). If the scan fails it falls back to `LAST_SWEEP_UNIX`, else boot time, and retries the scan in the background every 15 min (up to 8 times). The clock advances only when a sweep actually moves USDC (scheduled, `/harvest`, or a stop/TP/recenter/emergency pre-close sweep); a due sweep that moves nothing is retried after `SWEEP_RETRY_SEC` (1h). The next sweep time (PT) is shown at boot/attach and in `/status`.
 
+### Market regime (bin shape for new deploys)
+
+The regime only shapes **new** deploys (bid/ask bins) and the stop % a new position starts with. Logic is in `regime.ts` (unit-tested: `npm test`).
+
+- **Score** = 50 + trend (±25) + funding (±25).
+  - Trend: `25 × clamp((price / 200-day mean − 1) / 10%, −1, 1)` (CoinGecko daily, 200 days).
+  - Funding: Hyperliquid SOL, 24h average of **settled hourly** rates (`fundingHistory`), annualized `hourly × 24 × 365 × 100`. Fallback: HL predicted rate (venue `HlPerp`) normalized by its `fundingIntervalHours`. |APR| < 3% → 0 (deadband); 3→8% → 0→+25; 8–40% → +25 (HL's neutral baseline is 10.95%); > 40% → 0 (overheated); −3→−10% → 0→−25; unknown → 0.
+  - Score ≥ 85 → `BULL_EXPANSION` (trend **and** funding agree), < 40 → `BEAR_DEFENSIVE`, else `RANGE_CHOP`.
+- **Hysteresis**: a new regime needs 2 consecutive complete reads (≥10 min apart; the bot re-checks after 15 min while a switch is pending) — or, except for BULL, a score ≥ 10 points inside the new band — **and** ≥ 2h in the current regime. Score < 30 switches to BEAR immediately. A read with unknown funding can't trigger a switch.
+- **Boot**: nothing is persisted; the bot starts in `RANGE_CHOP` and leaves it only after 2 consecutive confirming reads (~15 min).
+- **Failures**: keeps the current regime while the last good read is < 6h old, else `RANGE_CHOP`; never defaults to BULL. Failed reads back off 5 min (no per-tick API calls); good reads are cached 1h.
+- A `[REGIME]` log line (score, price, SMA, funding raw/interval/APR/source, result, hysteresis) is written whenever the result changes, and at least hourly. `/regime` shows the same; SNAPSHOT ledger notes include the regime and score.
+
+### Price stop is locked per position
+
+When a position is deployed, its price-stop % and post-stop cooldown are taken from the regime **at that moment** and locked for the life of the position (kept across below-range recenters, like the entry spot). Later regime changes never move the stop. On a boot-attach the lock is `ENTRY_STOP_PCT` if pinned (see below), otherwise **RANGE_CHOP's 5%** — deliberately not the live regime, so a restart can't move the stop. Idle top-ups use the locked regime's bid/ask split (the shape the position was opened with), so a regime flip doesn't trigger rebalancing swaps. `/status`, deploy and attach messages show the locked % and its source. The equity stop (`MAX_DRAWDOWN_PCT`) is unchanged.
+
 ### Entry pin across restarts
 
-On restart the bot re-anchors entry (and therefore both stops) to the live spot/equity unless pinned. To keep the original entry, set all three: `ENTRY_POSITION_PUBKEY`, `ENTRY_SPOT_USD`, `ENTRY_EQUITY_USD`. The pin is applied only when attaching at boot and only if the attached position equals `ENTRY_POSITION_PUBKEY`; otherwise it is ignored with a warning (so it can never be re-applied to a later position after a take-profit / recenter / new deploy). After every deploy/attach the bot logs the exact values to copy (`[ENTRY] To keep this entry across restarts set: ...`).
+On restart the bot re-anchors entry (and therefore both stops) to the live spot/equity unless pinned. To keep the original entry, set `ENTRY_POSITION_PUBKEY`, `ENTRY_SPOT_USD`, `ENTRY_EQUITY_USD` and `ENTRY_STOP_PCT` (fraction, e.g. `0.05`; must be 0.005–0.25). The pin is applied only when attaching at boot and only if the attached position equals `ENTRY_POSITION_PUBKEY`; otherwise it is ignored with a warning (so it can never be re-applied to a later position after a take-profit / recenter / new deploy). After every deploy/attach the bot logs the exact values to copy (`[ENTRY] To keep this entry across restarts set: ...`).
 
 ### Read guard (stop safety)
 
