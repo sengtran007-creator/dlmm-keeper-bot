@@ -10,6 +10,7 @@ import {
   sendAndConfirmTransaction,
   SystemProgram,
   Transaction,
+  TransactionInstruction,
   VersionedTransaction,
 } from "@solana/web3.js";
 import {
@@ -36,6 +37,17 @@ import {
   entryPinLine,
 } from "./regime";
 import { positionHasLiquidity } from "./multipool";
+import {
+  MEMO_PROGRAM_ID,
+  LandedStatus,
+  SweepMemo,
+  buildSweepMemo,
+  decideCatchup,
+  feeClaimLedgerFields,
+  parseSweepTx,
+  resolveLanded,
+  solSweepLamports,
+} from "./feesweep";
 
 dotenv.config();
 
@@ -96,7 +108,7 @@ const LAST_SWEEP_UNIX_ENV = (() => {
   const v = parseOptionalUsd("LAST_SWEEP_UNIX");
   return v != null && v > 1_600_000_000 ? Math.floor(v) : null;
 })();
-// Max signatures scanned on the revenue USDC ATA at boot.
+// Max signatures scanned (each) on the revenue USDC ATA and the revenue wallet at boot.
 const SWEEP_SCAN_MAX_SIGS = Math.max(100, Number(process.env.SWEEP_SCAN_MAX_SIGS ?? 2000));
 
 // Public Meteora SOL-USDC ~10bps DLMM pool + well-known mints (safe to keep in source).
@@ -125,6 +137,28 @@ const SNAPSHOT_INTERVAL_SEC = Math.max(60, Number(process.env.SNAPSHOT_INTERVAL_
 const JUPITER_API_BASE = (process.env.JUPITER_API_BASE?.trim() || "https://lite-api.jup.ag/swap/v1").replace(/\/$/, "");
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY?.trim() || "";
 const JUPITER_SLIPPAGE_BPS = Number(process.env.JUPITER_SLIPPAGE_BPS ?? 50);
+
+// ---- Claimed fee SOL handling (sweepRevenueToVault) ----
+// After a claim the fee SOL is swapped to USDC via Jupiter (FEE_SOL_SWAP_ATTEMPTS attempts; a retry only
+// happens once the previous signature is proven NOT to have landed). If the swap fails or is skipped
+// (gas gate, too small), the claimed SOL is sent natively to REVENUE_WALLET_PUBKEY instead — never taking
+// the LP wallet below GAS_RESERVE_LAMPORTS + FEE_SOL_SWEEP_MARGIN_LAMPORTS (+ tx fee).
+const FEE_SOL_SWAP_ATTEMPTS = Math.min(3, Math.max(1, Number(process.env.FEE_SOL_SWAP_ATTEMPTS ?? 2)));
+const FEE_SOL_SWAP_MIN_LAMPORTS = Math.max(0, Number(process.env.FEE_SOL_SWAP_MIN_LAMPORTS ?? 5_000_000)); // 0.005 SOL
+const FEE_SOL_SWEEP_MIN_LAMPORTS = Math.max(100_000, Number(process.env.FEE_SOL_SWEEP_MIN_LAMPORTS ?? 1_000_000)); // 0.001 SOL
+const FEE_SOL_SWEEP_MARGIN_LAMPORTS = Math.max(0, Number(process.env.FEE_SOL_SWEEP_MARGIN_LAMPORTS ?? 5_000_000)); // 0.005 SOL
+/** Budget for the native transfer's own fee (base 5000 + small priority headroom). */
+const SOL_TRANSFER_FEE_LAMPORTS = 10_000;
+// ---- One-time catch-up sweep of fee SOL left in the LP wallet (e.g. Oct 9 2026: 0.017390554 SOL) ----
+// Runs once, CATCHUP_SOL_SWEEP_DELAY_SEC after boot (≥120s so any tx sent by a previous process has either
+// landed or expired before the guard scan). Guard: the transfer carries an on-chain memo
+// "dlmm-keeper:catchup-sol-sweep id=<CATCHUP_SOL_SWEEP_ID> …"; if a tx from the LP wallet with that memo
+// already exists on the revenue wallet, nothing is sent. Fails closed if the scan fails or is incomplete.
+const CATCHUP_SOL_SWEEP_LAMPORTS = Math.max(0, Math.floor(Number(process.env.CATCHUP_SOL_SWEEP_LAMPORTS ?? 0) || 0));
+const CATCHUP_SOL_SWEEP_ID = (process.env.CATCHUP_SOL_SWEEP_ID?.trim() || "2026-10-09").replace(/[^A-Za-z0-9_.\-]/g, "").slice(0, 32);
+// Hard ceiling 0.1 SOL regardless of env (typo guard); default cap 0.05 SOL.
+const CATCHUP_SOL_SWEEP_MAX_LAMPORTS = Math.min(100_000_000, Math.max(0, Number(process.env.CATCHUP_SOL_SWEEP_MAX_LAMPORTS ?? 50_000_000)));
+const CATCHUP_SOL_SWEEP_DELAY_SEC = Math.max(120, Number(process.env.CATCHUP_SOL_SWEEP_DELAY_SEC ?? 180));
 
 // Gate 2: max allowed *variable* fee in basis points before re-entry is blocked.
 // (Not variableFeeControl — that is a static pool config constant, often ~40000.)
@@ -217,6 +251,9 @@ let cumulativeSweptUsd = 0;
 /** USD swept to revenue since the current entry (reset with entry state). Used so per-cycle P&L isn't reduced by sweeps. */
 let sweptSinceEntryUsd = 0;
 let cumulativeGasSol = 0;
+/** Serializes native SOL transfers to the revenue wallet (fee sweep fallback vs one-time catch-up). */
+let solTransferInFlight = false;
+let catchupSentThisProcess = false;
 
 // ---- Read-guard state ----
 /** Set when entry equity could not be measured at attach; filled on the first good equity read. */
@@ -1019,34 +1056,57 @@ interface SweepHistory {
   totalSweptUsd: number;
   sweepCount: number;
   scannedSigs: number;
+  /** Native SOL sent LP → revenue (part of totalSweptUsd at its USD value). */
+  solSweptLamports?: number;
+  solSweptUsd?: number;
+  /** Catch-up ids found in LP-signed memos on chain (one-time catch-up guard). */
+  catchupIds?: Set<string>;
+}
+
+/** SOL/USD 1m close at a past unix time (Hyperliquid candles) — only for SOL sweeps without a bot memo. */
+async function historicalSolUsd(unixSec: number): Promise<number | null> {
+  try {
+    const startTime = (unixSec - 120) * 1000;
+    const endTime = (unixSec + 60) * 1000;
+    const res = await axios.post(
+      "https://api.hyperliquid.xyz/info",
+      { type: "candleSnapshot", req: { coin: "SOL", interval: "1m", startTime, endTime } },
+      { timeout: 8000 }
+    );
+    const candles: any[] = Array.isArray(res.data) ? res.data : [];
+    const before = candles.filter((c) => Number(c.t) <= unixSec * 1000);
+    const c = before.length ? before[before.length - 1] : candles[0];
+    const px = Number(c?.c);
+    return isValidSpot(px) ? px : null;
+  } catch {
+    return null;
+  }
+}
+
+async function listSignatures(address: PublicKey): Promise<{ sigs: { signature: string; err: any }[]; complete: boolean }> {
+  const sigs: { signature: string; err: any }[] = [];
+  let before: string | undefined;
+  let complete = false;
+  while (sigs.length < SWEEP_SCAN_MAX_SIGS) {
+    const limit = Math.min(1000, SWEEP_SCAN_MAX_SIGS - sigs.length);
+    const page = await connection.getSignaturesForAddress(address, { before, limit }, "confirmed");
+    sigs.push(...page);
+    if (page.length < limit) {
+      complete = true;
+      break;
+    }
+    before = page[page.length - 1].signature;
+  }
+  return { sigs, complete };
 }
 
 /**
- * USDC raw amount moved by THIS tx from the LP wallet's USDC ATA to the revenue wallet's USDC ATA,
- * signed by the LP wallet. Anything else (address-poisoning dust from lookalike wallets, transfers from
- * other sources, failed txs) counts as 0.
+ * Scan the revenue wallet's USDC ATA AND the revenue wallet itself for sweeps signed by this LP wallet:
+ * USDC transfers LP-ATA → revenue-ATA (raw USDC = USD) and native SOL transfers LP → revenue wallet
+ * (USD from the bot's sweep memo written at send time = lamports × pool spot then; memo-less SOL transfers
+ * fall back to the Hyperliquid 1m close at blockTime, else the scan is marked incomplete).
+ * Returns last sweep time, cumulative USD and the catch-up ids already done.
  */
-function sweepRawFromParsedTx(tx: any, lpWallet: string, lpUsdcAta: string, revUsdcAta: string): number {
-  if (!tx || tx.meta?.err) return 0;
-  const top = tx.transaction?.message?.instructions || [];
-  const inner = (tx.meta?.innerInstructions || []).flatMap((i: any) => i.instructions || []);
-  let raw = 0;
-  for (const ix of [...top, ...inner]) {
-    const parsed = ix?.parsed;
-    if (!parsed || ix.program !== "spl-token") continue;
-    if (parsed.type !== "transfer" && parsed.type !== "transferChecked") continue;
-    const info = parsed.info || {};
-    if (info.source !== lpUsdcAta || info.destination !== revUsdcAta) continue;
-    const authority = info.authority ?? info.multisigAuthority;
-    if (authority !== lpWallet) continue;
-    if (info.mint && info.mint !== USDC_MINT.toBase58()) continue;
-    const amt = Number(info.tokenAmount?.amount ?? info.amount);
-    if (Number.isFinite(amt) && amt > 0) raw += amt;
-  }
-  return raw;
-}
-
-/** Scan the revenue wallet's USDC ATA for sweeps from this LP wallet: last sweep time + cumulative USD. */
 async function scanSweepHistoryOnChain(): Promise<SweepHistory> {
   const empty: SweepHistory = {
     ok: false, complete: false, lastSweepUnix: null, lastSweepSig: null, totalSweptUsd: 0, sweepCount: 0, scannedSigs: 0,
@@ -1056,23 +1116,20 @@ async function scanSweepHistoryOnChain(): Promise<SweepHistory> {
     const lpUsdcAta = (await getAssociatedTokenAddress(USDC_MINT, wallet.publicKey)).toBase58();
     const revUsdcAtaKey = await getAssociatedTokenAddress(USDC_MINT, LP_REVENUE_VAULT);
     const revUsdcAta = revUsdcAtaKey.toBase58();
+    const ctx = { lpWallet, revWallet: LP_REVENUE_VAULT.toBase58(), lpUsdcAta, revUsdcAta, usdcMint: USDC_MINT.toBase58() };
 
-    const sigs: { signature: string; err: any; blockTime?: number | null }[] = [];
-    let before: string | undefined;
-    let complete = false;
-    while (sigs.length < SWEEP_SCAN_MAX_SIGS) {
-      const limit = Math.min(1000, SWEEP_SCAN_MAX_SIGS - sigs.length);
-      const page = await connection.getSignaturesForAddress(revUsdcAtaKey, { before, limit }, "confirmed");
-      sigs.push(...page);
-      if (page.length < limit) {
-        complete = true;
-        break;
-      }
-      before = page[page.length - 1].signature;
-    }
+    const ataList = await listSignatures(revUsdcAtaKey);
+    const walletList = await listSignatures(LP_REVENUE_VAULT);
+    const uniq = new Map<string, { signature: string; err: any }>();
+    for (const x of [...ataList.sigs, ...walletList.sigs]) if (!uniq.has(x.signature)) uniq.set(x.signature, x);
+    const sigs = [...uniq.values()];
 
-    const res: SweepHistory = { ...empty, ok: true, complete, scannedSigs: sigs.length };
+    const res: SweepHistory = {
+      ...empty, ok: true, complete: ataList.complete && walletList.complete, scannedSigs: sigs.length,
+      solSweptLamports: 0, solSweptUsd: 0, catchupIds: new Set<string>(),
+    };
     let totalRaw = 0;
+    let solUsd = 0;
     const candidates = sigs.filter((x) => !x.err);
     const BATCH = 10;
     for (let i = 0; i < candidates.length; i += BATCH) {
@@ -1089,11 +1146,26 @@ async function scanSweepHistoryOnChain(): Promise<SweepHistory> {
         const sig: string | undefined = tx.transaction?.signatures?.[0];
         if (!sig || seen.has(sig)) continue;
         seen.add(sig);
-        const raw = sweepRawFromParsedTx(tx, lpWallet, lpUsdcAta, revUsdcAta);
-        if (raw <= 0) continue;
-        totalRaw += raw;
-        res.sweepCount += 1;
+        const p = parseSweepTx(tx, ctx);
+        if (p.memo?.kind === "catchup-sol-sweep" && p.memo.id) res.catchupIds!.add(p.memo.id);
+        if (p.usdcRaw <= 0 && p.solLamports <= 0) continue;
         const bt: number | null = tx.blockTime ?? null;
+        if (p.usdcRaw > 0) totalRaw += p.usdcRaw;
+        if (p.solLamports > 0) {
+          let usd = p.solUsdFromMemo;
+          if (usd == null && bt) {
+            const px = await historicalSolUsd(bt);
+            if (px != null) usd = (p.solLamports / 1e9) * px;
+          }
+          if (usd == null) {
+            res.complete = false; // unpriced SOL sweep — total understated
+            console.warn(`[SWEEP] SOL sweep ${sig.slice(0, 8)}… (${p.solLamports} lamports) could not be priced`);
+          } else {
+            solUsd += usd;
+          }
+          res.solSweptLamports! += p.solLamports;
+        }
+        res.sweepCount += 1;
         if (bt && (res.lastSweepUnix == null || bt > res.lastSweepUnix)) {
           res.lastSweepUnix = bt;
           res.lastSweepSig = sig;
@@ -1101,7 +1173,8 @@ async function scanSweepHistoryOnChain(): Promise<SweepHistory> {
       }
       if (seen.size < batch.length) res.complete = false; // pruned/unavailable — total may be understated
     }
-    res.totalSweptUsd = Number((totalRaw / 1e6).toFixed(6));
+    res.solSweptUsd = Number(solUsd.toFixed(6));
+    res.totalSweptUsd = Number((totalRaw / 1e6 + solUsd).toFixed(6));
     return res;
   } catch (err: any) {
     return { ...empty, reason: redactSecrets(String(err?.message || err)).slice(0, 200) };
@@ -1154,7 +1227,8 @@ async function resolveSweepStateFromChain(context: string): Promise<boolean> {
     );
   }
   console.log(
-    `[SWEEP] ${context}: on-chain sweeps=${h.sweepCount} total=$${h.totalSweptUsd.toFixed(2)} (scanned ${h.scannedSigs} sigs${h.complete ? "" : ", incomplete"}) | ` +
+    `[SWEEP] ${context}: on-chain sweeps=${h.sweepCount} total=$${h.totalSweptUsd.toFixed(2)} ` +
+      `(incl. ${((h.solSweptLamports ?? 0) / 1e9).toFixed(6)} SOL = $${(h.solSweptUsd ?? 0).toFixed(2)}) (scanned ${h.scannedSigs} sigs${h.complete ? "" : ", incomplete"}) | ` +
       `prior swept $${priorSweptUsd.toFixed(2)} [${priorSweptSource}] | next sweep: ${nextSweepLabel()}`
   );
   return true;
@@ -1306,6 +1380,45 @@ interface SwapResult {
   slippageBps: number;
   usdNotional: number;
   isEstimate: boolean;
+  /** Set when a tx was signed (and maybe sent) but did not confirm as landed. */
+  attemptedSig?: string;
+  /** "landed" on success; on failure: not_landed / failed (safe to retry) or unknown (do NOT retry). */
+  landedStatus?: LandedStatus;
+}
+
+function isPreflightRejection(err: any): boolean {
+  const m = String(err?.message || err || "");
+  return /simulation failed|preflight|blockhash not found|insufficient (funds|lamports)/i.test(m);
+}
+
+/**
+ * Wait for a sent signature: blockhash-based confirm; on timeout/error, poll status until it is confirmed or
+ * its blockhash has expired (then it can never land). "unknown" = could not prove either way.
+ */
+async function confirmOrResolveLanded(
+  sig: string,
+  blockhash: string,
+  lastValidBlockHeight: number,
+  sendErr: any
+): Promise<LandedStatus> {
+  if (sendErr && isPreflightRejection(sendErr)) return "not_landed"; // RPC rejected it before broadcast
+  if (!sendErr) {
+    try {
+      const c = await connection.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, "confirmed");
+      return c?.value?.err ? "failed" : "landed";
+    } catch (err: any) {
+      console.warn(`[TX] confirm ${sig.slice(0, 8)}… did not resolve (${err?.message || err}) — checking chain`);
+    }
+  }
+  return resolveLanded(sig, lastValidBlockHeight, {
+    getStatus: async (x) => {
+      const r = await connection.getSignatureStatuses([x], { searchTransactionHistory: true });
+      const v = r?.value?.[0];
+      return v ? { err: v.err, confirmationStatus: v.confirmationStatus ?? null } : null;
+    },
+    getBlockHeight: () => connection.getBlockHeight("confirmed"),
+    sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+  }, { pollMs: 2000, maxWaitMs: 150_000 });
 }
 
 async function executeJupiterSwap(
@@ -1326,6 +1439,8 @@ async function executeJupiterSwap(
     usdNotional: 0,
     isEstimate: true,
   };
+  let attemptedSig = "";
+  let landedStatus: LandedStatus | undefined;
   try {
     // quote-api.jup.ag/v6 is dead (ENOTFOUND). Current Swap API: lite-api.jup.ag/swap/v1 (or api.jup.ag/swap/v1 + key).
     const headers: Record<string, string> = { Accept: "application/json" };
@@ -1375,8 +1490,28 @@ async function executeJupiterSwap(
     const vtx = VersionedTransaction.deserialize(swapTxBuf);
     vtx.sign([wallet]);
 
-    const txid = await connection.sendTransaction(vtx, { skipPreflight: false, maxRetries: 3 });
-    await connection.confirmTransaction(txid, "confirmed");
+    // Expiry bound for "did it land?": Jupiter returns lastValidBlockHeight; else a conservative
+    // current height + 300 (blockhash validity is 150 blocks from when Jupiter fetched it).
+    const jupLvbh = Number(swapRes.data?.lastValidBlockHeight);
+    const lastValidBlockHeight =
+      Number.isFinite(jupLvbh) && jupLvbh > 0 ? jupLvbh : (await connection.getBlockHeight("confirmed")) + 300;
+    // Signature is known before sending, so a send/confirm error never loses track of the tx.
+    const txid = bs58.encode(vtx.signatures[0]);
+    attemptedSig = txid;
+    let sendErr: any = null;
+    try {
+      await connection.sendTransaction(vtx, { skipPreflight: false, maxRetries: 3 });
+    } catch (e: any) {
+      sendErr = e;
+    }
+    landedStatus = await confirmOrResolveLanded(txid, vtx.message.recentBlockhash, lastValidBlockHeight, sendErr);
+    if (landedStatus !== "landed") {
+      throw new Error(
+        `swap tx ${txid} ${landedStatus}` +
+          (landedStatus === "unknown" ? " (could not prove it landed or expired — not retrying)" : "") +
+          (sendErr ? ` (send error: ${sendErr?.message || sendErr})` : "")
+      );
+    }
 
     const meta = await fetchTxWalletDeltas(txid);
     const postSnap = await snapshotWalletBalances();
@@ -1461,6 +1596,8 @@ async function executeJupiterSwap(
       slippageBps: realizedSlippageBps,
       usdNotional,
       isEstimate,
+      attemptedSig: txid,
+      landedStatus: "landed",
     };
 
     const inUi = inIsSol ? inAmountActual / 1e9 : inAmountActual / 1e6;
@@ -1492,13 +1629,169 @@ async function executeJupiterSwap(
     void emitLedger({
       event: "ERROR",
       notes: `Jupiter swap failed: ${err?.message || err}`,
+      tx_sig: attemptedSig || undefined,
       is_estimate: true,
     });
-    return empty;
+    // Nothing signed yet (quote / gas gate / API error) → nothing can land → safe to retry.
+    return { ...empty, attemptedSig: attemptedSig || undefined, landedStatus: attemptedSig ? (landedStatus ?? "unknown") : "not_landed" };
   }
 }
 
 // ==================== PROFIT SWEEP TO LP REVENUE ====================
+/** Any successful sweep (scheduled, /harvest, stop, TP, recenter, emergency, SOL or USDC) restarts the 24h clock. */
+function markSweptNow() {
+  lastSweepTime = Math.floor(Date.now() / 1000);
+  lastSweepSource = "in-process sweep";
+  nextSweepRetryAt = 0;
+}
+
+interface SolTransferResult {
+  status: LandedStatus | "skipped";
+  sig: string;
+  lamports: number;
+  usd: number;
+  reason?: string;
+}
+
+/**
+ * Native SOL → REVENUE_WALLET_PUBKEY (destination from config only — never from tx history; a lookalike
+ * poisoning address dusts this wallet). Adds a memo with the USD value at send time so the boot-time
+ * on-chain swept total can value it. Logs a FEE_SWEEP row and updates swept totals when it lands.
+ * Re-checks the gas floor right before sending.
+ */
+async function sendSolToRevenue(
+  requestedLamports: number,
+  spotUsd: number,
+  memo: Omit<SweepMemo, "usd" | "spot">,
+  ledgerNote: string
+): Promise<SolTransferResult> {
+  const skipped = (reason: string): SolTransferResult => ({ status: "skipped", sig: "", lamports: 0, usd: 0, reason });
+  if (solTransferInFlight) return skipped("another SOL transfer is in flight");
+  if (!isValidSpot(spotUsd)) return skipped(`invalid spot ${spotUsd}`);
+  if (LP_REVENUE_VAULT.equals(wallet.publicKey)) return skipped("revenue wallet == LP wallet");
+  solTransferInFlight = true;
+  try {
+    const native = await connection.getBalance(wallet.publicKey, "confirmed");
+    const size = solSweepLamports({
+      requestedLamports,
+      nativeLamports: native,
+      gasReserveLamports: GAS_RESERVE_LAMPORTS,
+      marginLamports: FEE_SOL_SWEEP_MARGIN_LAMPORTS,
+      txFeeLamports: SOL_TRANSFER_FEE_LAMPORTS,
+      minLamports: memo.kind === "catchup-sol-sweep" ? requestedLamports : FEE_SOL_SWEEP_MIN_LAMPORTS,
+    });
+    if (size.lamports <= 0) return skipped(size.reason);
+    const lamports = size.lamports;
+    const usd = Number(((lamports / 1e9) * spotUsd).toFixed(6));
+    const memoText = buildSweepMemo({ ...memo, lamports, usd, spot: spotUsd });
+
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    const tx = new Transaction({ feePayer: wallet.publicKey, blockhash, lastValidBlockHeight })
+      .add(SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: LP_REVENUE_VAULT, lamports }))
+      .add(new TransactionInstruction({ programId: new PublicKey(MEMO_PROGRAM_ID), keys: [], data: Buffer.from(memoText, "utf8") }));
+    tx.sign(wallet);
+    const sig = bs58.encode(tx.signature!);
+    let sendErr: any = null;
+    try {
+      await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+    } catch (e: any) {
+      sendErr = e;
+    }
+    const status = await confirmOrResolveLanded(sig, blockhash, lastValidBlockHeight, sendErr);
+    if (status !== "landed") {
+      void emitLedger({
+        event: "ERROR",
+        tx_sig: sig,
+        notes: `Native SOL sweep ${status}: ${(lamports / 1e9).toFixed(9)} SOL (${memo.kind})${sendErr ? ` send error: ${sendErr?.message || sendErr}` : ""}`,
+        is_estimate: true,
+      });
+      return { status, sig, lamports: 0, usd: 0, reason: status };
+    }
+    const feeSol = await getTxFeeSol(sig);
+    if (feeSol != null) cumulativeGasSol += feeSol;
+    cumulativeSweptUsd += usd;
+    sweptSinceEntryUsd += usd;
+    markSweptNow();
+    await emitLedger({
+      event: "FEE_SWEEP",
+      spot_usd: spotUsd,
+      // fees_claimed_usd intentionally omitted: fees are counted once, on the FEE_CLAIM row.
+      swept_to_revenue_usd: usd,
+      cumulative_fees_usd: cumulativeFeesUsd,
+      gas_fee_sol: feeSol ?? undefined,
+      gas_fee_usd: feeSol != null ? feeSol * spotUsd : undefined,
+      tx_sig: sig,
+      sol_swept: lamports / 1e9,
+      notes:
+        `Native SOL sweep to REVENUE_WALLET_PUBKEY: ${(lamports / 1e9).toFixed(9)} SOL @ $${spotUsd.toFixed(4)} = $${usd.toFixed(6)}. ` +
+        ledgerNote,
+      is_estimate: false,
+    });
+    return { status, sig, lamports, usd };
+  } catch (err: any) {
+    return skipped(`error: ${redactSecrets(String(err?.message || err)).slice(0, 160)}`);
+  } finally {
+    solTransferInFlight = false;
+  }
+}
+
+/**
+ * Claimed fee SOL → revenue. 1) Jupiter SOL→USDC (FEE_SOL_SWAP_ATTEMPTS; retry only when the previous
+ * signature is proven not landed / failed). 2) If the swap failed or was skipped, send the SOL natively.
+ * A swap whose outcome is "unknown" stops everything (no retry, no transfer) to avoid moving it twice.
+ */
+async function sweepClaimedFeeSol(
+  claimedSolLamports: number,
+  spotUsd: number
+): Promise<{ mode: "swap" | "transfer" | "kept" | "none"; solUsd: number; line: string }> {
+  const solUi = (claimedSolLamports / 1e9).toFixed(6);
+  let swapNote = "";
+  const native = await connection.getBalance(wallet.publicKey, "confirmed");
+  // executeJupiterSwap itself requires native ≥ reserve + 0.005 SOL before swapping.
+  const swapAmount = Math.min(claimedSolLamports, Math.max(0, native - GAS_RESERVE_LAMPORTS - FEE_SOL_SWEEP_MARGIN_LAMPORTS));
+  if (swapAmount >= FEE_SOL_SWAP_MIN_LAMPORTS) {
+    for (let attempt = 1; attempt <= FEE_SOL_SWAP_ATTEMPTS; attempt++) {
+      await notify(`🔄 Swapping ${(swapAmount / 1e9).toFixed(4)} claimed fee SOL to USDC (attempt ${attempt}/${FEE_SOL_SWAP_ATTEMPTS})...`);
+      const r = await executeJupiterSwap(WSOL_MINT, USDC_MINT, swapAmount.toString(), isValidSpot(spotUsd) ? spotUsd : 0);
+      if (r.sig) {
+        const outUsdc = (r.outAmountActual ?? r.outAmountQuoted) / 1e6;
+        return {
+          mode: "swap",
+          solUsd: 0, // proceeds are swept with the USDC leg
+          line: `• SOL: ${(r.inAmount / 1e9).toFixed(6)} SOL swapped → ${outUsdc.toFixed(6)} USDC (in the USDC sweep above; tx <code>${r.sig}</code>)`,
+        };
+      }
+      if (r.landedStatus === "unknown" || r.landedStatus === "landed") {
+        const msg =
+          `⚠️ Fee SOL swap ${r.attemptedSig ?? ""} status ${r.landedStatus} — NOT retrying and NOT sending SOL natively ` +
+          `(avoids moving it twice). Check the signature; leftover fee SOL stays in the LP wallet.`;
+        return { mode: "kept", solUsd: 0, line: `• SOL: ${solUi} SOL kept in LP wallet — ${msg}` };
+      }
+      swapNote = `Jupiter swap ${r.landedStatus ?? "failed"} after ${attempt} attempt(s)`;
+      if (attempt < FEE_SOL_SWAP_ATTEMPTS) await new Promise((res) => setTimeout(res, 3000));
+    }
+  } else {
+    swapNote =
+      claimedSolLamports < FEE_SOL_SWAP_MIN_LAMPORTS
+        ? `swap skipped (below ${(FEE_SOL_SWAP_MIN_LAMPORTS / 1e9).toFixed(3)} SOL)`
+        : `swap skipped (gas gate: wallet ${(native / 1e9).toFixed(4)} SOL)`;
+  }
+
+  const t = await sendSolToRevenue(claimedSolLamports, spotUsd, { kind: "fee-sol-sweep" }, `Fee SOL fallback (${swapNote}).`);
+  if (t.status === "landed") {
+    return {
+      mode: "transfer",
+      solUsd: t.usd,
+      line: `• SOL: <b>${(t.lamports / 1e9).toFixed(6)} SOL</b> sent natively ($${t.usd.toFixed(2)} @ $${spotUsd.toFixed(2)}; ${swapNote}) tx <code>${t.sig}</code>`,
+    };
+  }
+  return {
+    mode: "kept",
+    solUsd: 0,
+    line: `• SOL: ${solUi} SOL kept in LP wallet (${swapNote}; native transfer ${t.status}${t.reason && t.reason !== t.status ? `: ${t.reason}` : ""})`,
+  };
+}
+
 async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
   try {
     if (!activePositionPubkey) return 0;
@@ -1568,30 +1861,44 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
       if (snapUsdc > claimedUsdcRaw) claimedUsdcRaw = snapUsdc;
     }
 
-    const surplusSolToSwap = Math.max(0, postClaim.nativeLamports - GAS_RESERVE_LAMPORTS);
-    // FEE_CLAIM: fee X (SOL) + fee Y (USDC). SOL USD left for SWAP/FEE_SWEEP when converted.
+    // Spot for valuing the SOL half (pool active bin, else the last good spot).
+    let claimSpotUsd = NaN;
+    try {
+      const ab = await dlmmPool.getActiveBin();
+      claimSpotUsd = Number(ab.price) * PRICE_DECIMAL_FACTOR;
+    } catch {}
+    if (!isValidSpot(claimSpotUsd)) claimSpotUsd = lastGoodSpotUsd;
+
+    // FEE_CLAIM: both halves, valued once (fees_claimed_usd = USDC + SOL × spot). The dashboard counts
+    // fees from FEE_CLAIM rows only; FEE_SWEEP rows carry swept_to_revenue_usd and no fees_claimed_usd.
+    const claimFields = feeClaimLedgerFields(claimedUsdcRaw, claimedSolLamports, claimSpotUsd);
     if (claimedSolLamports > 0 || claimedUsdcRaw > 0) {
       if (claimFeeLamports > 0) cumulativeGasSol += claimFeeLamports / 1e9;
+      cumulativeFeesUsd += claimFields.fees_claimed_usd;
       void emitLedger({
         event: "FEE_CLAIM",
-        fees_claimed_usd: claimedUsdcRaw / 1e6,
+        spot_usd: isValidSpot(claimSpotUsd) ? claimSpotUsd : undefined,
+        fees_claimed_usd: claimFields.fees_claimed_usd,
+        cumulative_fees_usd: cumulativeFeesUsd,
+        // extra fields (ignored by the v2.1 Apps Script; kept for future columns / logs)
+        fees_sol: claimFields.fees_sol,
+        fees_usdc: claimFields.fees_usdc,
+        fees_sol_usd: claimFields.fees_sol_usd,
         gas_fee_sol: claimFeeLamports > 0 ? claimFeeLamports / 1e9 : undefined,
         tx_sig: claimSigs.join(",") || undefined,
-        notes: `feeX(SOL)=${(claimedSolLamports / 1e9).toFixed(6)} feeY(USDC)=${(claimedUsdcRaw / 1e6).toFixed(6)}`,
+        notes: claimFields.notes,
         is_estimate: !claimActual,
       });
     }
 
-    if (claimedSolLamports >= 5_000_000 && surplusSolToSwap >= 5_000_000) {
-      const swapAmount = Math.min(claimedSolLamports, surplusSolToSwap);
-      try {
-        await notify(`🔄 Swapping ${(swapAmount / 1e9).toFixed(4)} claimed fee SOL to USDC...`);
-        await executeJupiterSwap(WSOL_MINT, USDC_MINT, swapAmount.toString(), 0);
-      } catch (swapErr: any) {
-        console.error("Fee SOL-to-USDC swap note:", swapErr.message);
-      }
-    }
+    // ---- SOL half: Jupiter swap (with safe retry), else native transfer to the revenue wallet ----
+    const solLeg = claimedSolLamports > 0
+      ? await sweepClaimedFeeSol(claimedSolLamports, claimSpotUsd)
+      : { mode: "none" as const, solUsd: 0, line: "" };
 
+    // ---- USDC half (+ Jupiter proceeds of the fee SOL) ----
+    let usdcSweptUsd = 0;
+    let usdcSweepSig = "";
     const finalUsdcAcc = await getAccount(connection, botUsdcAta);
     const freshlyClaimedUsdc = finalUsdcAcc.amount > usdcBefore ? (finalUsdcAcc.amount - usdcBefore) : 0n;
 
@@ -1607,38 +1914,48 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
         )
       );
       const sig = await sendAndConfirmTransaction(connection, sweepTx, [wallet]);
+      usdcSweepSig = sig;
       const sweptAmountUsd = Number(freshlyClaimedUsdc) / 1e6;
-
-      await notify(
-        `💰 <b>[FEE SWEEP]</b> Harvested & Swept <b>$${sweptAmountUsd.toFixed(2)} USDC</b> to LP Revenue!\n` +
-        `• Destination: <code>${LP_REVENUE_VAULT.toBase58()}</code>\n` +
-        `• Tx: <code>${sig}</code>`
-      );
       const sweepMeta = await fetchTxWalletDeltas(sig);
-      const sweptUsdFinal = sweepMeta.ok
+      usdcSweptUsd = sweepMeta.ok
         ? Math.max(0, -(sweepMeta.usdcRawDelta)) / 1e6
         : sweptAmountUsd;
       const feeSol = sweepMeta.feeLamports != null ? sweepMeta.feeLamports / 1e9 : await getTxFeeSol(sig);
-      cumulativeFeesUsd += sweptUsdFinal;
-      cumulativeSweptUsd += sweptUsdFinal;
-      sweptSinceEntryUsd += sweptUsdFinal;
-      // Any successful sweep (scheduled, /harvest, stop, TP, recenter, emergency) restarts the 24h clock.
-      lastSweepTime = Math.floor(Date.now() / 1000);
-      lastSweepSource = "in-process sweep";
-      nextSweepRetryAt = 0;
+      cumulativeSweptUsd += usdcSweptUsd;
+      sweptSinceEntryUsd += usdcSweptUsd;
+      markSweptNow();
       if (feeSol != null) cumulativeGasSol += feeSol;
       await emitLedger({
         event: "FEE_SWEEP",
-        fees_claimed_usd: sweptUsdFinal,
-        swept_to_revenue_usd: sweptUsdFinal,
+        // fees_claimed_usd intentionally omitted: fees are counted once, on the FEE_CLAIM row.
+        swept_to_revenue_usd: usdcSweptUsd,
         cumulative_fees_usd: cumulativeFeesUsd,
         gas_fee_sol: feeSol ?? undefined,
         tx_sig: sig,
-        notes: "Claimed fees converted/swept to REVENUE_WALLET_PUBKEY",
+        notes:
+          `USDC fee sweep to REVENUE_WALLET_PUBKEY: ${usdcSweptUsd.toFixed(6)} USDC` +
+          (solLeg.mode === "swap" ? " (claimed USDC + Jupiter proceeds of fee SOL)" : " (claimed USDC)"),
         is_estimate: !sweepMeta.ok,
       });
-      return sweptUsdFinal;
     }
+
+    const solSweptUsd = solLeg.mode === "transfer" ? solLeg.solUsd : 0;
+    const totalSweptUsd = Number((usdcSweptUsd + solSweptUsd).toFixed(6));
+    if (claimedSolLamports > 0 || claimedUsdcRaw > 0 || totalSweptUsd > 0) {
+      const lines = [
+        `💰 <b>[FEE SWEEP]</b> Claimed <b>$${claimFields.fees_claimed_usd.toFixed(2)}</b> in fees ` +
+          `(${claimFields.fees_usdc.toFixed(6)} USDC + ${claimFields.fees_sol.toFixed(6)} SOL ≈ $${claimFields.fees_sol_usd.toFixed(2)}` +
+          `${isValidSpot(claimSpotUsd) ? ` @ $${claimSpotUsd.toFixed(2)}` : ""})`,
+        usdcSweptUsd > 0
+          ? `• USDC → revenue: <b>$${usdcSweptUsd.toFixed(2)}</b> (tx <code>${usdcSweepSig}</code>)`
+          : `• USDC → revenue: nothing swept (below $0.05 or no new USDC)`,
+      ];
+      if (solLeg.line) lines.push(solLeg.line);
+      lines.push(`• Total swept to revenue now: <b>$${totalSweptUsd.toFixed(2)}</b>`);
+      lines.push(`• Destination: <code>${LP_REVENUE_VAULT.toBase58()}</code>`);
+      await notify(lines.join("\n"));
+    }
+    if (totalSweptUsd > 0) return totalSweptUsd;
   } catch (err: any) {
     if (!err.message?.includes("No fee to claim")) {
       console.error("[FEE SWEEP ERROR]:", err.message);
@@ -2510,10 +2827,10 @@ async function listenTelegramCommands() {
             await notify("⚠️ Cannot harvest: No active open DLMM position detected.");
             continue;
           }
-          await notify("⏳ Checking and sweeping fees to USDC...");
+          await notify("⏳ Checking and sweeping fees to LP Revenue...");
           const sweptAmount = await sweepRevenueToVault(dlmmPoolInstance);
           if (sweptAmount > 0) {
-            await notify(`✅ Sweep complete: $${sweptAmount.toFixed(2)} USDC sent to LP Revenue.`);
+            await notify(`✅ Sweep complete: $${sweptAmount.toFixed(2)} sent to LP Revenue (USDC + any native fee SOL).`);
           } else {
             await notify("ℹ️ No surplus fees available to sweep.");
           }
@@ -2531,6 +2848,104 @@ async function listenTelegramCommands() {
   }
 }
 
+// ==================== ONE-TIME CATCH-UP: LEFTOVER FEE SOL → REVENUE ====================
+/**
+ * Env-driven one-shot (CATCHUP_SOL_SWEEP_LAMPORTS / CATCHUP_SOL_SWEEP_ID). Safe across restarts:
+ *  - runs CATCHUP_SOL_SWEEP_DELAY_SEC (≥120s) after boot, so a tx sent by a previous process has landed or
+ *    expired before the guard scan;
+ *  - the transfer carries memo "dlmm-keeper:catchup-sol-sweep id=<ID> …" signed by the LP wallet; a fresh
+ *    on-chain scan that finds that id means "already done" → nothing is sent (remove the env afterwards);
+ *  - fails closed if the scan fails or is incomplete; never sends twice in one process (even on "unknown");
+ *  - full amount must fit above GAS_RESERVE + FEE_SOL_SWEEP_MARGIN (no partial send); capped at
+ *    CATCHUP_SOL_SWEEP_MAX_LAMPORTS (≤ 0.1 SOL hard ceiling).
+ */
+async function runCatchupSolSweep(attempt = 1): Promise<void> {
+  if (!(CATCHUP_SOL_SWEEP_LAMPORTS > 0) || catchupSentThisProcess) return;
+  const retryLater = (why: string) => {
+    if (attempt >= 6) {
+      void notify(`⚠️ Catch-up SOL sweep (id ${CATCHUP_SOL_SWEEP_ID}) gave up after ${attempt} attempts: ${why}`);
+      return;
+    }
+    console.warn(`[CATCHUP] deferred (${why}); retry in 5 min`);
+    setTimeout(() => void runCatchupSolSweep(attempt + 1), 5 * 60 * 1000);
+  };
+  if (isExiting || isDeploying || isLiquidating || solTransferInFlight || !dlmmPoolInstance) {
+    retryLater("bot busy (exit/deploy/transfer in progress)");
+    return;
+  }
+  let h: SweepHistory;
+  try {
+    h = await withTimeout(scanSweepHistoryOnChain(), 60_000, "catch-up guard scan");
+  } catch (err: any) {
+    h = { ok: false, complete: false, lastSweepUnix: null, lastSweepSig: null, totalSweptUsd: 0, sweepCount: 0, scannedSigs: 0,
+      reason: redactSecrets(String(err?.message || err)) };
+  }
+  let native = 0;
+  try {
+    native = await connection.getBalance(wallet.publicKey, "confirmed");
+  } catch (err: any) {
+    retryLater(`balance read failed: ${err?.message || err}`);
+    return;
+  }
+  const d = decideCatchup({
+    configuredLamports: CATCHUP_SOL_SWEEP_LAMPORTS,
+    capLamports: CATCHUP_SOL_SWEEP_MAX_LAMPORTS,
+    id: CATCHUP_SOL_SWEEP_ID,
+    scanOk: h.ok,
+    scanComplete: h.complete,
+    priorCatchupIds: h.catchupIds ?? new Set<string>(),
+    sentThisProcess: catchupSentThisProcess,
+    nativeLamports: native,
+    gasReserveLamports: GAS_RESERVE_LAMPORTS,
+    marginLamports: FEE_SOL_SWEEP_MARGIN_LAMPORTS,
+    txFeeLamports: SOL_TRANSFER_FEE_LAMPORTS,
+  });
+  if (!d.send) {
+    if (/already done/.test(d.reason)) {
+      console.log(`[CATCHUP] ${d.reason} — nothing to do. You can remove CATCHUP_SOL_SWEEP_LAMPORTS.`);
+      return;
+    }
+    if (/scan (failed|incomplete)/.test(d.reason)) {
+      retryLater(d.reason + (h.reason ? `: ${h.reason}` : ""));
+      return;
+    }
+    await notify(`⚠️ Catch-up SOL sweep (id ${CATCHUP_SOL_SWEEP_ID}) NOT sent: ${d.reason}`);
+    return;
+  }
+  let spot = NaN;
+  try {
+    await dlmmPoolInstance.refetchStates();
+    spot = Number((await dlmmPoolInstance.getActiveBin()).price) * PRICE_DECIMAL_FACTOR;
+  } catch {}
+  if (!isValidSpot(spot)) {
+    retryLater("no valid spot");
+    return;
+  }
+  catchupSentThisProcess = true; // set BEFORE sending: never a second send from this process
+  const t = await sendSolToRevenue(
+    d.lamports,
+    spot,
+    { kind: "catchup-sol-sweep", id: CATCHUP_SOL_SWEEP_ID },
+    `One-time catch-up (id ${CATCHUP_SOL_SWEEP_ID}): leftover fee SOL from the Oct 9 2026 08:19 PT claim ` +
+      `(tx 5jLmxgz6…; Jupiter swap 4B4K8qfQ… never landed). Fee already counted on that FEE_CLAIM row — this row is a sweep only.`
+  );
+  if (t.status === "landed") {
+    await notify(
+      `💰 <b>[CATCH-UP SOL SWEEP]</b> Sent <b>${(t.lamports / 1e9).toFixed(9)} SOL</b> ($${t.usd.toFixed(2)} @ $${spot.toFixed(2)}) ` +
+        `to LP Revenue (id ${CATCHUP_SOL_SWEEP_ID}).\n• Destination: <code>${LP_REVENUE_VAULT.toBase58()}</code>\n• Tx: <code>${t.sig}</code>\n` +
+        `Remove CATCHUP_SOL_SWEEP_LAMPORTS from Railway (it will be skipped anyway — the memo marks it done).`
+    );
+  } else if (t.status === "skipped" && !t.sig) {
+    catchupSentThisProcess = false; // nothing was signed — allow a later retry
+    retryLater(t.reason || "skipped");
+  } else {
+    await notify(
+      `⚠️ Catch-up SOL sweep (id ${CATCHUP_SOL_SWEEP_ID}) status <b>${t.status}</b> (tx <code>${t.sig}</code>). ` +
+        `Not retrying in this process; the next boot re-checks the chain before any resend.`
+    );
+  }
+}
+
 // ==================== MAIN LIFECYCLE CONTROLLER ====================
 async function runKeeper() {
   await notify("🚀 DLMM Automated Keeper initialized on Railway.");
@@ -2538,6 +2953,13 @@ async function runKeeper() {
   dlmmPoolInstance = await DLMM.create(connection, SOL_USDC_POOL);
   // Fee-sweep clock + prior swept total from chain (bounded by a timeout; never blocks boot on failure).
   await initSweepClock();
+  if (CATCHUP_SOL_SWEEP_LAMPORTS > 0) {
+    console.log(
+      `[CATCHUP] One-time SOL catch-up configured: ${CATCHUP_SOL_SWEEP_LAMPORTS} lamports (id ${CATCHUP_SOL_SWEEP_ID}); ` +
+        `guard scan + send in ${CATCHUP_SOL_SWEEP_DELAY_SEC}s`
+    );
+    setTimeout(() => void runCatchupSolSweep(), CATCHUP_SOL_SWEEP_DELAY_SEC * 1000);
+  }
 
   // Capital baseline (reporting only — never read by stops/TP/recenter/sizing), set ONCE here:
   // STARTING_CAPITAL_USD (+ NET_DEPOSITS_USD), else full MTM equity at boot (position + wallet).

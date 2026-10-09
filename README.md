@@ -44,7 +44,7 @@ Net PnL = live equity (position + wallet) + swept to revenue − (STARTING_CAPIT
 | --- | --- |
 | `STARTING_CAPITAL_USD` | Authoritative starting capital in USD. If unset, the baseline falls back to mark-to-market equity at boot (P&L is then "since boot"). `BASELINE_USD` is a deprecated alias. |
 | `NET_DEPOSITS_USD` | Optional. External deposits − withdrawals after the start (may be negative). Fee sweeps are **not** withdrawals. |
-| `PRIOR_SWEPT_USD` | Fallback only. The bot derives cumulative swept on-chain at boot (all LP-wallet → revenue-ATA USDC transfers) and adds in-process sweeps; this env is used only if the scan fails or is incomplete. Only used with `STARTING_CAPITAL_USD`. |
+| `PRIOR_SWEPT_USD` | Fallback only. The bot derives cumulative swept on-chain at boot (all LP-wallet → revenue USDC transfers + native SOL transfers at their memo USD value) and adds in-process sweeps; this env is used only if the scan fails or is incomplete. Only used with `STARTING_CAPITAL_USD`. |
 
 - Top-ups, deploys, recenters, swaps, wrap/unwrap, closes, take-profit, circuit breaker and emergency exit never change the baseline; it is set once per boot, so restarts cannot double it.
 - Fee sweeps to the revenue wallet are added back, so they never show as a loss.
@@ -53,6 +53,29 @@ Net PnL = live equity (position + wallet) + swept to revenue − (STARTING_CAPIT
 ### Fee-sweep schedule
 
 Fees are claimed and swept to `REVENUE_WALLET_PUBKEY` every `SWEEP_INTERVAL_SEC` (24h). The clock survives restarts: at boot the bot scans the revenue wallet's USDC ATA and uses the block time of the latest transfer whose source is the LP wallet's USDC ATA, signed by the LP wallet (address-poisoning dust from lookalike wallets and transfers from anyone else are ignored). If the scan fails it falls back to `LAST_SWEEP_UNIX`, else boot time, and retries the scan in the background every 15 min (up to 8 times). The clock advances only when a sweep actually moves USDC (scheduled, `/harvest`, or a stop/TP/recenter/emergency pre-close sweep); a due sweep that moves nothing is retried after `SWEEP_RETRY_SEC` (1h). The next sweep time (PT) is shown at boot/attach and in `/status`.
+
+### Fee SOL handling and ledger rows
+
+- **FEE_CLAIM** rows record both halves once: `fees_claimed_usd = USDC + SOL × pool spot at claim`; notes carry
+  `fees_sol=… fees_usdc=… spot=… sol_usd=…`. (The old `feeX(SOL)=` note token is no longer written — the
+  Executive PnL "Fees earned" formula adds that token × spot for old rows, so writing it again would double-count.)
+- **FEE_SWEEP** rows carry `swept_to_revenue_usd` only (no `fees_claimed_usd`) — fees are counted once, on FEE_CLAIM.
+- Claimed fee SOL is swapped to USDC via Jupiter (`FEE_SOL_SWAP_ATTEMPTS`, default 2). A retry happens only after the
+  previous signature is proven not to have landed (blockhash expired / failed); an "unknown" outcome stops (no retry,
+  no transfer). If the swap fails or is skipped (gas gate, < `FEE_SOL_SWAP_MIN_LAMPORTS`), the claimed SOL is sent
+  **natively** to `REVENUE_WALLET_PUBKEY` (from config only — never from tx history), never taking the LP wallet below
+  `GAS_RESERVE_LAMPORTS + FEE_SOL_SWEEP_MARGIN_LAMPORTS` (+ tx fee). That transfer carries a memo
+  `dlmm-keeper:fee-sol-sweep lamports=… usd=… spot=…` and logs a FEE_SWEEP row at that USD value.
+- The boot-time on-chain swept total scans both the revenue USDC ATA and the revenue wallet: USDC transfers count at
+  face value, native SOL transfers LP → revenue (signed by the LP wallet) at the USD value stored in the bot's memo
+  (spot at send time); SOL transfers without a bot memo use the Hyperliquid 1m close at block time, else the scan is
+  marked incomplete (env fallback). Revenue → LP transfers are **not** subtracted — book them as a DEPOSIT
+  (`NET_DEPOSITS_USD` / Capital Flows).
+- One-time catch-up: `CATCHUP_SOL_SWEEP_LAMPORTS` (+ `CATCHUP_SOL_SWEEP_ID`, default `2026-10-09`) sends that much SOL
+  to the revenue wallet once, `CATCHUP_SOL_SWEEP_DELAY_SEC` (≥120 s) after boot, only if no LP-signed memo
+  `dlmm-keeper:catchup-sol-sweep id=<ID>` is already on chain (fails closed if the scan fails/is incomplete), the full
+  amount fits above the gas floor, and it is ≤ `CATCHUP_SOL_SWEEP_MAX_LAMPORTS` (default 0.05 SOL, hard max 0.1).
+  Remove the variable after the Telegram confirmation.
 
 ### Market regime (bin shape for new deploys)
 
