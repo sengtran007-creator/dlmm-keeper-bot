@@ -12,12 +12,23 @@
  *            −3% … −10%            → 0 … −25 linear (shorts paying)
  *            ≤ −10%                → −25
  *            unknown               → 0   (partial read; can't trigger a regime switch)
- * Regime: score ≥ 85 BULL_EXPANSION (trend AND funding must agree) · score < 40 BEAR_DEFENSIVE · else RANGE_CHOP.
+ *   direction (±20): short-term price direction from Hyperliquid 1h candles. Composite c =
+ *            0.25 × clamp((price/EMA20(1h) − 1) / 1.5%) + 0.25 × clamp(4h change / 1.5%) + 0.5 × clamp(24h change / 4%)
+ *            (each clamped to ±1; full scale ≈ 95th percentile of the last 14 days; 24h weighted most so a
+ *            4h bounce inside a down day doesn't read as rising). |c| < 0.25 → 0 (flat); beyond that
+ *            linear to ±20. Unknown → 0 (partial read; can't trigger a switch).
+ * Regime (score = 50 + trend + funding + direction):
+ *   BULL_EXPANSION  score ≥ 85 AND direction ≥ 0 (never BULL while price is falling short-term)
+ *   BEAR_DEFENSIVE  score < 40 AND trend + funding < 0 (short-term direction alone can't make BEAR)
+ *   RANGE_CHOP      otherwise
  *
- * Hysteresis: a different regime must be observed on 2 consecutive complete evaluations (≥10 min apart)
+ * Hysteresis: a different regime must be observed on 2 consecutive complete evaluations (≥30 min apart)
  * OR (not for BULL) sit ≥10 points inside its band, AND the current regime must have been in force ≥2h.
- * Exception: score < 30 → BEAR immediately (safety). Boot starts in RANGE_CHOP (nothing persisted) and
- * leaves it only after 2 consecutive confirming reads (no margin shortcut, no dwell at boot).
+ * Exception: BEAR immediately when the LONG-SIDE score 50 + trend + funding < 30 (direction excluded,
+ * so short-term noise can't trip the safety shortcut). Boot starts in RANGE_CHOP (nothing persisted) and
+ * leaves it only after 2 consecutive confirming reads ~30 min apart (no margin shortcut, no dwell at boot).
+ * Schmitt band: an existing BULL is kept while score ≥ 75 and direction ≥ −8; an existing BEAR while
+ * score < 48 (and trend + funding < 0) — so values hovering at an entry threshold don't flip the raw read.
  * Failures: keep the current regime while the last good read is < 6h old, else fall back to RANGE_CHOP;
  * never default to BULL. Failed evaluations back off (5 min) instead of retrying every tick.
  */
@@ -44,12 +55,26 @@ export const SCORE_BULL_MIN = 85;
 export const SCORE_BEAR_BELOW = 40;
 export const SCORE_BEAR_IMMEDIATE_BELOW = 30;
 export const SWITCH_MARGIN_POINTS = 10;
+// Schmitt-trigger exits: once in BULL/BEAR, stay while the (looser) exit condition still holds.
+export const SCORE_BULL_STAY_MIN = 75;
+export const DIRECTION_BULL_STAY_MIN = -8;
+export const SCORE_BEAR_STAY_BELOW = 48;
 export const TREND_FULL_PCT = 0.1;
 export const FUNDING_DEADBAND_APR = 3;
 export const FUNDING_FULL_BULL_APR = 8;
 export const FUNDING_OVERHEATED_APR = 40;
 export const FUNDING_FULL_BEAR_APR = -10;
 export const FUNDING_WINDOW_HOURS = 24;
+export const DIRECTION_MAX_POINTS = 20;
+export const DIRECTION_FULL_EMA_GAP = 0.015;
+export const DIRECTION_FULL_MOM4H = 0.015;
+export const DIRECTION_FULL_MOM24H = 0.04;
+export const DIRECTION_DEADBAND = 0.25;
+export const DIRECTION_WEIGHT_EMA = 0.25;
+export const DIRECTION_WEIGHT_4H = 0.25;
+export const DIRECTION_WEIGHT_24H = 0.5;
+export const DIRECTION_EMA_PERIOD = 20;
+export const DIRECTION_CANDLE_HOURS = 72;
 export const FUNDING_MIN_SAMPLES = 12;
 
 // ---------------- inputs ----------------
@@ -74,11 +99,36 @@ export const UNKNOWN_FUNDING: FundingReading = {
   samples: 0,
 };
 
+export interface DirectionReading {
+  known: boolean;
+  /** Price used for direction (latest 1h candle close, incl. the in-progress candle). */
+  price: number;
+  ema20: number;
+  emaGapPct: number;
+  mom4hPct: number;
+  mom24hPct: number;
+  /** Composite in [−1, 1] before the deadband. */
+  composite: number;
+  source: string;
+}
+
+export const UNKNOWN_DIRECTION: DirectionReading = {
+  known: false,
+  price: NaN,
+  ema20: NaN,
+  emaGapPct: NaN,
+  mom4hPct: NaN,
+  mom24hPct: NaN,
+  composite: NaN,
+  source: "unknown",
+};
+
 export interface MarketInputs {
   solPrice: number;
   sma200: number;
   smaPoints: number;
   funding: FundingReading;
+  direction: DirectionReading;
 }
 
 export function annualizeFunding(rate: number, intervalHours: number): number {
@@ -135,6 +185,59 @@ export function fundingFromPredicted(data: any): FundingReading | null {
   };
 }
 
+function clamp1(x: number): number {
+  return Math.max(-1, Math.min(1, x));
+}
+
+/**
+ * Hyperliquid candleSnapshot (1h) → direction inputs. EMA20 over completed candles; current price = latest
+ * candle close (the in-progress candle if present); 4h/24h change vs the last close at/before now−4h/−24h.
+ */
+export function directionFromCandles(rows: any, nowMs: number): DirectionReading | null {
+  if (!Array.isArray(rows)) return null;
+  const c = rows
+    .map((r: any) => ({ t: Number(r?.t), T: Number(r?.T), close: Number(r?.c) }))
+    .filter((r: any) => Number.isFinite(r.t) && Number.isFinite(r.T) && r.close > 0 && r.t <= nowMs)
+    .sort((a: any, b: any) => a.t - b.t);
+  if (c.length < 30) return null;
+  const last = c[c.length - 1];
+  if (nowMs - last.t > 2 * 3600 * 1000) return null; // stale feed
+  const price = last.close;
+  const completed = c.filter((r: any) => r.T < nowMs);
+  if (completed.length < DIRECTION_EMA_PERIOD + 5) return null;
+  const closes = completed.map((r: any) => r.close);
+  const seed = closes.slice(0, DIRECTION_EMA_PERIOD).reduce((a: number, b: number) => a + b, 0) / DIRECTION_EMA_PERIOD;
+  const k = 2 / (DIRECTION_EMA_PERIOD + 1);
+  let ema20 = seed;
+  for (let i = DIRECTION_EMA_PERIOD; i < closes.length; i++) ema20 = closes[i] * k + ema20 * (1 - k);
+  const closeAtOrBefore = (ms: number): number => {
+    let v = NaN;
+    for (const r of completed) if (r.T <= ms) v = r.close;
+    return v;
+  };
+  const p4 = closeAtOrBefore(nowMs - 4 * 3600 * 1000);
+  const p24 = closeAtOrBefore(nowMs - 24 * 3600 * 1000);
+  if (!(p4 > 0) || !(p24 > 0) || !(ema20 > 0)) return null;
+  const emaGap = price / ema20 - 1;
+  const mom4 = price / p4 - 1;
+  const mom24 = price / p24 - 1;
+  // 24h change weighted 50%: a 4h bounce inside a down day must not read as "rising".
+  const composite =
+    DIRECTION_WEIGHT_EMA * clamp1(emaGap / DIRECTION_FULL_EMA_GAP) +
+    DIRECTION_WEIGHT_4H * clamp1(mom4 / DIRECTION_FULL_MOM4H) +
+    DIRECTION_WEIGHT_24H * clamp1(mom24 / DIRECTION_FULL_MOM24H);
+  return {
+    known: true,
+    price,
+    ema20,
+    emaGapPct: emaGap * 100,
+    mom4hPct: mom4 * 100,
+    mom24hPct: mom24 * 100,
+    composite,
+    source: `HL 1h candles (${completed.length})`,
+  };
+}
+
 // ---------------- scoring ----------------
 
 export function trendPoints(solPrice: number, sma200: number): number {
@@ -154,15 +257,41 @@ export function fundingPoints(f: FundingReading): number {
   return -25 * Math.min(1, (-apr - FUNDING_DEADBAND_APR) / (-FUNDING_FULL_BEAR_APR - FUNDING_DEADBAND_APR));
 }
 
-export function scoreInputs(inp: MarketInputs): { score: number; trendPts: number; fundingPts: number } {
-  const trendPts = trendPoints(inp.solPrice, inp.sma200);
-  const fundingPts = fundingPoints(inp.funding);
-  return { score: 50 + trendPts + fundingPts, trendPts, fundingPts };
+export function directionPoints(d: DirectionReading): number {
+  if (!d.known || !Number.isFinite(d.composite)) return 0;
+  const a = Math.abs(d.composite);
+  if (a < DIRECTION_DEADBAND) return 0;
+  return Math.sign(d.composite) * DIRECTION_MAX_POINTS * Math.min(1, (a - DIRECTION_DEADBAND) / (1 - DIRECTION_DEADBAND));
 }
 
-export function classifyScore(score: number): MarketRegime {
-  if (score >= SCORE_BULL_MIN) return "BULL_EXPANSION";
-  if (score < SCORE_BEAR_BELOW) return "BEAR_DEFENSIVE";
+export interface ScoreParts {
+  score: number;
+  trendPts: number;
+  fundingPts: number;
+  dirPts: number;
+  /** 50 + trend + funding (direction excluded) — the long-side view used by the BEAR rules. */
+  longScore: number;
+}
+
+export function scoreInputs(inp: MarketInputs): ScoreParts {
+  const trendPts = trendPoints(inp.solPrice, inp.sma200);
+  const fundingPts = fundingPoints(inp.funding);
+  const dirPts = directionPoints(inp.direction ?? UNKNOWN_DIRECTION);
+  const longScore = 50 + trendPts + fundingPts;
+  return { score: longScore + dirPts, trendPts, fundingPts, dirPts, longScore };
+}
+
+/**
+ * Raw regime for one read. `current` enables the Schmitt-trigger band: entering BULL needs score ≥ 85 and
+ * direction ≥ 0, but an existing BULL is kept while score ≥ 75 and direction ≥ −8; entering BEAR needs
+ * score < 40 with trend + funding < 0, an existing BEAR is kept while score < 48 and trend + funding < 0.
+ */
+export function classifyScore(parts: ScoreParts, current?: MarketRegime): MarketRegime {
+  const longBearish = parts.trendPts + parts.fundingPts < 0;
+  if (current === "BULL_EXPANSION" && parts.score >= SCORE_BULL_STAY_MIN && parts.dirPts >= DIRECTION_BULL_STAY_MIN) return "BULL_EXPANSION";
+  if (current === "BEAR_DEFENSIVE" && parts.score < SCORE_BEAR_STAY_BELOW && longBearish) return "BEAR_DEFENSIVE";
+  if (parts.score >= SCORE_BULL_MIN && parts.dirPts >= 0) return "BULL_EXPANSION";
+  if (parts.score < SCORE_BEAR_BELOW && longBearish) return "BEAR_DEFENSIVE";
   return "RANGE_CHOP";
 }
 
@@ -200,6 +329,13 @@ export interface RegimeConfig extends RegimeProfile {
     fundingKnown: boolean;
     trendPts: number;
     fundingPts: number;
+    dirPts: number;
+    longScore: number;
+    directionKnown: boolean;
+    directionSource: string;
+    emaGapPct: number;
+    mom4hPct: number;
+    mom24hPct: number;
     turnoverRatio: number;
   };
 }
@@ -208,6 +344,8 @@ export interface RegimeFetchers {
   fetchCoinGecko(): Promise<any>;
   fetchFundingHistory(startTimeMs: number): Promise<any>;
   fetchPredictedFundings(): Promise<any>;
+  /** Hyperliquid candleSnapshot rows (1h) between startMs and endMs. */
+  fetchCandles(startMs: number, endMs: number): Promise<any>;
 }
 
 export interface SentinelOptions {
@@ -230,6 +368,8 @@ interface GoodRead {
   score: number;
   trendPts: number;
   fundingPts: number;
+  dirPts: number;
+  longScore: number;
   rawRegime: MarketRegime;
   complete: boolean;
 }
@@ -253,11 +393,11 @@ export class RegimeSentinel {
   constructor(private fetchers: RegimeFetchers, opts: SentinelOptions = {}) {
     this.o = {
       evalSec: opts.evalSec ?? 3600,
-      confirmSec: opts.confirmSec ?? 900,
+      confirmSec: opts.confirmSec ?? 1800,
       retrySec: opts.retrySec ?? 300,
       dwellSec: opts.dwellSec ?? 7200,
       lastGoodMaxAgeSec: opts.lastGoodMaxAgeSec ?? 21600,
-      minConfirmGapSec: opts.minConfirmGapSec ?? 600,
+      minConfirmGapSec: opts.minConfirmGapSec ?? 1800,
       logIntervalSec: opts.logIntervalSec ?? 3600,
       forcedMinGapSec: opts.forcedMinGapSec ?? 30,
       nowSec: opts.nowSec ?? (() => Math.floor(Date.now() / 1000)),
@@ -298,6 +438,13 @@ export class RegimeSentinel {
         fundingKnown: g ? g.inputs.funding.known : false,
         trendPts: g ? g.trendPts : 0,
         fundingPts: g ? g.fundingPts : 0,
+        dirPts: g ? g.dirPts : 0,
+        longScore: g ? g.longScore : NaN,
+        directionKnown: g ? g.inputs.direction.known : false,
+        directionSource: g ? g.inputs.direction.source : "n/a",
+        emaGapPct: g ? g.inputs.direction.emaGapPct : NaN,
+        mom4hPct: g ? g.inputs.direction.mom4hPct : NaN,
+        mom24hPct: g ? g.inputs.direction.mom24hPct : NaN,
         turnoverRatio: 0.15,
       },
     };
@@ -309,7 +456,9 @@ export class RegimeSentinel {
     const sc = c.score != null ? c.score.toFixed(1) : "n/a";
     const extra =
       c.source === "held" ? `, raw ${c.rawRegime} held` : c.source === "last-good" ? ", last good read" : c.source === "default" ? ", default" : "";
-    return `${c.regime} (score ${sc}${extra})`;
+    const dir =
+      c.score == null ? "" : c.details.directionKnown ? `, dir ${fmtPts(c.details.dirPts)}` : ", dir unknown";
+    return `${c.regime} (score ${sc}${dir}${extra})`;
   }
 
   async evaluate(force = false): Promise<RegimeConfig> {
@@ -325,9 +474,10 @@ export class RegimeSentinel {
 
   private async fetchInputs(nowSec: number): Promise<MarketInputs> {
     const nowMs = nowSec * 1000;
-    const [cg, hist] = await Promise.allSettled([
+    const [cg, hist, candles] = await Promise.allSettled([
       this.fetchers.fetchCoinGecko(),
       this.fetchers.fetchFundingHistory(nowMs - (FUNDING_WINDOW_HOURS + 1) * 3600 * 1000),
+      this.fetchers.fetchCandles(nowMs - DIRECTION_CANDLE_HOURS * 3600 * 1000, nowMs),
     ]);
     if (cg.status !== "fulfilled") throw new Error(`CoinGecko: ${errMsg(cg.reason)}`);
     const trend = smaFromCoinGecko(cg.value);
@@ -340,7 +490,8 @@ export class RegimeSentinel {
         funding = null;
       }
     }
-    return { ...trend, funding: funding ?? UNKNOWN_FUNDING };
+    const direction = candles.status === "fulfilled" ? directionFromCandles(candles.value, nowMs) : null;
+    return { ...trend, funding: funding ?? UNKNOWN_FUNDING, direction: direction ?? UNKNOWN_DIRECTION };
   }
 
   private async runEvaluation(now: number): Promise<RegimeConfig> {
@@ -349,13 +500,14 @@ export class RegimeSentinel {
     let changedNote = "";
     try {
       const inputs = await this.fetchInputs(now);
-      const { score, trendPts, fundingPts } = scoreInputs(inputs);
-      const raw = classifyScore(score);
-      const complete = inputs.funding.known;
-      this.lastGood = { at: now, inputs, score, trendPts, fundingPts, rawRegime: raw, complete };
+      const parts = scoreInputs(inputs);
+      const { score, trendPts, fundingPts, dirPts, longScore } = parts;
+      const raw = classifyScore(parts, this.effective);
+      const complete = inputs.funding.known && inputs.direction.known;
+      this.lastGood = { at: now, inputs, score, trendPts, fundingPts, dirPts, longScore, rawRegime: raw, complete };
       this.lastEvalOk = true;
       this.lastFailure = "";
-      changedNote = this.applyObservation(raw, score, complete, now);
+      changedNote = this.applyObservation(raw, score, longScore, complete, now);
       this.nextEvalAt = now + (this.pending ? this.o.confirmSec : this.o.evalSec);
     } catch (e: any) {
       this.lastEvalOk = false;
@@ -377,20 +529,24 @@ export class RegimeSentinel {
   }
 
   /** Returns a note when the effective regime changed. */
-  private applyObservation(raw: MarketRegime, score: number, complete: boolean, now: number): string {
+  private applyObservation(raw: MarketRegime, score: number, longScore: number, complete: boolean, now: number): string {
     if (raw === this.effective) {
       this.pending = null;
       if (this.provisional && complete) this.provisional = false;
       this.holdReason = "";
       return "";
     }
-    if (raw === "BEAR_DEFENSIVE" && score < SCORE_BEAR_IMMEDIATE_BELOW) {
+    // Safety shortcut uses the LONG-SIDE score (trend + funding) so short-term direction alone can't trip it.
+    if (raw === "BEAR_DEFENSIVE" && longScore < SCORE_BEAR_IMMEDIATE_BELOW) {
       this.switchTo(raw, now);
       this.holdReason = "";
-      return `immediate switch to BEAR (score ${score.toFixed(1)} < ${SCORE_BEAR_IMMEDIATE_BELOW})`;
+      return `immediate switch to BEAR (long-side score ${longScore.toFixed(1)} < ${SCORE_BEAR_IMMEDIATE_BELOW})`;
     }
     if (!complete) {
-      this.holdReason = `raw ${raw} not acted on — funding unknown (partial read can't switch)`;
+      const missing = [this.lastGood && !this.lastGood.inputs.funding.known ? "funding" : "", this.lastGood && !this.lastGood.inputs.direction.known ? "direction" : ""]
+        .filter(Boolean)
+        .join("+");
+      this.holdReason = `raw ${raw} not acted on — ${missing || "input"} unknown (partial read can't switch)`;
       return "";
     }
     if (this.pending && this.pending.regime === raw) {
@@ -458,11 +614,19 @@ export function formatRegimeLine(c: RegimeConfig, evalOk: boolean, changedNote: 
       ` | funding ${fmtPts(d.fundingPts)}: ` +
       (d.fundingKnown
         ? `${d.fundingRawRate.toExponential(3)}/${d.fundingIntervalHours}h → ${d.fundingAnnual.toFixed(2)}% APR [${d.fundingSource}]`
+        : "unknown → neutral") +
+      ` | direction ${fmtPts(d.dirPts)}: ` +
+      (d.directionKnown
+        ? `vs EMA20(1h) ${fmtPct(d.emaGapPct)}, 4h ${fmtPct(d.mom4hPct)}, 24h ${fmtPct(d.mom24hPct)} [${d.directionSource}]`
         : "unknown → neutral")
     : "";
   const hold = c.holdReason ? ` | ${c.holdReason}` : "";
   const chg = changedNote ? ` | ${changedNote}` : "";
   return `${head} | ${res}${inputs}${hold}${chg} | source ${c.source} | next eval ${fmtTime(c.nextEvalAt)}`;
+}
+
+function fmtPct(n: number): string {
+  return `${n >= 0 ? "+" : ""}${n.toFixed(2)}%`;
 }
 
 function fmtPts(n: number): string {

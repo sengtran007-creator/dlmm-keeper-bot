@@ -1262,12 +1262,15 @@ const regimeSentinel = new RegimeSentinel(
     fetchFundingHistory: async (startTime: number) =>
       (await axios.post(HL_INFO_URL, { type: "fundingHistory", coin: "SOL", startTime }, { timeout: 8000 })).data,
     fetchPredictedFundings: async () => (await axios.post(HL_INFO_URL, { type: "predictedFundings" }, { timeout: 8000 })).data,
+    fetchCandles: async (startTime: number, endTime: number) =>
+      (await axios.post(HL_INFO_URL, { type: "candleSnapshot", req: { coin: "SOL", interval: "1h", startTime, endTime } }, { timeout: 8000 }))
+        .data,
   },
   { fmtTime: (sec: number) => formatUnixPt(sec), log: (line: string) => console.log(line) }
 );
 
 const macroSentinel = {
-  /** Cached (1h; 15 min while a switch is pending; 5 min backoff after a failure). */
+  /** Cached (1h; 30 min while a switch is pending; 5 min backoff after a failure). */
   evaluateRegime: (_pool: string, force = false) => regimeSentinel.evaluate(force),
 };
 
@@ -2242,7 +2245,11 @@ async function listenTelegramCommands() {
             (haveRead
               ? `• <b>Trend:</b> ${d.trendPts >= 0 ? "+" : ""}${d.trendPts.toFixed(1)} — $${d.solPrice.toFixed(2)} vs 200-SMA $${d.sma200.toFixed(2)}\n` +
                 `• <b>Funding:</b> ${d.fundingPts >= 0 ? "+" : ""}${d.fundingPts.toFixed(1)} — ` +
-                (d.fundingKnown ? `${d.fundingAnnual.toFixed(2)}% APR (${escapeHtml(d.fundingSource)})` : "unknown → neutral") + `\n`
+                (d.fundingKnown ? `${d.fundingAnnual.toFixed(2)}% APR (${escapeHtml(d.fundingSource)})` : "unknown → neutral") + `\n` +
+                `• <b>Direction:</b> ${d.dirPts >= 0 ? "+" : ""}${d.dirPts.toFixed(1)} — ` +
+                (d.directionKnown
+                  ? `vs EMA20(1h) ${d.emaGapPct.toFixed(2)}%, 4h ${d.mom4hPct.toFixed(2)}%, 24h ${d.mom24hPct.toFixed(2)}%`
+                  : "unknown → neutral") + `\n`
               : "") +
             (config.holdReason ? `• <b>Hysteresis:</b> ${escapeHtml(config.holdReason)}\n` : "") +
             (config.lastFailure ? `• <b>Last error:</b> ${escapeHtml(redactSecrets(config.lastFailure))}\n` : "") +

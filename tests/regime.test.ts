@@ -12,6 +12,10 @@ import {
   priceStopFromLock,
   entryPinLine,
   UNKNOWN_FUNDING,
+  directionFromCandles,
+  directionPoints,
+  classifyScore,
+  scoreInputs,
 } from "../regime";
 
 const T0 = 1_791_500_000; // ~Oct 8 2026
@@ -33,7 +37,26 @@ function hist(nowSec: number, fn: (i: number) => number) {
 
 const aprToHourly = (apr: number) => apr / 876000;
 
-function harness(opts: { price?: number | (() => number); hourly?: (now: number) => any; failCg?: () => boolean; failHist?: boolean; predicted?: any }) {
+/** 72 hourly HL-style candles ending at nowSec; close(i) for i = 0..71 (71 = in-progress candle). */
+function candles(nowSec: number, close: (i: number) => number) {
+  const startHour = Math.floor(nowSec / 3600) * 3600 - 71 * 3600;
+  return Array.from({ length: 72 }, (_, i) => {
+    const t = (startHour + i * 3600) * 1000;
+    return { t, T: t + 3600 * 1000 - 1, s: "SOL", i: "1h", o: "0", c: String(close(i)), h: "0", l: "0", v: "0", n: 1 };
+  });
+}
+const flat = (p = 109) => (now: number) => candles(now, () => p);
+/** Linear drift: total pct change over the 72 candles. */
+const drift = (pctTotal: number, end = 109) => (now: number) => candles(now, (i) => end * (1 + (pctTotal / 100) * ((i - 71) / 71)));
+
+function harness(opts: {
+  price?: number | (() => number);
+  hourly?: (now: number) => any;
+  failCg?: () => boolean;
+  failHist?: boolean;
+  predicted?: any;
+  candles?: ((now: number) => any) | null;
+}) {
   let now = T0;
   const calls = { cg: 0, hist: 0, pred: 0 };
   const logs: string[] = [];
@@ -53,6 +76,10 @@ function harness(opts: { price?: number | (() => number); hourly?: (now: number)
       calls.pred++;
       if (opts.predicted === undefined) throw new Error("timeout");
       return opts.predicted;
+    },
+    fetchCandles: async () => {
+      if (opts.candles === null) throw new Error("timeout");
+      return (opts.candles ?? flat())(now);
     },
   };
   const s = new RegimeSentinel(fetchers, { nowSec: () => now, log: (l) => logs.push(l), fmtTime: (x) => String(x) });
@@ -150,7 +177,7 @@ test("a single strong BULL read (score 100, margin 15) after dwell still needs a
   assert.equal(c.score, 100);
   assert.equal(c.regime, "RANGE_CHOP");
   assert.match(c.holdReason, /BULL needs 2 consecutive reads \(1\/2\)/);
-  h.advance(900);
+  h.advance(1800);
   c = await h.s.evaluate();
   assert.equal(c.regime, "BULL_EXPANSION");
 });
@@ -161,24 +188,25 @@ test("two consecutive confirming reads switch after boot; dwell 2h then holds a 
   let c = await h.s.evaluate();
   assert.equal(c.regime, "RANGE_CHOP"); // boot: 1/2
   assert.match(c.holdReason, /boot: needs 2 consecutive reads \(1\/2\)/);
-  assert.ok(c.nextEvalAt - h.now() === 900, "re-check in 15 min while a switch is pending");
-  h.advance(900);
+  assert.ok(c.nextEvalAt - h.now() === 1800, "re-check in 30 min while a switch is pending");
+  h.advance(1800);
   c = await h.s.evaluate();
   assert.equal(c.regime, "BULL_EXPANSION");
   assert.equal(c.floorStopPct, 0.04);
-  // contrary read 1h later: score 80 → RANGE margin 5, dwell 1h → held
+  // Schmitt band: score 80 (funding 4% APR) keeps an existing BULL (stay ≥ 75) — no flip at the entry edge
   apr = 4;
   h.advance(3600);
   c = await h.s.evaluate();
   assert.equal(c.regime, "BULL_EXPANSION");
-  assert.equal(c.source, "held");
-  // contrary read with margin 10 (score 75) but still inside 2h dwell → held
-  apr = 0;
-  h.advance(900);
-  c = await h.s.evaluate();
+  assert.equal(c.rawRegime, "BULL_EXPANSION");
+  // clearly contrary read (funding −5% APR → score ≈ 69, RANGE margin 16) inside the 2h dwell → held
+  apr = -5;
+  h.advance(900); // 1h15m after the switch to BULL; forced read (like /regime)
+  c = await h.s.evaluate(true);
   assert.equal(c.regime, "BULL_EXPANSION");
+  assert.equal(c.source, "held");
   assert.match(c.holdReason, /dwell/);
-  // after dwell, 2nd consecutive RANGE read → switch
+  // after the dwell → switch
   h.advance(3600);
   c = await h.s.evaluate();
   assert.equal(c.regime, "RANGE_CHOP");
@@ -196,7 +224,7 @@ test("eval failure keeps last good regime < 6h, then falls back to RANGE (never 
   let fail = false;
   const h = harness({ price: 109, failCg: () => fail, hourly: (now) => hist(now, () => aprToHourly(9)) });
   await h.s.evaluate();
-  h.advance(900);
+  h.advance(1800);
   assert.equal((await h.s.evaluate()).regime, "BULL_EXPANSION");
   fail = true;
   h.advance(3600);
@@ -213,7 +241,7 @@ test("locked stop doesn't move when the regime changes", async () => {
   const before = priceStopFromLock(110.26, lock);
   const h = harness({ price: 109, hourly: (now) => hist(now, () => aprToHourly(9)) });
   await h.s.evaluate();
-  h.advance(900);
+  h.advance(1800);
   const c = await h.s.evaluate();
   assert.equal(c.regime, "BULL_EXPANSION");
   assert.equal(c.floorStopPct, 0.04); // live regime would say 4%…
@@ -239,4 +267,81 @@ test("restart with pin → same stop; stale/invalid pin → RANGE 5% with a warn
   assert.match(bad.warning, /out of range/);
   // the live position at merge: ENTRY_STOP_PCT=0.05 → $104.75
   assert.equal(priceStopFromLock(110.26, resolveAttachStopLock("0.05", true).lock).toFixed(2), "104.75");
+});
+
+test("direction: flat → 0; falling → negative; rising → positive; too little data → unknown", () => {
+  const now = T0;
+  const f = directionFromCandles(flat()(now), now * 1000)!;
+  assert.equal(directionPoints(f), 0);
+  const down = directionFromCandles(drift(-6)(now), now * 1000)!; // −6% over 3 days, ~−2% in the last 24h
+  assert.ok(directionPoints(down) < 0, `down ${directionPoints(down)}`);
+  const up = directionFromCandles(drift(+6)(now), now * 1000)!;
+  assert.ok(directionPoints(up) > 0, `up ${directionPoints(up)}`);
+  assert.equal(directionFromCandles(flat()(now).slice(-10), now * 1000), null);
+  assert.equal(directionFromCandles("bad", now * 1000), null);
+});
+
+test("falling price while 26% above the 200-day average → not BULL", async () => {
+  // today's shape: 24h −6%, below the 1h EMA20, 4h −1.3%; funding healthy (9% APR)
+  const h = harness({
+    price: 109,
+    hourly: (now) => hist(now, () => aprToHourly(9)),
+    candles: (now) => candles(now, (i) => (i >= 47 ? 116 - (7 * (i - 47)) / 24 : 116)),
+  });
+  for (let i = 0; i < 6; i++) {
+    const c = await h.s.evaluate();
+    assert.notEqual(c.regime, "BULL_EXPANSION");
+    assert.notEqual(c.rawRegime, "BULL_EXPANSION");
+    assert.ok(c.details.dirPts < 0);
+    h.advance(1800);
+  }
+});
+
+test("rising price + positive funding → BULL after 2 confirming reads", async () => {
+  const h = harness({ price: 109, hourly: (now) => hist(now, () => aprToHourly(9)), candles: drift(+6) });
+  let c = await h.s.evaluate();
+  assert.equal(c.rawRegime, "BULL_EXPANSION");
+  assert.equal(c.regime, "RANGE_CHOP");
+  h.advance(1800);
+  c = await h.s.evaluate();
+  assert.equal(c.regime, "BULL_EXPANSION");
+  assert.ok(c.details.dirPts > 0);
+});
+
+test("flat market with neutral funding → RANGE", async () => {
+  // price ≈ 200-day average (trend ~0), funding in deadband, flat candles → score ≈ 50
+  const h = harness({ price: SMA, hourly: (now) => hist(now, () => aprToHourly(1)), candles: flat(SMA) });
+  for (let i = 0; i < 4; i++) {
+    const c = await h.s.evaluate();
+    assert.equal(c.regime, "RANGE_CHOP");
+    assert.equal(c.rawRegime, "RANGE_CHOP");
+    assert.equal(c.details.dirPts, 0);
+    h.advance(3600);
+  }
+});
+
+test("direction data missing → neutral, and a partial read can't switch", async () => {
+  const h = harness({ price: 109, hourly: (now) => hist(now, () => aprToHourly(9)), candles: null });
+  let c = await h.s.evaluate();
+  assert.equal(c.details.directionKnown, false);
+  assert.equal(c.details.dirPts, 0);
+  assert.equal(c.rawRegime, "BULL_EXPANSION"); // score 100 with neutral direction…
+  for (let i = 0; i < 4; i++) {
+    h.advance(3600);
+    c = await h.s.evaluate();
+    assert.equal(c.regime, "RANGE_CHOP"); // …but never acted on while direction is unknown
+  }
+  assert.match(c.holdReason, /direction unknown \(partial read can't switch\)/);
+});
+
+test("short-term crash alone can't trigger BEAR; long side must agree", () => {
+  const base = { solPrice: 109, sma200: 109, smaPoints: 201, funding: { ...UNKNOWN_FUNDING, known: true, apr: 0 } };
+  const crash = { ...directionFromCandles(drift(-30)(T0), T0 * 1000)! }; // ~−10% in 24h
+  const p = scoreInputs({ ...base, direction: crash });
+  assert.equal(p.dirPts, -20);
+  assert.equal(p.score, 30);
+  assert.equal(classifyScore(p), "RANGE_CHOP"); // trend + funding = 0 → not BEAR
+  const bearish = scoreInputs({ ...base, solPrice: 102, direction: crash }); // 6.4% below the 200-day → trend −16
+  assert.equal(classifyScore(bearish), "BEAR_DEFENSIVE"); // long side agrees → BEAR (via normal confirmation)
+  assert.ok(bearish.longScore > 30, "long-side score above 30 → not the immediate shortcut");
 });
