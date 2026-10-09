@@ -9,7 +9,8 @@ This software trades real capital. You can lose money. There is **no warranty**.
 - Regime-aware bin width (bull / range / bear heuristics)
 - Fee claim + sweep to `REVENUE_WALLET_PUBKEY`
 - Circuit-breaker stop and upper-bound recycle
-- Optional Telegram commands (`/status`, `/pause`, `/resume`, `/harvest`, `/emergency_exit`, …)
+- Optional Telegram commands (`/status`, `/pause`, `/resume`, `/harvest`, `/emergency_exit`, `/withdraw_pct N`, …)
+  - `/withdraw_pct N` pauses the bot and withdraws N% (1–90) of the open position's liquidity into the LP wallet (position stays open) so it can be transferred out. While paused no stops run. `/resume` re-bases entry equity to live equity (so the equity stop doesn't fire on the transfer out); before the next restart set `NET_DEPOSITS_USD` for the amount moved out and update/remove `ENTRY_EQUITY_USD`.
 - Optional Google Sheet webhook logging
 
 ## Requirements

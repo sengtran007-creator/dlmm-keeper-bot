@@ -258,6 +258,8 @@ let priorSweptUsd = PRIOR_SWEPT_USD;
 let priorSweptSource = PRIOR_SWEPT_USD > 0 ? "env PRIOR_SWEPT_USD" : "none";
 let isDeploying = false;
 let isBotPaused = false;
+/** Set by /withdraw_pct: liquidity was pulled into the wallet for an external transfer. /resume re-bases entry equity. */
+let partialWithdrawPending = false;
 let isLiquidating = false;
 /** True while any unwind path (circuit breaker / take-profit / emergency) is in flight. */
 let isExiting = false;
@@ -2543,6 +2545,83 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
   }
 }
 
+// ==================== MANUAL PARTIAL WITHDRAWAL ====================
+/**
+ * /withdraw_pct N: PAUSE the bot, then withdraw N% of the open position's liquidity (every bin, position
+ * stays open) into the LP wallet so the operator can move it out (e.g. to fund a second instance).
+ * The bot stays paused (no stops, top-ups or recenters) until /resume or a restart:
+ *  - /resume re-bases entry equity to live equity (so the equity stop can't fire on the transfer out);
+ *    any funds still in the wallet get topped back in.
+ *  - a restart re-reads entry equity at attach (remove/update ENTRY_EQUITY_USD first) and should carry
+ *    NET_DEPOSITS_USD = −(USD moved out) so P&L stays right.
+ */
+async function withdrawPartial(dlmmPool: DLMM, pct: number): Promise<void> {
+  if (!activePositionPubkey) {
+    await notify("⚠️ /withdraw_pct: no open position.");
+    return;
+  }
+  if (!(pct >= 1 && pct <= 90)) {
+    await notify("⚠️ Usage: /withdraw_pct N (1–90). Use /emergency_exit to close everything.");
+    return;
+  }
+  if (isExiting || isLiquidating || isDeploying) {
+    await notify("⏳ /withdraw_pct: another position action is in flight — try again in a minute.");
+    return;
+  }
+  isBotPaused = true;
+  isExiting = true;
+  try {
+    await notify(`⏸️ <b>[PAUSED]</b> Withdrawing ${pct}% of the position's liquidity to the wallet...`);
+    if (!(await ensureTxFeeFloor("partial withdraw"))) {
+      await notify("⚠️ /withdraw_pct aborted — native SOL below fee floor. Bot stays PAUSED; /resume to continue.");
+      return;
+    }
+    await dlmmPool.refetchStates();
+    const pos = await dlmmPool.getPosition(activePositionPubkey);
+    const pre = await snapshotWalletBalances();
+    const txs = await (dlmmPool as any).removeLiquidity({
+      user: wallet.publicKey,
+      position: activePositionPubkey,
+      fromBinId: Number(pos.positionData.lowerBinId),
+      toBinId: Number(pos.positionData.upperBinId),
+      bps: new BN(Math.round(pct * 100)),
+      shouldClaimAndClose: false,
+    });
+    const sigs: string[] = [];
+    for (const tx of Array.isArray(txs) ? txs : [txs]) sigs.push(await sendAndConfirmTransaction(connection, tx, [wallet]));
+    const post = await snapshotWalletBalances();
+    const activeBin = await dlmmPool.getActiveBin();
+    const spot = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
+    const solOut = Math.max(0, post.solEffectiveLamports - pre.solEffectiveLamports) / 1e9;
+    const usdcOut = Math.max(0, post.usdcRaw - pre.usdcRaw) / 1e6;
+    const usd = solOut * spot + usdcOut;
+    partialWithdrawPending = true;
+    await notify(
+      `💸 <b>[PARTIAL WITHDRAW ${pct}%]</b> Moved to wallet: ${solOut.toFixed(4)} SOL + $${usdcOut.toFixed(2)} USDC (≈ $${usd.toFixed(2)} @ $${spot.toFixed(2)}).\n` +
+        `• Bot is <b>PAUSED</b> (stops OFF). Transfer the funds out now (keep ≥ ${(GAS_RESERVE_LAMPORTS / 1e9).toFixed(2)} SOL here).\n` +
+        `• Then either /resume (entry equity re-based to live equity) or redeploy with NET_DEPOSITS_USD and ENTRY_EQUITY_USD updated.\n` +
+        `• Tx: <code>${sigs.join(",")}</code>`
+    );
+    void emitLedger({
+      event: "PARTIAL_WITHDRAW",
+      spot_usd: spot,
+      position_value_usd: usd,
+      tx_sig: sigs.join(","),
+      swap_in_amount: solOut,
+      swap_out_amount: usdcOut,
+      swap_direction: "POSITION→wallet",
+      notes: `Partial withdraw ${pct}% to LP wallet (≈ $${usd.toFixed(2)}); bot paused for external transfer`,
+      is_estimate: false,
+    });
+  } catch (err: any) {
+    const msg = redactSecrets(String(err?.message || err)).slice(0, 300);
+    console.error("[PARTIAL WITHDRAW ERROR]:", msg);
+    await notify(`⚠️ <b>[PARTIAL WITHDRAW FAILED]</b> ${escapeHtml(msg)}. Bot stays PAUSED; /resume to continue.`);
+  } finally {
+    isExiting = false;
+  }
+}
+
 // ==================== MANUAL EMERGENCY EXIT ====================
 async function executeFullEmergencyExit(dlmmPool: DLMM) {
   if (isExiting) {
@@ -2666,6 +2745,7 @@ async function listenTelegramCommands() {
             `• <b>/balance</b> - Liquid balances & gas reserve safety check\n` +
             `• <b>/harvest</b> - Trigger an immediate swap-fee sweep to LP Revenue\n` +
             `• <b>/emergency_exit</b> - Pull liquidity, swap 100% to USDC, and pause\n` +
+            `• <b>/withdraw_pct N</b> - Pause and withdraw N% of the position to the wallet (for a transfer out)\n` +
             `• <b>/pause</b> - Freeze automated redeployments\n` +
             `• <b>/resume</b> - Unpause bot and resume strategy loops`;
           await notify(helpMsg);
@@ -2704,12 +2784,36 @@ async function listenTelegramCommands() {
             })() +
             `• <b>Target Deploy:</b> ${(DEPLOY_PCT * 100).toFixed(0)}% (env DEPLOY_PCT; regime table kept for bins/stops)`;
           await notify(rMsg);
+        } else if (text.startsWith("/withdraw_pct")) {
+          const pct = Number(text.split(/\s+/)[1]);
+          if (dlmmPoolInstance) await withdrawPartial(dlmmPoolInstance, pct);
         } else if (text === "/emergency_exit") {
           if (dlmmPoolInstance) await executeFullEmergencyExit(dlmmPoolInstance);
         } else if (text === "/pause") {
           isBotPaused = true;
           await notify("⏸️ <b>[PAUSED]</b> Deployments frozen. Standing by in current state.");
         } else if (text === "/resume") {
+          if (partialWithdrawPending && dlmmPoolInstance && activePositionPubkey) {
+            // Funds were pulled for an external transfer: re-base entry equity so the equity stop measures
+            // from what is left, not from the pre-withdrawal equity. Refuse to resume on a failed read.
+            await dlmmPoolInstance.refetchStates();
+            const ab = await dlmmPoolInstance.getActiveBin();
+            const spotNow = Number(ab.price) * PRICE_DECIMAL_FACTOR;
+            const pr = await probeEquityWithRetry(dlmmPoolInstance, spotNow, activePositionPubkey, 3);
+            if (!pr.ok) {
+              await notify(`⚠️ /resume refused: equity read failed (${escapeHtml(pr.reason || "unknown")}). Still PAUSED — try again.`);
+              continue;
+            }
+            const before = entryEquityUsd;
+            entryEquityUsd = pr.totalUsd;
+            entryEquityPending = false;
+            partialWithdrawPending = false;
+            await notify(
+              `ℹ️ Entry equity re-based after partial withdrawal: $${before.toFixed(2)} → $${entryEquityUsd.toFixed(2)}. ` +
+                `Set NET_DEPOSITS_USD for the amount moved out and update/remove ENTRY_EQUITY_USD before the next restart.`
+            );
+            logEntryPinHint();
+          }
           isBotPaused = false;
           inCooldownUntil = 0;
           markStopsArmed(); // don't fire a "stops blind" alert for the paused period
