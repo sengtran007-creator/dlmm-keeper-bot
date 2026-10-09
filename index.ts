@@ -468,6 +468,22 @@ async function getTxFeeSol(sig: string): Promise<number | null> {
   return d.feeLamports != null ? d.feeLamports / 1e9 : null;
 }
 
+// Closes / liquidity withdrawals and fee claims don't spend the reserve (a close refunds ~0.057 SOL rent),
+// so they only need enough native SOL for fees + temporary ATA rent. Deploy and top-up leave native SOL at
+// ≈ the reserve minus rent/fees, so requiring reserve + buffer here used to block every claim and close
+// (stops, recenter, take-profit, emergency exit) after a top-up or deploy.
+const TX_FEE_FLOOR_LAMPORTS = Math.max(1_000_000, Number(process.env.TX_FEE_FLOOR_LAMPORTS ?? 10_000_000)); // 0.01 SOL
+
+/** Risk-reducing / SOL-neutral txs (close, withdraw, claim): only require a small fee floor. */
+async function ensureTxFeeFloor(context: string): Promise<boolean> {
+  const bal = await connection.getBalance(wallet.publicKey);
+  if (bal < TX_FEE_FLOOR_LAMPORTS) {
+    console.warn(`[GAS] ${context}: native SOL ${(bal / 1e9).toFixed(4)} below fee floor ${(TX_FEE_FLOOR_LAMPORTS / 1e9).toFixed(4)} — aborting`);
+    return false;
+  }
+  return true;
+}
+
 /** Refuse to send when native SOL is below gas reserve (+ optional buffer for the next fee). */
 async function ensureGasReserve(extraLamports: number = 5_000_000): Promise<boolean> {
   const bal = await connection.getBalance(wallet.publicKey);
@@ -1500,8 +1516,8 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
 
     const claimSigs: string[] = [];
     try {
-      if (!(await ensureGasReserve(5_000_000))) {
-        console.warn("[FEE] Skipping claim — SOL below gas reserve");
+      if (!(await ensureTxFeeFloor("fee claim"))) {
+        console.warn("[FEE] Skipping claim — SOL below fee floor");
         return 0;
       }
       const claimTx = await (dlmmPool as any).claimSwapFee({
@@ -1664,8 +1680,8 @@ async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResu
           continue;
         }
 
-        if (!(await ensureGasReserve(5_000_000))) {
-          console.warn("[CLOSE] Aborting further closes — SOL below gas reserve");
+        if (!(await ensureTxFeeFloor("close"))) {
+          console.warn("[CLOSE] Aborting further closes — SOL below fee floor");
           break;
         }
 
