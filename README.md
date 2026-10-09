@@ -44,11 +44,15 @@ Net PnL = live equity (position + wallet) + swept to revenue − (STARTING_CAPIT
 | --- | --- |
 | `STARTING_CAPITAL_USD` | Authoritative starting capital in USD. If unset, the baseline falls back to mark-to-market equity at boot (P&L is then "since boot"). `BASELINE_USD` is a deprecated alias. |
 | `NET_DEPOSITS_USD` | Optional. External deposits − withdrawals after the start (may be negative). Fee sweeps are **not** withdrawals. |
-| `PRIOR_SWEPT_USD` | Optional. USD swept to the revenue wallet before the current boot (in-process sweeps are added automatically). Only used with `STARTING_CAPITAL_USD`. |
+| `PRIOR_SWEPT_USD` | Fallback only. The bot derives cumulative swept on-chain at boot (all LP-wallet → revenue-ATA USDC transfers) and adds in-process sweeps; this env is used only if the scan fails or is incomplete. Only used with `STARTING_CAPITAL_USD`. |
 
 - Top-ups, deploys, recenters, swaps, wrap/unwrap, closes, take-profit, circuit breaker and emergency exit never change the baseline; it is set once per boot, so restarts cannot double it.
 - Fee sweeps to the revenue wallet are added back, so they never show as a loss.
 - The baseline is **reporting only**. Stops use the entry state: price stop = `entry spot × (1 − floorStopPct)`, equity stop = `entry equity × (1 − MAX_DRAWDOWN_PCT)`.
+
+### Fee-sweep schedule
+
+Fees are claimed and swept to `REVENUE_WALLET_PUBKEY` every `SWEEP_INTERVAL_SEC` (24h). The clock survives restarts: at boot the bot scans the revenue wallet's USDC ATA and uses the block time of the latest transfer whose source is the LP wallet's USDC ATA, signed by the LP wallet (address-poisoning dust from lookalike wallets and transfers from anyone else are ignored). If the scan fails it falls back to `LAST_SWEEP_UNIX`, else boot time, and retries the scan in the background every 15 min (up to 8 times). The clock advances only when a sweep actually moves USDC (scheduled, `/harvest`, or a stop/TP/recenter/emergency pre-close sweep); a due sweep that moves nothing is retried after `SWEEP_RETRY_SEC` (1h). The next sweep time (PT) is shown at boot/attach and in `/status`.
 
 ### Entry pin across restarts
 

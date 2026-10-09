@@ -70,9 +70,22 @@ const STARTING_CAPITAL_USD_ENV = (() => {
 // Net external capital flows AFTER the starting capital: deposits − withdrawals (may be negative).
 // Fee sweeps to REVENUE_WALLET_PUBKEY are NOT withdrawals — do not include them here.
 const NET_DEPOSITS_USD = parseOptionalUsd("NET_DEPOSITS_USD", true) ?? 0;
-// USD already swept to the revenue wallet BEFORE this process started (sweeps are counted
-// in-process from 0 on every boot). Only applied when STARTING_CAPITAL_USD/BASELINE_USD is set.
+// FALLBACK for USD already swept to the revenue wallet before this boot. The bot now derives this
+// on-chain at boot (sum of LP-wallet → revenue-ATA USDC transfers); this env is used only if that
+// scan fails or is incomplete. Only applied when STARTING_CAPITAL_USD/BASELINE_USD is set.
 const PRIOR_SWEPT_USD = parseOptionalUsd("PRIOR_SWEPT_USD") ?? 0;
+
+// ---- Fee-sweep schedule (survives restarts) ----
+const SWEEP_INTERVAL_SEC = Math.max(3600, Number(process.env.SWEEP_INTERVAL_SEC ?? 86400));
+// When a due sweep moves nothing (no/low fees, gas reserve, error), retry after this long instead of every tick.
+const SWEEP_RETRY_SEC = Math.max(300, Number(process.env.SWEEP_RETRY_SEC ?? 3600));
+// Fallback last-sweep time (unix seconds) if the on-chain lookup finds nothing or fails.
+const LAST_SWEEP_UNIX_ENV = (() => {
+  const v = parseOptionalUsd("LAST_SWEEP_UNIX");
+  return v != null && v > 1_600_000_000 ? Math.floor(v) : null;
+})();
+// Max signatures scanned on the revenue USDC ATA at boot.
+const SWEEP_SCAN_MAX_SIGS = Math.max(100, Number(process.env.SWEEP_SCAN_MAX_SIGS ?? 2000));
 
 // Public Meteora SOL-USDC ~10bps DLMM pool + well-known mints (safe to keep in source).
 const SOL_USDC_POOL = new PublicKey("BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y");
@@ -143,7 +156,14 @@ let activePositionPubkey: PublicKey | null = null;
 let lowestBinPrice = 0;
 let highestBinPrice = 0;
 let inCooldownUntil = 0;
+/** Unix seconds of the last successful fee sweep. Set at boot from chain (else LAST_SWEEP_UNIX, else boot time). */
 let lastSweepTime = Math.floor(Date.now() / 1000);
+let lastSweepSource = "boot time (not yet resolved)";
+/** When a due sweep moved nothing, don't retry before this time (avoids a claim attempt every 15s tick). */
+let nextSweepRetryAt = 0;
+/** USD swept to the revenue wallet before this boot (on-chain scan, else PRIOR_SWEPT_USD fallback). */
+let priorSweptUsd = PRIOR_SWEPT_USD;
+let priorSweptSource = PRIOR_SWEPT_USD > 0 ? "env PRIOR_SWEPT_USD" : "none";
 let isDeploying = false;
 let isBotPaused = false;
 let isLiquidating = false;
@@ -915,6 +935,197 @@ async function recordEntryAfterOpen(dlmmPool: DLMM, spotUsd: number, note: strin
   console.log(`[ENTRY] ${note} spot=$${entrySpotUsd.toFixed(2)} equity=$${entryEquityUsd.toFixed(2)}`);
 }
 
+// ==================== FEE-SWEEP CLOCK (on-chain, survives restarts) ====================
+function formatUnixPt(unixSec: number): string {
+  return `${formatTimestampPt(new Date(unixSec * 1000))} PT`;
+}
+
+/** Human label for the next scheduled sweep (PT). */
+function nextSweepLabel(): string {
+  const now = Math.floor(Date.now() / 1000);
+  const due = lastSweepTime + SWEEP_INTERVAL_SEC;
+  const at = Math.max(due, nextSweepRetryAt);
+  const last = `last ${formatUnixPt(lastSweepTime)} (${lastSweepSource})`;
+  if (at <= now) return `due now (first eligible tick) — ${last}`;
+  return `${formatUnixPt(at)}${nextSweepRetryAt > due ? " (retry after a sweep that moved nothing)" : ""} — ${last}`;
+}
+
+interface SweepHistory {
+  ok: boolean;
+  reason?: string;
+  /** False if the signature cap was hit or any transaction could not be fetched (total may be low). */
+  complete: boolean;
+  lastSweepUnix: number | null;
+  lastSweepSig: string | null;
+  totalSweptUsd: number;
+  sweepCount: number;
+  scannedSigs: number;
+}
+
+/**
+ * USDC raw amount moved by THIS tx from the LP wallet's USDC ATA to the revenue wallet's USDC ATA,
+ * signed by the LP wallet. Anything else (address-poisoning dust from lookalike wallets, transfers from
+ * other sources, failed txs) counts as 0.
+ */
+function sweepRawFromParsedTx(tx: any, lpWallet: string, lpUsdcAta: string, revUsdcAta: string): number {
+  if (!tx || tx.meta?.err) return 0;
+  const top = tx.transaction?.message?.instructions || [];
+  const inner = (tx.meta?.innerInstructions || []).flatMap((i: any) => i.instructions || []);
+  let raw = 0;
+  for (const ix of [...top, ...inner]) {
+    const parsed = ix?.parsed;
+    if (!parsed || ix.program !== "spl-token") continue;
+    if (parsed.type !== "transfer" && parsed.type !== "transferChecked") continue;
+    const info = parsed.info || {};
+    if (info.source !== lpUsdcAta || info.destination !== revUsdcAta) continue;
+    const authority = info.authority ?? info.multisigAuthority;
+    if (authority !== lpWallet) continue;
+    if (info.mint && info.mint !== USDC_MINT.toBase58()) continue;
+    const amt = Number(info.tokenAmount?.amount ?? info.amount);
+    if (Number.isFinite(amt) && amt > 0) raw += amt;
+  }
+  return raw;
+}
+
+/** Scan the revenue wallet's USDC ATA for sweeps from this LP wallet: last sweep time + cumulative USD. */
+async function scanSweepHistoryOnChain(): Promise<SweepHistory> {
+  const empty: SweepHistory = {
+    ok: false, complete: false, lastSweepUnix: null, lastSweepSig: null, totalSweptUsd: 0, sweepCount: 0, scannedSigs: 0,
+  };
+  try {
+    const lpWallet = wallet.publicKey.toBase58();
+    const lpUsdcAta = (await getAssociatedTokenAddress(USDC_MINT, wallet.publicKey)).toBase58();
+    const revUsdcAtaKey = await getAssociatedTokenAddress(USDC_MINT, LP_REVENUE_VAULT);
+    const revUsdcAta = revUsdcAtaKey.toBase58();
+
+    const sigs: { signature: string; err: any; blockTime?: number | null }[] = [];
+    let before: string | undefined;
+    let complete = false;
+    while (sigs.length < SWEEP_SCAN_MAX_SIGS) {
+      const limit = Math.min(1000, SWEEP_SCAN_MAX_SIGS - sigs.length);
+      const page = await connection.getSignaturesForAddress(revUsdcAtaKey, { before, limit }, "confirmed");
+      sigs.push(...page);
+      if (page.length < limit) {
+        complete = true;
+        break;
+      }
+      before = page[page.length - 1].signature;
+    }
+
+    const res: SweepHistory = { ...empty, ok: true, complete, scannedSigs: sigs.length };
+    let totalRaw = 0;
+    const candidates = sigs.filter((x) => !x.err);
+    const BATCH = 10;
+    for (let i = 0; i < candidates.length; i += BATCH) {
+      const batch = candidates.slice(i, i + BATCH);
+      const txs = await connection.getParsedTransactions(
+        batch.map((x) => x.signature),
+        { maxSupportedTransactionVersion: 0, commitment: "confirmed" }
+      );
+      // Batch responses are not guaranteed to be in request order: take signature + blockTime
+      // from the returned transaction itself, never from the batch position.
+      const seen = new Set<string>();
+      for (const tx of txs as any[]) {
+        if (!tx) continue;
+        const sig: string | undefined = tx.transaction?.signatures?.[0];
+        if (!sig || seen.has(sig)) continue;
+        seen.add(sig);
+        const raw = sweepRawFromParsedTx(tx, lpWallet, lpUsdcAta, revUsdcAta);
+        if (raw <= 0) continue;
+        totalRaw += raw;
+        res.sweepCount += 1;
+        const bt: number | null = tx.blockTime ?? null;
+        if (bt && (res.lastSweepUnix == null || bt > res.lastSweepUnix)) {
+          res.lastSweepUnix = bt;
+          res.lastSweepSig = sig;
+        }
+      }
+      if (seen.size < batch.length) res.complete = false; // pruned/unavailable — total may be understated
+    }
+    res.totalSweptUsd = Number((totalRaw / 1e6).toFixed(6));
+    return res;
+  } catch (err: any) {
+    return { ...empty, reason: redactSecrets(String(err?.message || err)).slice(0, 200) };
+  }
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, rej) => setTimeout(() => rej(new Error(`${label} timed out after ${ms}ms`)), ms)),
+  ]);
+}
+
+/**
+ * Resolve the sweep clock + prior-swept total from chain. Safe to call again later (background retry):
+ * chain overrides a fallback clock (env / boot time) but never an in-process sweep with an older time,
+ * and the prior total subtracts sweeps already counted in-process (no double count).
+ */
+async function resolveSweepStateFromChain(context: string): Promise<boolean> {
+  let h: SweepHistory;
+  try {
+    h = await withTimeout(scanSweepHistoryOnChain(), 45_000, "sweep history scan");
+  } catch (err: any) {
+    h = { ok: false, complete: false, lastSweepUnix: null, lastSweepSig: null, totalSweptUsd: 0, sweepCount: 0, scannedSigs: 0,
+      reason: redactSecrets(String(err?.message || err)) };
+  }
+  if (!h.ok) {
+    console.warn(`[SWEEP] On-chain sweep history unavailable (${context}): ${h.reason}`);
+    return false;
+  }
+  if (h.lastSweepUnix != null && h.lastSweepUnix > 0) {
+    if (lastSweepSource !== "in-process sweep" || h.lastSweepUnix > lastSweepTime) {
+      lastSweepTime = h.lastSweepUnix;
+      lastSweepSource = `on-chain ${h.lastSweepSig ? h.lastSweepSig.slice(0, 8) + "…" : ""}`.trim();
+    }
+  }
+  if (h.complete) {
+    const prior = Math.max(0, Number((h.totalSweptUsd - cumulativeSweptUsd).toFixed(6)));
+    if (PRIOR_SWEPT_USD > 0 && Math.abs(PRIOR_SWEPT_USD - h.totalSweptUsd) > 0.01) {
+      console.warn(
+        `[SWEEP] PRIOR_SWEPT_USD=${PRIOR_SWEPT_USD} differs from on-chain total $${h.totalSweptUsd.toFixed(2)} — using on-chain (env is fallback only).`
+      );
+    }
+    priorSweptUsd = prior;
+    priorSweptSource = `on-chain (${h.sweepCount} sweeps)`;
+  } else {
+    console.warn(
+      `[SWEEP] On-chain sweep scan incomplete (${h.scannedSigs} sigs, cap ${SWEEP_SCAN_MAX_SIGS} or unavailable txs) — ` +
+        `keeping prior swept $${priorSweptUsd.toFixed(2)} (${priorSweptSource}).`
+    );
+  }
+  console.log(
+    `[SWEEP] ${context}: on-chain sweeps=${h.sweepCount} total=$${h.totalSweptUsd.toFixed(2)} (scanned ${h.scannedSigs} sigs${h.complete ? "" : ", incomplete"}) | ` +
+      `prior swept $${priorSweptUsd.toFixed(2)} [${priorSweptSource}] | next sweep: ${nextSweepLabel()}`
+  );
+  return true;
+}
+
+/** Boot: resolve from chain; on failure use LAST_SWEEP_UNIX or boot time, and retry the scan in the background. */
+async function initSweepClock(): Promise<void> {
+  const ok = await resolveSweepStateFromChain("boot");
+  if (ok && lastSweepSource.startsWith("on-chain")) return;
+  if (!ok || lastSweepSource.startsWith("boot")) {
+    if (LAST_SWEEP_UNIX_ENV != null) {
+      lastSweepTime = LAST_SWEEP_UNIX_ENV;
+      lastSweepSource = "env LAST_SWEEP_UNIX";
+    } else {
+      lastSweepSource = ok ? "boot time (no on-chain sweep found)" : "boot time (on-chain lookup failed)";
+    }
+    console.warn(`[SWEEP] Sweep clock source: ${lastSweepSource} | next sweep: ${nextSweepLabel()}`);
+  }
+  if (!ok) {
+    // Retry in the background so frequent restarts + a flaky RPC can't postpone sweeps forever.
+    let attempts = 0;
+    const retry = async () => {
+      attempts += 1;
+      const done = await resolveSweepStateFromChain(`background retry ${attempts}`);
+      if (!done && attempts < 8) setTimeout(retry, 15 * 60 * 1000);
+    };
+    setTimeout(retry, 15 * 60 * 1000);
+  }
+}
+
 /** Logs the exact env values that would pin the CURRENT entry across a restart. */
 function logEntryPinHint() {
   if (!activePositionPubkey || !(entrySpotUsd > 0)) return;
@@ -929,7 +1140,7 @@ function logEntryPinHint() {
 function sweptForPnlUsd(): number {
   // Prior sweeps only make sense against an env (true starting capital) baseline;
   // a boot-equity baseline already excludes everything swept before boot.
-  return (capitalBaselineSource === "env" ? PRIOR_SWEPT_USD : 0) + cumulativeSweptUsd;
+  return (capitalBaselineSource === "env" ? priorSweptUsd : 0) + cumulativeSweptUsd;
 }
 
 /** Net P&L vs contributed capital: equity + swept to revenue − baseline. NaN while the baseline is pending. */
@@ -1434,6 +1645,10 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
       cumulativeFeesUsd += sweptUsdFinal;
       cumulativeSweptUsd += sweptUsdFinal;
       sweptSinceEntryUsd += sweptUsdFinal;
+      // Any successful sweep (scheduled, /harvest, stop, TP, recenter, emergency) restarts the 24h clock.
+      lastSweepTime = Math.floor(Date.now() / 1000);
+      lastSweepSource = "in-process sweep";
+      nextSweepRetryAt = 0;
       if (feeSol != null) cumulativeGasSol += feeSol;
       await emitLedger({
         event: "FEE_SWEEP",
@@ -2216,6 +2431,7 @@ async function listenTelegramCommands() {
             `• <b>Equity (MTM):</b> ${statusEquityUsd != null ? `$${statusEquityUsd.toFixed(2)}` : "n/a"}\n` +
             `• <b>Capital Baseline:</b> ${capitalBaselineLabel()}\n` +
             `• <b>Net PnL:</b> ${statusPnl != null ? `${fmtSignedUsd(statusPnl)} (${fmtPct(statusPnl, capitalBaselineUsd)}, incl. $${sweptForPnlUsd().toFixed(2)} swept)` : "n/a"}\n` +
+            `• <b>Next Fee Sweep:</b> ${nextSweepLabel()}\n` +
             `• <b>Position NFT:</b> <code>${activePositionPubkey ? activePositionPubkey.toBase58() : "None (Holding Cash)"}</code>\n\n` +
             `${gateTelemetry}`;
           await notify(statusMsg);
@@ -2250,6 +2466,8 @@ async function runKeeper() {
   await notify("🚀 DLMM Automated Keeper initialized on Railway.");
   void emitLedger({ event: "BOOT", notes: "Keeper process started", is_estimate: true });
   dlmmPoolInstance = await DLMM.create(connection, SOL_USDC_POOL);
+  // Fee-sweep clock + prior swept total from chain (bounded by a timeout; never blocks boot on failure).
+  await initSweepClock();
 
   // Capital baseline (reporting only — never read by stops/TP/recenter/sizing), set ONCE here:
   // STARTING_CAPITAL_USD (+ NET_DEPOSITS_USD), else full MTM equity at boot (position + wallet).
@@ -2386,6 +2604,7 @@ async function runKeeper() {
       `• Capital Baseline: ${capitalBaselineLabel()}` +
       (bootEquityUsd != null && !capitalBaselinePending ? `\n• Net PnL: ${fmtSignedUsd(totalPnlUsd(bootEquityUsd))}` : "") +
       `\n• Entry pin: ${pinStatus}` +
+      `\n• Next fee sweep: ${nextSweepLabel()}` +
       (entryEquityPending ? `\n• ⏳ Entry equity pending first good read (equity stop not armed yet)` : "")
     );
     void emitLedger({
@@ -2411,7 +2630,8 @@ async function runKeeper() {
     }
     await notify(
       `🟢 <b>[BOOTED IN 100% USDC]</b> Equity: ${bootEquityUsd != null ? `$${bootEquityUsd.toFixed(2)}` : "n/a"} | ` +
-      `Capital Baseline: ${capitalBaselineLabel()}. Standing by for Gate 1-3 clearance.`
+      `Capital Baseline: ${capitalBaselineLabel()}. Standing by for Gate 1-3 clearance.\n` +
+      `• Next fee sweep: ${nextSweepLabel()}`
     );
   }
 
@@ -2445,9 +2665,15 @@ async function runKeeper() {
 
       const currentConfig = await macroSentinel.evaluateRegime(SOL_USDC_POOL.toBase58());
 
-      if (now - lastSweepTime > 86400) {
-        await sweepRevenueToVault(dlmmPoolInstance!);
-        lastSweepTime = now;
+      // Scheduled sweep (before idle top-up so top-up doesn't absorb USDC about to be swept).
+      // lastSweepTime only advances on an actual sweep (inside sweepRevenueToVault); if a due sweep
+      // moves nothing, retry after SWEEP_RETRY_SEC instead of on every tick.
+      if (now - lastSweepTime >= SWEEP_INTERVAL_SEC && now >= nextSweepRetryAt) {
+        const swept = await sweepRevenueToVault(dlmmPoolInstance!);
+        if (!(swept > 0)) {
+          nextSweepRetryAt = now + SWEEP_RETRY_SEC;
+          console.log(`[SWEEP] Due sweep moved nothing — retry at ${formatUnixPt(nextSweepRetryAt)}`);
+        }
       }
 
       // Idle top-up AFTER sweep so we do not absorb USDC about to be sent to revenue wallet.
