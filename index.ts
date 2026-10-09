@@ -20,7 +20,9 @@ import {
   createTransferCheckedInstruction,
   createCloseAccountInstruction,
   getAccount,
+  getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
+import { randomInt } from "crypto";
 import { BN } from "@coral-xyz/anchor";
 import bs58 from "bs58";
 import axios from "axios";
@@ -61,6 +63,31 @@ import {
   resolveLanded,
   solSweepLamports,
 } from "./feesweep";
+import {
+  ATA_RENT_LAMPORTS,
+  TRANSFER_OUT_CONFIRM_TTL_MS,
+  TRANSFER_OUT_FEATURE_EPOCH_UNIX,
+  TransferConfirmations,
+  TransferOutHistory,
+  TransferRequest,
+  addToHistory,
+  applyTransferOut,
+  baselineWithTransfersOut,
+  buildTransferOutMemo,
+  checkTransferPreconditions,
+  effectivePinnedEntryEquity,
+  emptyTransferOutHistory,
+  parseConfirmCommand,
+  parseTransferAllowlist,
+  parseTransferOutCommand,
+  parseTransferOutTx,
+  parseUserIds,
+  planTransferOut,
+  resolveMaxEquityPct,
+  resolveMaxUsd,
+  revalidateQuotedPlan,
+  signatureHasTransferOutMemo,
+} from "./transferout";
 
 dotenv.config();
 
@@ -243,6 +270,33 @@ const MAX_POSITION_WIDTH = DEFAULT_BIN_PER_POSITION.toNumber(); // 70
 const connection = new Connection(RPC_URL, "confirmed");
 const wallet = Keypair.fromSecretKey(bs58.decode(BOT_PRIVATE_KEY));
 
+// ---- /transfer_out (allow-listed, confirmed transfer of funds out of the LP wallet; see transferout.ts) ----
+// TRANSFER_OUT_ALLOWLIST: exactly ONE destination wallet (public key). Unset/invalid = command disabled.
+// The destination never comes from Telegram. Needs TELEGRAM_CHAT_ID; optional TRANSFER_OUT_USER_IDS
+// (Telegram user ids allowed to request/confirm). Caps: TRANSFER_OUT_MAX_USD (default 600, hard ceiling 5000)
+// and TRANSFER_OUT_MAX_EQUITY_PCT of live equity (default 60). SOL leg never takes native SOL below
+// GAS_RESERVE_LAMPORTS + TRANSFER_OUT_SOL_MARGIN_LAMPORTS (default 0.01 SOL) + tx fee (+ destination ATA rent).
+// Accounting: each transfer carries an on-chain memo; at boot the total is re-derived from chain and subtracted
+// from an env capital baseline (do NOT also put it in NET_DEPOSITS_USD). TRANSFER_OUT_PRIOR_USD is a fallback
+// used only if that scan fails / is incomplete.
+const TRANSFER_OUT = parseTransferAllowlist(process.env.TRANSFER_OUT_ALLOWLIST, {
+  lpWallet: wallet.publicKey.toBase58(),
+  revenueWallet: LP_REVENUE_VAULT.toBase58(),
+  isValidPubkey: (x) => {
+    try {
+      return PublicKey.isOnCurve(new PublicKey(x).toBytes());
+    } catch {
+      return false;
+    }
+  },
+});
+const TRANSFER_OUT_MAX_USD = resolveMaxUsd(process.env.TRANSFER_OUT_MAX_USD);
+const TRANSFER_OUT_MAX_EQUITY_PCT = resolveMaxEquityPct(process.env.TRANSFER_OUT_MAX_EQUITY_PCT);
+const TRANSFER_OUT_USER_IDS = parseUserIds(process.env.TRANSFER_OUT_USER_IDS);
+const TRANSFER_OUT_SOL_MARGIN_LAMPORTS = Math.max(0, Number(process.env.TRANSFER_OUT_SOL_MARGIN_LAMPORTS ?? 10_000_000));
+const TRANSFER_OUT_PRIOR_USD = parseOptionalUsd("TRANSFER_OUT_PRIOR_USD") ?? 0;
+const TRANSFER_OUT_SCAN_MAX_SIGS = Math.max(200, Number(process.env.TRANSFER_OUT_SCAN_MAX_SIGS ?? 5000));
+
 let dlmmPoolInstance: DLMM | null = null;
 let activePositionPubkey: PublicKey | null = null;
 let lowestBinPrice = 0;
@@ -260,6 +314,20 @@ let isDeploying = false;
 let isBotPaused = false;
 /** Set by /withdraw_pct: liquidity was pulled into the wallet for an external transfer. /resume re-bases entry equity. */
 let partialWithdrawPending = false;
+/** USD moved out by /transfer_out: before this boot (chain, else TRANSFER_OUT_PRIOR_USD) + this process. */
+let priorTransferOutUsd = 0;
+let priorTransferOutSource = "none";
+let transferOutHistory: TransferOutHistory = emptyTransferOutHistory();
+let transferredOutThisProcessUsd = 0;
+interface QuotedTransfer {
+  req: TransferRequest;
+  usdcRaw: number;
+  lamports: number;
+  usd: number;
+  spot: number;
+  needsAta: boolean;
+}
+const transferConfirmations = new TransferConfirmations<QuotedTransfer>(TRANSFER_OUT_CONFIRM_TTL_MS);
 let isLiquidating = false;
 /** True while any unwind path (circuit breaker / take-profit / emergency) is in flight. */
 let isExiting = false;
@@ -1323,8 +1391,10 @@ function fmtPct(num: number, den: number): string {
 function capitalBaselineLabel(): string {
   if (capitalBaselinePending) return "pending (equity at boot unreadable; set STARTING_CAPITAL_USD)";
   if (capitalBaselineSource === "env") {
-    const parts = [`starting $${(capitalBaselineUsd - NET_DEPOSITS_USD).toFixed(2)}`];
+    const outUsd = priorTransferOutUsd + transferredOutThisProcessUsd;
+    const parts = [`starting $${(capitalBaselineUsd - NET_DEPOSITS_USD + outUsd).toFixed(2)}`];
     if (NET_DEPOSITS_USD !== 0) parts.push(`net deposits ${fmtSignedUsd(NET_DEPOSITS_USD)}`);
+    if (outUsd > 0) parts.push(`transferred out −$${outUsd.toFixed(2)}`);
     return `$${capitalBaselineUsd.toFixed(2)} (${parts.join(", ")})`;
   }
   return `$${capitalBaselineUsd.toFixed(2)} (equity at boot — set STARTING_CAPITAL_USD for true PnL)`;
@@ -2552,8 +2622,9 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
  * The bot stays paused (no stops, top-ups or recenters) until /resume or a restart:
  *  - /resume re-bases entry equity to live equity (so the equity stop can't fire on the transfer out);
  *    any funds still in the wallet get topped back in.
- *  - a restart re-reads entry equity at attach (remove/update ENTRY_EQUITY_USD first) and should carry
- *    NET_DEPOSITS_USD = −(USD moved out) so P&L stays right.
+ *  - /transfer_out (allow-listed, confirmed) moves the funds and records the capital withdrawal on chain, so
+ *    no env edit is needed for P&L; a transfer done by hand instead needs NET_DEPOSITS_USD = −(USD moved out)
+ *    and ENTRY_EQUITY_USD removed/updated before a restart.
  */
 async function withdrawPartial(dlmmPool: DLMM, pct: number): Promise<void> {
   if (!activePositionPubkey) {
@@ -2598,8 +2669,10 @@ async function withdrawPartial(dlmmPool: DLMM, pct: number): Promise<void> {
     partialWithdrawPending = true;
     await notify(
       `💸 <b>[PARTIAL WITHDRAW ${pct}%]</b> Moved to wallet: ${solOut.toFixed(4)} SOL + $${usdcOut.toFixed(2)} USDC (≈ $${usd.toFixed(2)} @ $${spot.toFixed(2)}).\n` +
-        `• Bot is <b>PAUSED</b> (stops OFF). Transfer the funds out now (keep ≥ ${(GAS_RESERVE_LAMPORTS / 1e9).toFixed(2)} SOL here).\n` +
-        `• Then either /resume (entry equity re-based to live equity) or redeploy with NET_DEPOSITS_USD and ENTRY_EQUITY_USD updated.\n` +
+        (TRANSFER_OUT.enabled
+          ? `• Bot is <b>PAUSED</b> (stops OFF). Next: <code>/transfer_out 100%</code> (or a USD amount) → /confirm CODE, then /resume.\n`
+          : `• Bot is <b>PAUSED</b> (stops OFF). Transfer the funds out now (keep ≥ ${(GAS_RESERVE_LAMPORTS / 1e9).toFixed(2)} SOL here).\n` +
+            `• Then either /resume (entry equity re-based to live equity) or redeploy with NET_DEPOSITS_USD and ENTRY_EQUITY_USD updated.\n`) +
         `• Tx: <code>${sigs.join(",")}</code>`
     );
     void emitLedger({
@@ -2619,6 +2692,263 @@ async function withdrawPartial(dlmmPool: DLMM, pct: number): Promise<void> {
     await notify(`⚠️ <b>[PARTIAL WITHDRAW FAILED]</b> ${escapeHtml(msg)}. Bot stays PAUSED; /resume to continue.`);
   } finally {
     isExiting = false;
+  }
+}
+
+// ==================== /transfer_out (allow-listed, confirmed) ====================
+/**
+ * Boot: re-derive every /transfer_out this LP wallet made (on-chain memo + actual transfers), so the capital
+ * baseline and a stale ENTRY_EQUITY_USD pin stay right across restarts without env edits. Scans the LP wallet's
+ * signatures back to the feature epoch; only signatures whose memo carries the transfer-out tag are fetched.
+ * Runs whether or not TRANSFER_OUT_ALLOWLIST is set (unsetting it after a transfer must not change P&L).
+ */
+async function initTransferOutHistory(): Promise<void> {
+  const h = emptyTransferOutHistory();
+  const work = (async () => {
+    const lpWallet = wallet.publicKey.toBase58();
+    const lpUsdcAta = getAssociatedTokenAddressSync(USDC_MINT, wallet.publicKey).toBase58();
+    const ctx = {
+      lpWallet,
+      lpUsdcAta,
+      usdcMint: USDC_MINT.toBase58(),
+      usdcAtaOf: (owner: string) => getAssociatedTokenAddressSync(USDC_MINT, new PublicKey(owner), true).toBase58(),
+    };
+    let before: string | undefined;
+    const hits: string[] = [];
+    while (h.scannedSigs < TRANSFER_OUT_SCAN_MAX_SIGS) {
+      const limit = Math.min(1000, TRANSFER_OUT_SCAN_MAX_SIGS - h.scannedSigs);
+      const page = await connection.getSignaturesForAddress(wallet.publicKey, { before, limit }, "confirmed");
+      h.scannedSigs += page.length;
+      let reachedEpoch = false;
+      for (const x of page) {
+        if (x.blockTime != null && x.blockTime < TRANSFER_OUT_FEATURE_EPOCH_UNIX) {
+          reachedEpoch = true;
+          break;
+        }
+        if (signatureHasTransferOutMemo(x)) hits.push(x.signature);
+      }
+      if (reachedEpoch || page.length < limit) {
+        h.complete = true;
+        break;
+      }
+      before = page[page.length - 1].signature;
+    }
+    for (let i = 0; i < hits.length; i += 10) {
+      const txs = await connection.getParsedTransactions(hits.slice(i, i + 10), { maxSupportedTransactionVersion: 0, commitment: "confirmed" });
+      for (const tx of txs) {
+        const t = parseTransferOutTx(tx, ctx);
+        if (t) addToHistory(h, t);
+      }
+    }
+    h.ok = true;
+  })();
+  try {
+    await Promise.race([work, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout 45s")), 45_000))]);
+  } catch (err: any) {
+    h.ok = false;
+    console.warn(`[TRANSFER_OUT] history scan failed: ${redactSecrets(String(err?.message || err))}`);
+  }
+  transferOutHistory = h;
+  if (h.ok && h.complete) {
+    priorTransferOutUsd = h.totalUsd;
+    priorTransferOutSource = h.count > 0 ? `on-chain (${h.count} transfer${h.count === 1 ? "" : "s"})` : "none";
+  } else {
+    priorTransferOutUsd = Math.max(h.ok ? h.totalUsd : 0, TRANSFER_OUT_PRIOR_USD);
+    priorTransferOutSource = h.ok ? "on-chain scan INCOMPLETE (max of partial and TRANSFER_OUT_PRIOR_USD)" : "env TRANSFER_OUT_PRIOR_USD (scan failed)";
+    if (priorTransferOutUsd === 0) console.warn("[TRANSFER_OUT] history not fully verified and TRANSFER_OUT_PRIOR_USD unset — assuming $0 transferred out.");
+  }
+  console.log(
+    `[TRANSFER_OUT] ${TRANSFER_OUT.enabled ? `enabled → ${TRANSFER_OUT.address} (cap $${TRANSFER_OUT_MAX_USD} / ${TRANSFER_OUT_MAX_EQUITY_PCT}% of equity)` : `disabled (${TRANSFER_OUT.reason})`}` +
+      ` | prior transferred out $${priorTransferOutUsd.toFixed(2)} (${priorTransferOutSource}; ${h.scannedSigs} sigs scanned)`
+  );
+}
+
+function transferGate(chatId: string, userId: string) {
+  return checkTransferPreconditions({
+    enabled: TRANSFER_OUT.enabled,
+    disabledReason: TRANSFER_OUT.reason,
+    chatIdConfigured: !!TELEGRAM_CHAT_ID,
+    chatMatches: !!TELEGRAM_CHAT_ID && chatId === TELEGRAM_CHAT_ID.trim(),
+    userAllowed: TRANSFER_OUT_USER_IDS.size === 0 || TRANSFER_OUT_USER_IDS.has(userId),
+    paused: isBotPaused,
+    partialWithdrawPending,
+    hasOpenPosition: !!activePositionPubkey,
+    busy: isExiting || isLiquidating || isDeploying || solTransferInFlight,
+  });
+}
+
+/** Fresh inputs for sizing: balances, spot, live equity, whether the destination USDC account must be created. */
+async function transferInputs(): Promise<{ usdcRaw: number; nativeLamports: number; spotUsd: number; equityUsd: number | null; needsAta: boolean }> {
+  if (!dlmmPoolInstance || !TRANSFER_OUT.address) throw new Error("not ready");
+  await dlmmPoolInstance.refetchStates();
+  const ab = await dlmmPoolInstance.getActiveBin();
+  const spotUsd = Number(ab.price) * PRICE_DECIMAL_FACTOR;
+  const bal = await snapshotWalletBalances();
+  const pr = await probeEquityWithRetry(dlmmPoolInstance, spotUsd, activePositionPubkey, 2);
+  const destAta = getAssociatedTokenAddressSync(USDC_MINT, new PublicKey(TRANSFER_OUT.address), true);
+  const needsAta = !(await connection.getAccountInfo(destAta, "confirmed"));
+  return { usdcRaw: bal.usdcRaw, nativeLamports: bal.nativeLamports, spotUsd, equityUsd: pr.ok ? pr.totalUsd ?? null : null, needsAta };
+}
+
+function sizingParams(inp: { needsAta: boolean }) {
+  return {
+    gasReserveLamports: GAS_RESERVE_LAMPORTS,
+    marginLamports: TRANSFER_OUT_SOL_MARGIN_LAMPORTS,
+    txFeeLamports: SOL_TRANSFER_FEE_LAMPORTS,
+    ataRentLamports: inp.needsAta ? ATA_RENT_LAMPORTS : 0,
+    maxUsd: TRANSFER_OUT_MAX_USD,
+    maxEquityPct: TRANSFER_OUT_MAX_EQUITY_PCT,
+  };
+}
+
+/** Step 1: `/transfer_out <usd|pct%> [usdc]` → exact quote + one-time code (nothing is sent). */
+async function handleTransferOutRequest(rawText: string, chatId: string, userId: string): Promise<void> {
+  const gate = transferGate(chatId, userId);
+  if (!gate.ok) {
+    if (gate.reason !== "wrong chat") await notify(`⛔ /transfer_out refused: ${escapeHtml(gate.reason)}`);
+    return;
+  }
+  const cmd = parseTransferOutCommand(rawText);
+  if (!cmd.ok) {
+    await notify(`⚠️ ${escapeHtml((cmd as { error: string }).error)}`);
+    return;
+  }
+  try {
+    const inp = await transferInputs();
+    if (!isValidSpot(inp.spotUsd)) throw new Error(`invalid spot ${inp.spotUsd}`);
+    const plan = planTransferOut({ req: (cmd as { req: TransferRequest }).req, usdcRaw: inp.usdcRaw, nativeLamports: inp.nativeLamports, spotUsd: inp.spotUsd, equityUsd: inp.equityUsd, ...sizingParams(inp) });
+    if (!plan.ok) {
+      await notify(`⛔ /transfer_out refused: ${escapeHtml(plan.reason)}`);
+      return;
+    }
+    const code = String(randomInt(0, 1_000_000)).padStart(6, "0");
+    transferConfirmations.create(
+      { req: (cmd as { req: TransferRequest }).req, usdcRaw: plan.usdcRaw, lamports: plan.lamports, usd: plan.usd, spot: inp.spotUsd, needsAta: inp.needsAta },
+      chatId, userId, Date.now(), code
+    );
+    await notify(
+      `🔐 <b>[TRANSFER OUT — CONFIRM]</b>\n` +
+        `• To (allow-list): <code>${TRANSFER_OUT.address}</code>\n` +
+        `• Amount: $${(plan.usdcRaw / 1e6).toFixed(2)} USDC + ${(plan.lamports / 1e9).toFixed(6)} SOL ≈ <b>$${plan.usd.toFixed(2)}</b> @ $${inp.spotUsd.toFixed(2)}\n` +
+        `• LP wallet keeps ${(plan.remainingLamports / 1e9).toFixed(4)} SOL native (floor ${(plan.floorLamports / 1e9).toFixed(4)})` +
+        (inp.needsAta ? `; incl. 0.00204 SOL to create the destination USDC account` : "") + `\n` +
+        `• Transferable now: $${plan.transferableUsd.toFixed(2)} | caps: $${TRANSFER_OUT_MAX_USD} and ${TRANSFER_OUT_MAX_EQUITY_PCT}% of equity ($${(inp.equityUsd ?? 0).toFixed(2)})\n` +
+        `Reply <code>/confirm ${code}</code> within ${Math.round(TRANSFER_OUT_CONFIRM_TTL_MS / 1000)}s to send, or /cancel.`
+    );
+  } catch (err: any) {
+    await notify(`⚠️ /transfer_out failed to quote: ${escapeHtml(redactSecrets(String(err?.message || err)).slice(0, 200))}`);
+  }
+}
+
+/** Step 2: `/confirm <code>` → re-check everything, send exactly the quoted amounts, adjust accounting. */
+async function handleTransferOutConfirm(rawText: string, chatId: string, userId: string): Promise<void> {
+  if (!TRANSFER_OUT.enabled || !TELEGRAM_CHAT_ID || chatId !== TELEGRAM_CHAT_ID.trim()) return;
+  const code = parseConfirmCommand(rawText);
+  if (!code) {
+    await notify("⚠️ Usage: /confirm 123456");
+    return;
+  }
+  const c = transferConfirmations.confirm(code, chatId, userId, Date.now());
+  if (!c.ok) {
+    const why: Record<string, string> = {
+      none: "nothing pending", expired: "code expired — run /transfer_out again", wrong_chat: "wrong chat",
+      wrong_user: "only the user who requested it can confirm", wrong_code: "wrong code",
+      too_many_attempts: "too many wrong codes — request cancelled",
+    };
+    await notify(`⛔ /confirm refused: ${why[(c as { reason: string }).reason]}`);
+    return;
+  }
+  const gate = transferGate(chatId, userId);
+  if (!gate.ok) {
+    await notify(`⛔ /confirm refused: ${escapeHtml(gate.reason)}`);
+    return;
+  }
+  await executeTransferOut((c as { pending: { plan: QuotedTransfer } }).pending.plan);
+}
+
+async function executeTransferOut(q: QuotedTransfer): Promise<void> {
+  if (!TRANSFER_OUT.address) return;
+  const dest = new PublicKey(TRANSFER_OUT.address);
+  solTransferInFlight = true;
+  try {
+    const inp = await transferInputs();
+    const v = revalidateQuotedPlan(
+      { usdcRaw: q.usdcRaw, lamports: q.lamports },
+      { usdcRaw: inp.usdcRaw, nativeLamports: inp.nativeLamports, spotUsd: inp.spotUsd, equityUsd: inp.equityUsd, ...sizingParams(inp) }
+    );
+    if (!v.ok) {
+      await notify(`⛔ /transfer_out not sent: ${escapeHtml(v.reason)}. Nothing moved — run /transfer_out again.`);
+      return;
+    }
+    const usd = v.usd;
+    const eqAfter = entryEquityUsd > 0 ? Math.max(0, entryEquityUsd - usd) : undefined;
+    const memoText = buildTransferOutMemo({
+      to: dest.toBase58(), usd, usdcRaw: q.usdcRaw, lamports: q.lamports, spot: inp.spotUsd,
+      pos: activePositionPubkey?.toBase58() || "none", eqAfter,
+    });
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash("confirmed");
+    const tx = new Transaction({ feePayer: wallet.publicKey, blockhash, lastValidBlockHeight });
+    if (q.usdcRaw > 0) {
+      const srcAta = getAssociatedTokenAddressSync(USDC_MINT, wallet.publicKey);
+      const destAta = getAssociatedTokenAddressSync(USDC_MINT, dest, true);
+      tx.add(createAssociatedTokenAccountIdempotentInstruction(wallet.publicKey, destAta, dest, USDC_MINT));
+      tx.add(createTransferCheckedInstruction(srcAta, USDC_MINT, destAta, wallet.publicKey, BigInt(q.usdcRaw), 6));
+    }
+    if (q.lamports > 0) tx.add(SystemProgram.transfer({ fromPubkey: wallet.publicKey, toPubkey: dest, lamports: q.lamports }));
+    tx.add(new TransactionInstruction({ programId: new PublicKey(MEMO_PROGRAM_ID), keys: [], data: Buffer.from(memoText, "utf8") }));
+    tx.sign(wallet);
+    const sig = bs58.encode(tx.signature!);
+    let sendErr: any = null;
+    try {
+      await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
+    } catch (e: any) {
+      sendErr = e;
+    }
+    const status = await confirmOrResolveLanded(sig, blockhash, lastValidBlockHeight, sendErr);
+    if (status !== "landed") {
+      const detail = sendErr ? ` (${escapeHtml(redactSecrets(String(sendErr?.message || sendErr)).slice(0, 160))})` : "";
+      await notify(
+        status === "unknown"
+          ? `⚠️ <b>[TRANSFER OUT UNKNOWN]</b> <code>${sig}</code> did not confirm in time. Check Solscan BEFORE retrying. ` +
+              `Accounting not changed now; if it landed, the next boot picks it up from chain.${detail}`
+          : `⚠️ <b>[TRANSFER OUT FAILED]</b> ${status}${detail}. Nothing moved. Bot stays PAUSED.`
+      );
+      void emitLedger({ event: "ERROR", tx_sig: sig, notes: `TRANSFER_OUT ${status}: $${usd.toFixed(2)} to ${dest.toBase58()}`, is_estimate: true });
+      return;
+    }
+    const feeSol = await getTxFeeSol(sig);
+    if (feeSol != null) cumulativeGasSol += feeSol;
+    const before = { capitalBaselineUsd, entryEquityUsd };
+    const next = applyTransferOut({ capitalBaselineUsd, entryEquityUsd, transferredOutUsd: transferredOutThisProcessUsd }, usd);
+    capitalBaselineUsd = next.capitalBaselineUsd;
+    entryEquityUsd = next.entryEquityUsd;
+    transferredOutThisProcessUsd = next.transferredOutUsd;
+    await notify(
+      `✅ <b>[TRANSFER OUT]</b> $${(q.usdcRaw / 1e6).toFixed(2)} USDC + ${(q.lamports / 1e9).toFixed(6)} SOL ≈ <b>$${usd.toFixed(2)}</b> → <code>${dest.toBase58()}</code>\n` +
+        `• Capital baseline $${before.capitalBaselineUsd.toFixed(2)} → $${capitalBaselineUsd.toFixed(2)} (recorded on chain; no NET_DEPOSITS_USD change needed)\n` +
+        `• Entry equity $${before.entryEquityUsd.toFixed(2)} → $${entryEquityUsd.toFixed(2)}` +
+        (ENTRY_EQUITY_USD_ENV ? ` — ENTRY_EQUITY_USD is pinned: set it to ${entryEquityUsd.toFixed(2)} (or delete it) at your next env edit` : "") + `\n` +
+        `• Bot still <b>PAUSED</b>. /resume re-bases entry equity to live equity and resumes stops.\n` +
+        `• Tx: <code>${sig}</code>`
+    );
+    await emitLedger({
+      event: "TRANSFER_OUT",
+      spot_usd: inp.spotUsd,
+      transfer_out_usd: usd,
+      transfer_out_usdc: q.usdcRaw / 1e6,
+      transfer_out_sol: q.lamports / 1e9,
+      transfer_to: dest.toBase58(),
+      capital_baseline_usd: capitalBaselineUsd,
+      gas_fee_sol: feeSol ?? undefined,
+      gas_fee_usd: feeSol != null ? feeSol * inp.spotUsd : undefined,
+      tx_sig: sig,
+      notes: `Transfer out to allow-listed wallet: ${(q.usdcRaw / 1e6).toFixed(6)} USDC + ${(q.lamports / 1e9).toFixed(9)} SOL @ $${inp.spotUsd.toFixed(4)} = $${usd.toFixed(2)} (capital withdrawal, not a fee sweep)`,
+      is_estimate: false,
+    });
+  } catch (err: any) {
+    await notify(`⚠️ <b>[TRANSFER OUT ERROR]</b> ${escapeHtml(redactSecrets(String(err?.message || err)).slice(0, 200))}. Bot stays PAUSED.`);
+  } finally {
+    solTransferInFlight = false;
   }
 }
 
@@ -2746,6 +3076,9 @@ async function listenTelegramCommands() {
             `• <b>/harvest</b> - Trigger an immediate swap-fee sweep to LP Revenue\n` +
             `• <b>/emergency_exit</b> - Pull liquidity, swap 100% to USDC, and pause\n` +
             `• <b>/withdraw_pct N</b> - Pause and withdraw N% of the position to the wallet (for a transfer out)\n` +
+            (TRANSFER_OUT.enabled
+              ? `• <b>/transfer_out &lt;usd|pct%&gt; [usdc]</b> - Send withdrawn funds to the allow-listed wallet <code>${TRANSFER_OUT.address}</code> (then /confirm CODE within 60s; /cancel)\n`
+              : "") +
             `• <b>/pause</b> - Freeze automated redeployments\n` +
             `• <b>/resume</b> - Unpause bot and resume strategy loops`;
           await notify(helpMsg);
@@ -2784,6 +3117,12 @@ async function listenTelegramCommands() {
             })() +
             `• <b>Target Deploy:</b> ${(DEPLOY_PCT * 100).toFixed(0)}% (env DEPLOY_PCT; regime table kept for bins/stops)`;
           await notify(rMsg);
+        } else if (text.startsWith("/transfer_out")) {
+          await handleTransferOutRequest(String(msg.text), incomingChatId, String(msg.from?.id ?? ""));
+        } else if (text.startsWith("/confirm")) {
+          await handleTransferOutConfirm(String(msg.text), incomingChatId, String(msg.from?.id ?? ""));
+        } else if (text === "/cancel") {
+          await notify(transferConfirmations.cancel() ? "❎ Pending /transfer_out cancelled." : "Nothing pending.");
         } else if (text.startsWith("/withdraw_pct")) {
           const pct = Number(text.split(/\s+/)[1]);
           if (dlmmPoolInstance) await withdrawPartial(dlmmPoolInstance, pct);
@@ -2793,6 +3132,7 @@ async function listenTelegramCommands() {
           isBotPaused = true;
           await notify("⏸️ <b>[PAUSED]</b> Deployments frozen. Standing by in current state.");
         } else if (text === "/resume") {
+          if (transferConfirmations.cancel()) await notify("❎ Pending /transfer_out cancelled by /resume.");
           if (partialWithdrawPending && dlmmPoolInstance && activePositionPubkey) {
             // Funds were pulled for an external transfer: re-base entry equity so the equity stop measures
             // from what is left, not from the pre-withdrawal equity. Refuse to resume on a failed read.
@@ -2810,7 +3150,10 @@ async function listenTelegramCommands() {
             partialWithdrawPending = false;
             await notify(
               `ℹ️ Entry equity re-based after partial withdrawal: $${before.toFixed(2)} → $${entryEquityUsd.toFixed(2)}. ` +
-                `Set NET_DEPOSITS_USD for the amount moved out and update/remove ENTRY_EQUITY_USD before the next restart.`
+                (transferredOutThisProcessUsd > 0
+                  ? `Transfers made with /transfer_out are already in the capital baseline (on chain) — do NOT add them to NET_DEPOSITS_USD. ` +
+                    (ENTRY_EQUITY_USD_ENV ? `Update ENTRY_EQUITY_USD to ${entryEquityUsd.toFixed(2)} (or remove it) at your next env edit.` : "")
+                  : `Funds moved out by hand: set NET_DEPOSITS_USD for the amount and update/remove ENTRY_EQUITY_USD before the next restart.`)
             );
             logEntryPinHint();
           }
@@ -3116,6 +3459,7 @@ async function runKeeper() {
   }
   // Fee-sweep clock + prior swept total from chain (bounded by a timeout; never blocks boot on failure).
   await initSweepClock();
+  await initTransferOutHistory();
   if (CATCHUP_SOL_SWEEP_LAMPORTS > 0) {
     console.log(
       `[CATCHUP] One-time SOL catch-up configured: ${CATCHUP_SOL_SWEEP_LAMPORTS} lamports (id ${CATCHUP_SOL_SWEEP_ID}); ` +
@@ -3150,7 +3494,11 @@ async function runKeeper() {
     else console.warn("[BASELINE] Equity probe failed:", p.reason);
   }
   if (STARTING_CAPITAL_USD_ENV != null) {
-    capitalBaselineUsd = Number((STARTING_CAPITAL_USD_ENV + NET_DEPOSITS_USD).toFixed(2));
+    capitalBaselineUsd = baselineWithTransfersOut({
+      source: "env",
+      baselineUsd: Number((STARTING_CAPITAL_USD_ENV + NET_DEPOSITS_USD).toFixed(2)),
+      priorTransferOutUsd,
+    });
     capitalBaselineSource = "env";
   } else {
     capitalBaselineSource = "boot-equity";
@@ -3234,7 +3582,16 @@ async function runKeeper() {
       );
     }
     if (pinApplies && pinEquity != null && pinEquity > 0) {
-      entryEquityUsd = pinEquity;
+      // A /transfer_out after the pin was taken lowers this position's entry equity (on-chain memo). Without
+      // this a stale pre-transfer pin would fire the equity stop at once.
+      const eff = effectivePinnedEntryEquity(pinEquity, attachedKey, transferOutHistory.eqAfterByPosition);
+      entryEquityUsd = eff.usd;
+      if (eff.adjusted) {
+        console.warn(
+          `[ENTRY] ENTRY_EQUITY_USD $${pinEquity.toFixed(2)} predates a /transfer_out from this position — using $${eff.usd.toFixed(2)} ` +
+            `(entry equity after the transfer, from the on-chain memo). Update ENTRY_EQUITY_USD to silence this.`
+        );
+      }
       entryEquityPending = false;
     } else {
       const p = await probeEquityWithRetry(dlmmPoolInstance, spotPriceUsd, activePositionPubkey, 3);

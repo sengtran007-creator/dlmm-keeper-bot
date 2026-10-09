@@ -172,3 +172,29 @@ test("positionHasLiquidity: funded positions must be withdrawn before close", ()
     true
   );
 });
+
+test("two instances on one revenue wallet: native SOL sweeps + memos are attributed to the signing LP wallet only", () => {
+  const USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+  const REV = "ErDjEoMTh1Rjrkoz1Ri1h48XifkzwW8ffZZUxwPUj5K6";
+  const REV_ATA = "3hDFzbEPBLXGrYZzhzGq4FuZpd2C1ASFPCPct2SdhBRy";
+  const A = { wallet: "6BGjJLPU33KqwCCZ3a6PZyAmpXakpcuNRuUHNV4onzzp", ata: "74wLb5cmJCRT1emQagBWVp3ouVBheiUgnM7LcoocsG7H" };
+  const B = { wallet: "7h2ziXFfUjouCLCoxuRJXVKgjeKGKLtyZPoYRKgmdwqw", ata: "CqvVauh17X3AuJcTrWUUfGTghDpGQ54D6TeWgaBG7cfK" };
+  const solSweep = (from: typeof A, lamports: number, usd: number) => ({
+    meta: { err: null, innerInstructions: [] },
+    transaction: {
+      signatures: ["S"],
+      message: {
+        accountKeys: [{ pubkey: from.wallet, signer: true }],
+        instructions: [
+          { program: "system", programId: "11111111111111111111111111111111", parsed: { type: "transfer", info: { source: from.wallet, destination: REV, lamports } } },
+          { program: "spl-memo", parsed: `dlmm-keeper:fee-sol-sweep lamports=${lamports} usd=${usd.toFixed(6)} spot=150.0000` },
+        ],
+      },
+    },
+  });
+  const txs = [solSweep(A, 10_000_000, 1.5), solSweep(B, 20_000_000, 3), solSweep(A, 2_000_000, 0.3)];
+  const ctxOf = (w: typeof A) => ({ lpWallet: w.wallet, revWallet: REV, lpUsdcAta: w.ata, revUsdcAta: REV_ATA, usdcMint: USDC });
+  const sum = (w: typeof A) => txs.map((t) => parseSweepTx(t, ctxOf(w))).reduce((s, p) => s + (p.solUsdFromMemo ?? 0), 0);
+  near(sum(A), 1.8, 1e-9);
+  near(sum(B), 3, 1e-9);
+});
