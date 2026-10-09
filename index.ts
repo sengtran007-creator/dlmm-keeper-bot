@@ -35,6 +35,7 @@ import {
   priceStopFromLock,
   entryPinLine,
 } from "./regime";
+import { positionHasLiquidity } from "./multipool";
 
 dotenv.config();
 
@@ -1632,7 +1633,10 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
 
 // ==================== MANUAL & AUTOMATED TEARDOWN ====================
 interface CloseReclaimResult {
+  /** True only when no position is left open in this pool (verified by a re-read). */
   ok: boolean;
+  /** Positions still open after the attempt (empty when ok). */
+  remaining: PublicKey[];
   sigs: string[];
   solReceivedLamports: number;
   usdcReceivedRaw: number;
@@ -1641,11 +1645,11 @@ interface CloseReclaimResult {
 }
 
 async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResult> {
-  const empty: CloseReclaimResult = { ok: false, sigs: [], solReceivedLamports: 0, usdcReceivedRaw: 0, feeLamports: 0, isEstimate: true };
+  const empty: CloseReclaimResult = { ok: false, remaining: [], sigs: [], solReceivedLamports: 0, usdcReceivedRaw: 0, feeLamports: 0, isEstimate: true };
   try {
     await dlmmPool.refetchStates();
     const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
-    if (userPositions.length === 0) return { ...empty, ok: true, isEstimate: false };
+    if (userPositions.length === 0) return { ...empty, ok: true, remaining: [], isEstimate: false };
 
     const pre = await snapshotWalletBalances();
     const sigs: string[] = [];
@@ -1665,10 +1669,21 @@ async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResu
           break;
         }
 
-        const closeTx = await (dlmmPool as any).closePosition({
-          owner: wallet.publicKey,
-          position: pos,
-        });
+        // closePosition (closePosition2) only closes an EMPTY position — on a funded one it fails with
+        // NonEmptyPosition (6030). Withdraw 100% + claim fees + close in one SDK call when it holds liquidity.
+        const closeTx = positionHasLiquidity(pos.positionData)
+          ? await (dlmmPool as any).removeLiquidity({
+              user: wallet.publicKey,
+              position: pos.publicKey,
+              fromBinId: Number(pos.positionData.lowerBinId),
+              toBinId: Number(pos.positionData.upperBinId),
+              bps: new BN(10_000),
+              shouldClaimAndClose: true,
+            })
+          : await (dlmmPool as any).closePosition({
+              owner: wallet.publicKey,
+              position: pos,
+            });
 
         if (Array.isArray(closeTx)) {
           for (const tx of closeTx) {
@@ -1715,8 +1730,29 @@ async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResu
       swap_direction: "CLOSE→wallet",
     });
 
+    // Verify on chain: anything still open means the close did NOT happen (callers must not redeploy
+    // on top of it or treat the funds as liquidated).
+    let remaining: PublicKey[] = [];
+    try {
+      await dlmmPool.refetchStates();
+      const after = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
+      remaining = (after.userPositions || []).map((p: any) => p.publicKey);
+    } catch (verifyErr: any) {
+      console.warn("[CLOSE] post-close verification read failed:", verifyErr?.message || verifyErr);
+    }
+    if (remaining.length > 0) {
+      const keys = remaining.map((k) => k.toBase58()).join(", ");
+      console.error(`[CLOSE] INCOMPLETE — still open: ${keys}`);
+      await notify(
+        `⚠️ <b>[CLOSE INCOMPLETE]</b> ${remaining.length} position(s) still open after close attempt: <code>${keys}</code>. ` +
+          `Keeping it tracked; no redeploy on top of it. Check Railway logs.`
+      );
+      void emitLedger({ event: "ERROR", notes: `Close incomplete; still open: ${keys}`, is_estimate: true });
+    }
+
     return {
-      ok: true,
+      ok: remaining.length === 0,
+      remaining,
       sigs,
       solReceivedLamports: solReceived,
       usdcReceivedRaw: usdcReceived,
@@ -1727,6 +1763,31 @@ async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResu
     console.error("[CLOSE RECLAIM ERROR]:", err.message);
     return empty;
   }
+}
+
+/**
+ * After a close that left a position open: track it again (range from chain) so stops keep running
+ * on it and nothing gets deployed on top of it. Entry state is left as-is.
+ */
+async function reattachAfterFailedClose(dlmmPool: DLMM, close: CloseReclaimResult, fallback: PublicKey | null): Promise<void> {
+  const key = close.remaining[0] ?? fallback;
+  if (!key) return;
+  activePositionPubkey = key;
+  try {
+    await dlmmPool.refetchStates();
+    const activeBin = await dlmmPool.getActiveBin();
+    const spot = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
+    const pos = await dlmmPool.getPosition(key);
+    if (isValidSpot(spot) && pos?.positionData) {
+      lowestBinPrice = calculateBinPriceUsd(spot, activeBin.binId, pos.positionData.lowerBinId, 10);
+      highestBinPrice = calculateBinPriceUsd(spot, activeBin.binId, pos.positionData.upperBinId, 10);
+    }
+  } catch (err: any) {
+    console.warn("[CLOSE] re-attach range read failed:", err?.message || err);
+  }
+  belowRangeTickCount = 0;
+  markStopsArmed();
+  console.warn(`[CLOSE] Re-attached to still-open position ${key.toBase58()}`);
 }
 
 // ==================== IDLE TOP-UP INTO EXISTING POSITION ====================
@@ -2137,7 +2198,15 @@ async function executeFullEmergencyExit(dlmmPool: DLMM) {
   if (activePositionPubkey) {
     await sweepRevenueToVault(dlmmPool);
   }
-  await closePositionAndReclaim(dlmmPool);
+  const exitClose = await closePositionAndReclaim(dlmmPool);
+  if (!exitClose.ok) {
+    await reattachAfterFailedClose(dlmmPool, exitClose, activePositionPubkey);
+    await notify(
+      "🚨 <b>[EMERGENCY EXIT INCOMPLETE]</b> Position could not be closed — bot stays PAUSED (no SOL dump). " +
+        "Retry /emergency_exit or withdraw in the Meteora UI."
+    );
+    return;
+  }
 
   const solBal = await connection.getBalance(wallet.publicKey);
   const dumpSolLamports = Math.floor(solBal - GAS_RESERVE_LAMPORTS);
@@ -2797,7 +2866,15 @@ async function runKeeper() {
           }
 
           if (dlmmPoolInstance) {
-            await closePositionAndReclaim(dlmmPoolInstance);
+            const cbClose = await closePositionAndReclaim(dlmmPoolInstance);
+            if (!cbClose.ok) {
+              // Position still open: keep tracking it (entry/stops unchanged) and retry the stop soon
+              // instead of reporting a liquidation that did not happen.
+              await reattachAfterFailedClose(dlmmPoolInstance, cbClose, targetPos);
+              inCooldownUntil = Math.floor(Date.now() / 1000) + 120;
+              await notify("🚨 <b>[CIRCUIT BREAKER INCOMPLETE]</b> Close failed — position still open; retrying the stop in ~2 min.");
+              return;
+            }
           }
 
           const solBal = await connection.getBalance(wallet.publicKey);
@@ -2891,7 +2968,12 @@ async function runKeeper() {
           } catch (sweepErr: any) {
             console.warn("Below-range fee sweep note:", sweepErr.message);
           }
-          await closePositionAndReclaim(dlmmPoolInstance!);
+          const recClose = await closePositionAndReclaim(dlmmPoolInstance!);
+          if (!recClose.ok) {
+            await reattachAfterFailedClose(dlmmPoolInstance!, recClose, activePositionPubkey);
+            lastRecenterAt = now; // retry after RECENTER_COOLDOWN_SEC, never deploy on top of an open position
+            return;
+          }
           activePositionPubkey = null;
           lowestBinPrice = 0;
           highestBinPrice = 0;
@@ -2918,7 +3000,12 @@ async function runKeeper() {
         await notify(`🎯 <b>[TAKE-PROFIT]</b> Price ($${currentPrice.toFixed(2)}) cleared upper bins! Sweeping fees and unwinding...`);
         
         await sweepRevenueToVault(dlmmPoolInstance!);
-        await closePositionAndReclaim(dlmmPoolInstance!);
+        const tpClose = await closePositionAndReclaim(dlmmPoolInstance!);
+        if (!tpClose.ok) {
+          await reattachAfterFailedClose(dlmmPoolInstance!, tpClose, activePositionPubkey);
+          lastRecenterAt = now; // retry after RECENTER_COOLDOWN_SEC
+          return;
+        }
         
         const botUsdcAta = await getAssociatedTokenAddress(USDC_MINT, wallet.publicKey);
         let postTpUsdc = 0;
