@@ -1,6 +1,6 @@
 # dlmm-keeper-bot
 
-Automated **Meteora DLMM** liquidity keeper for the public Solana **SOL/USDC** (~10 bps) pool. It deploys an asymmetric Spot grid, harvests fees to a revenue wallet, monitors a floor stop / take-profit, and can be steered over Telegram.
+Automated **Meteora DLMM** liquidity keeper for a public Solana **SOL/USDC** pool (default: the 10 bps pool; any SOL-USDC DLMM pool via `POOL_ADDRESS`). It deploys an asymmetric Spot grid, harvests fees to a revenue wallet, monitors a floor stop / take-profit, and can be steered over Telegram.
 
 This software trades real capital. You can lose money. There is **no warranty**. Review the strategy, risk controls, and custody model before running it.
 
@@ -31,6 +31,14 @@ npm start
 ## Environment
 
 See `.env.example` for every variable the bot reads. **Required at minimum:** `BOT_PRIVATE_KEY`, `REVENUE_WALLET_PUBKEY`, plus a usable RPC (`SOLANA_RPC_URL` or `RPC_URL`).
+
+### Pool, range and instances
+
+- `POOL_ADDRESS` picks the pool (default `BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y`, 10 bps). The bin step is read from the pool at boot (`lbPair.binStep`) and used for every price/range calculation; the bot refuses to start on a pool that isn't SOL(X)/USDC(Y).
+- Range for new positions: `BID_BINS`/`ASK_BINS` (this pool's bins) → `RANGE_WIDTH_PCT` (±%) → the regime profile. Regime profiles are in 10 bps bins and are converted to the same price width on other bin steps, then clamped to Meteora's 70-bin position limit (RANGE 30/30 on 10 bps ≈ ±3%; on the 4 bps pool that becomes 34/35 ≈ −1.37%/+1.41%).
+- Gate 2 (re-entry after a stop): unless `GATE2_MAX_VARIABLE_FEE_BPS` is set, the limit is 15 bps on the 10 bps pool and is scaled by the pool's `variableFeeControl` elsewhere, so it means the same volatility on any bin step (45 bps on the 4 bps pool).
+- Running two instances (e.g. one per pool): give each its **own wallet** (`BOT_PRIVATE_KEY`), its own `STARTING_CAPITAL_USD` / `NET_DEPOSITS_USD`, and never copy `ENTRY_*` / `PRIOR_SWEPT_USD` / `LAST_SWEEP_UNIX` between them. `INSTANCE_LABEL` prefixes Telegram messages and fills the ledger `instance` field. Two processes must not poll the same Telegram token: either give the second one its own `TELEGRAM_BOT_TOKEN`, or set `TELEGRAM_COMMANDS_ENABLED=false` there (notifications only). Both may sweep to the same `REVENUE_WALLET_PUBKEY`: each instance's sweep clock and swept total only count transfers signed by its own LP wallet from its own USDC account.
+- Closing a position (recenter, take-profit, stops, emergency exit) withdraws 100% of its liquidity, claims fees and closes it in one SDK call (`removeLiquidity … shouldClaimAndClose`), then re-reads the chain. If a position is still open the bot keeps tracking it and does not deploy a new one on top of it.
 
 ### P&L baseline
 
@@ -116,7 +124,7 @@ On restart the bot re-anchors entry (and therefore both stops) to the live spot/
 1. Create a service from this repo (worker / no public HTTP needed).
 2. Set the same env vars as in `.env.example` in the Railway Variables UI.
 3. Start command should match the `Procfile`: `npm run build && npm start` (or rely on the Procfile worker process).
-4. Use a single replica — multiple instances will fight over Telegram `getUpdates` (HTTP 409).
+4. Use a single replica per service — two processes polling one Telegram token fight over `getUpdates` (HTTP 409). A second service on another pool needs its own wallet and either its own Telegram token or `TELEGRAM_COMMANDS_ENABLED=false`.
 
 ## Security
 

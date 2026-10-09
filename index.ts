@@ -36,7 +36,20 @@ import {
   priceStopFromLock,
   entryPinLine,
 } from "./regime";
-import { positionHasLiquidity } from "./multipool";
+import {
+  positionHasLiquidity,
+  calculateBinPriceUsd,
+  resolveRangeBins,
+  ResolvedRange,
+  gate2ThresholdBps,
+  volatilityMovePct,
+  sanitizeInstanceLabel,
+  withInstancePrefix,
+  parseBoolEnv,
+  parseOptionalInt,
+  KNOWN_SOL_USDC_POOLS,
+  DEFAULT_POOL_ADDRESS,
+} from "./multipool";
 import {
   MEMO_PROGRAM_ID,
   LandedStatus,
@@ -111,8 +124,36 @@ const LAST_SWEEP_UNIX_ENV = (() => {
 // Max signatures scanned (each) on the revenue USDC ATA and the revenue wallet at boot.
 const SWEEP_SCAN_MAX_SIGS = Math.max(100, Number(process.env.SWEEP_SCAN_MAX_SIGS ?? 2000));
 
-// Public Meteora SOL-USDC ~10bps DLMM pool + well-known mints (safe to keep in source).
-const SOL_USDC_POOL = new PublicKey("BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y");
+// ---- Pool / instance (multi-pool) ----
+// POOL_ADDRESS: Meteora SOL-USDC DLMM pool to LP in. Default = the original 10 bps pool, so an unset env
+// keeps the existing bot unchanged. The bin step is read from the pool at boot (lbPair.binStep).
+const POOL_ADDRESS = process.env.POOL_ADDRESS?.trim() || DEFAULT_POOL_ADDRESS;
+const SOL_USDC_POOL = (() => {
+  try {
+    return new PublicKey(POOL_ADDRESS);
+  } catch {
+    throw new Error(`POOL_ADDRESS is not a valid public key: ${JSON.stringify(POOL_ADDRESS)}`);
+  }
+})();
+/** Pool bin step (bps). Label-only guess until boot reads lbPair.binStep (authoritative). */
+let poolBinStep = KNOWN_SOL_USDC_POOLS[POOL_ADDRESS]?.binStep ?? 0;
+function poolName(): string {
+  return poolBinStep > 0 ? `SOL-USDC ${poolBinStep}bps` : "SOL-USDC";
+}
+// INSTANCE_LABEL (alias BOT_NAME): tags Telegram messages and ledger rows so two bots can share a chat
+// and a sheet. Unset = no prefix and an empty `instance` column (the original bot's rows/messages).
+const INSTANCE_LABEL = sanitizeInstanceLabel(process.env.INSTANCE_LABEL || process.env.BOT_NAME);
+// TELEGRAM_COMMANDS_ENABLED=false: send notifications only, never poll getUpdates. Use it on a second
+// instance that shares the first one's TELEGRAM_BOT_TOKEN (two pollers on one token → HTTP 409).
+const TELEGRAM_COMMANDS_ENABLED = parseBoolEnv(process.env.TELEGRAM_COMMANDS_ENABLED, true);
+// Range overrides for NEW positions (this pool's bins). Unset = regime profile, converted from 10 bps bins
+// to the same price width on this pool's bin step, clamped to the 70-bin position limit.
+const BID_BINS_ENV = parseOptionalInt(process.env.BID_BINS);
+const ASK_BINS_ENV = parseOptionalInt(process.env.ASK_BINS);
+const RANGE_WIDTH_PCT_ENV = (() => {
+  const v = parseOptionalUsd("RANGE_WIDTH_PCT");
+  return v != null && v > 0 ? v : null;
+})();
 const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 const WSOL_MINT = new PublicKey("So11111111111111111111111111111111111111112");
 const LP_REVENUE_VAULT = new PublicKey(REVENUE_WALLET_PUBKEY);
@@ -162,7 +203,9 @@ const CATCHUP_SOL_SWEEP_DELAY_SEC = Math.max(120, Number(process.env.CATCHUP_SOL
 
 // Gate 2: max allowed *variable* fee in basis points before re-entry is blocked.
 // (Not variableFeeControl — that is a static pool config constant, often ~40000.)
-const GATE2_MAX_VARIABLE_FEE_BPS = Number(process.env.GATE2_MAX_VARIABLE_FEE_BPS ?? 15);
+// Unset = 15 bps on the 10 bps pool, scaled by the pool's variableFeeControl elsewhere (same volatility
+// tolerance on any bin step — see gate2ThresholdBps in multipool.ts).
+const GATE2_MAX_VARIABLE_FEE_BPS_ENV = parseOptionalUsd("GATE2_MAX_VARIABLE_FEE_BPS");
 
 // Hard stop: max drawdown on mark-to-market equity vs entry (fraction, e.g. 0.05 = 5%).
 const MAX_DRAWDOWN_PCT = Number(process.env.MAX_DRAWDOWN_PCT ?? 0.05);
@@ -289,7 +332,7 @@ function redactSecrets(text: string): string {
 }
 
 async function notify(rawMsg: string) {
-  const msg = redactSecrets(rawMsg);
+  const msg = withInstancePrefix(redactSecrets(rawMsg), INSTANCE_LABEL);
   console.log(msg);
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
 
@@ -554,7 +597,10 @@ async function emitLedger(fields: LedgerFields): Promise<void> {
     timestamp_pt: formatTimestampPt(now),
     // legacy
     timestamp: now.toISOString().replace("T", " ").substring(0, 19),
-    pool_name: "SOL-USDC 10bps",
+    pool_name: poolName(),
+    instance: INSTANCE_LABEL,
+    pool_address: POOL_ADDRESS,
+    bin_step: poolBinStep || undefined,
     event_type: fields.event_type || fields.event,
     ...fields,
     entry_spot: fields.entry_spot ?? (entrySpotUsd || undefined),
@@ -609,15 +655,7 @@ async function logSheet(
   });
 }
 
-// ==================== DETERMINISTIC BIN PRICE HELPER ====================
-function calculateBinPriceUsd(activeSpotUsd: number, activeBinId: number, targetBinId: number, binStepBps: number = 10): number {
-  try {
-    const binDiff = targetBinId - activeBinId;
-    return activeSpotUsd * Math.pow(1 + binStepBps / 10000, binDiff);
-  } catch {
-    return 0;
-  }
-}
+// Bin price helper: calculateBinPriceUsd(spot, activeBinId, targetBinId, poolBinStep) in multipool.ts.
 
 // ==================== GATE 2 VOLATILITY HELPER ====================
 /**
@@ -629,7 +667,8 @@ function calculateBinPriceUsd(activeSpotUsd: number, activeBinId: number, target
  * *variable fee rate* via Meteora's formula (see docs):
  *   variableFee = ceil(variableFeeControl * (volAcc * binStep)^2 / 1e11)
  * in FEE_PRECISION units where 1e9 = 100%, so 1 bps = 1e5.
- * We gate on variable-fee bps <= GATE2_MAX_VARIABLE_FEE_BPS (env, default 15).
+ * We gate on variable-fee bps <= GATE2_MAX_VARIABLE_FEE_BPS (env), else the default: 15 bps on the
+ * 10 bps pool, scaled by the pool's variableFeeControl on other pools (same volatility tolerance).
  */
 function getGate2VolatilityState(dlmmPool: DLMM): {
   volAcc: number;
@@ -640,7 +679,7 @@ function getGate2VolatilityState(dlmmPool: DLMM): {
 } {
   const lbPair = (dlmmPool as any).lbPair;
   const volAcc = Number(lbPair?.vParameters?.volatilityAccumulator ?? 0);
-  const binStep = Number(lbPair?.binStep ?? 10);
+  const binStep = Number(lbPair?.binStep ?? poolBinStep);
   const sParameters = lbPair?.parameters;
   const vParameters = lbPair?.vParameters;
   let variableFeeBps = 0;
@@ -652,42 +691,25 @@ function getGate2VolatilityState(dlmmPool: DLMM): {
       console.warn("[Gate2] getVariableFee failed:", err?.message || err);
     }
   }
-  const thresholdBps = GATE2_MAX_VARIABLE_FEE_BPS;
+  const thresholdBps = gate2ThresholdBps(GATE2_MAX_VARIABLE_FEE_BPS_ENV, Number(sParameters?.variableFeeControl ?? 0)).bps;
   const passed = variableFeeBps <= thresholdBps;
+  const move = volatilityMovePct(volAcc, binStep);
+  const moveNote = binStep === 10 ? "" : `, ≈${move.toFixed(2)}% move`;
   const detail = passed
-    ? `✅ Passed (${variableFeeBps.toFixed(2)} bps ≤ ${thresholdBps} bps, volAcc=${volAcc})`
-    : `⏳ High Volatility (${variableFeeBps.toFixed(2)} bps > ${thresholdBps} bps, volAcc=${volAcc})`;
+    ? `✅ Passed (${variableFeeBps.toFixed(2)} bps ≤ ${thresholdBps} bps, volAcc=${volAcc}${moveNote})`
+    : `⏳ High Volatility (${variableFeeBps.toFixed(2)} bps > ${thresholdBps} bps, volAcc=${volAcc}${moveNote})`;
   return { volAcc, variableFeeBps, thresholdBps, passed, detail };
 }
 
-/** Clamp bid/ask bins so inclusive width (max-min+1) ≤ DEFAULT_BIN_PER_POSITION (70). */
-function clampBinRange(
-  activeBinId: number,
-  bidBins: number,
-  askBins: number
-): { minBinId: number; maxBinId: number; bidBins: number; askBins: number; width: number } {
-  let bid = Math.max(0, Math.floor(bidBins));
-  let ask = Math.max(0, Math.floor(askBins));
-  // Inclusive width = bid + ask + 1 (active bin counted once).
-  let width = bid + ask + 1;
-  if (width > MAX_POSITION_WIDTH) {
-    const budget = MAX_POSITION_WIDTH - 1; // bins excluding active
-    const totalSide = Math.max(1, bid + ask);
-    bid = Math.max(0, Math.floor((budget * bid) / totalSide));
-    ask = Math.max(0, budget - bid);
-    width = bid + ask + 1;
-    console.warn(
-      `[BIN CLAMP] Regime width exceeded ${MAX_POSITION_WIDTH}; clamped to bid=${bid} ask=${ask} (width=${width})`
-    );
-  }
-  if (width < 1) {
-    bid = 0;
-    ask = 0;
-    width = 1;
-  }
-  const minBinId = activeBinId - bid;
-  const maxBinId = activeBinId + ask;
-  return { minBinId, maxBinId, bidBins: bid, askBins: ask, width };
+/** Bid/ask bins for a NEW position under `profile` (env overrides → regime profile scaled to this bin step; ≤70 wide). */
+function rangeForProfile(profile: { bidBins: number; askBins: number }): ResolvedRange {
+  return resolveRangeBins(
+    profile.bidBins,
+    profile.askBins,
+    poolBinStep,
+    { bidBins: BID_BINS_ENV, askBins: ASK_BINS_ENV, widthPct: RANGE_WIDTH_PCT_ENV },
+    MAX_POSITION_WIDTH
+  );
 }
 
 function gasBufferLabel(lamports: number): string {
@@ -1146,6 +1168,9 @@ async function scanSweepHistoryOnChain(): Promise<SweepHistory> {
         const sig: string | undefined = tx.transaction?.signatures?.[0];
         if (!sig || seen.has(sig)) continue;
         seen.add(sig);
+        // parseSweepTx only counts transfers SIGNED by this LP wallet (USDC: authority = LP wallet, source = LP ATA;
+        // SOL: LP wallet signer) — another instance sweeping to the same revenue wallet signs from a different
+        // wallet and is ignored, so per-instance swept totals never double count.
         const p = parseSweepTx(tx, ctx);
         if (p.memo?.kind === "catchup-sol-sweep" && p.memo.id) res.catchupIds!.add(p.memo.id);
         if (p.usdcRaw <= 0 && p.solLamports <= 0) continue;
@@ -2112,8 +2137,8 @@ async function reattachAfterFailedClose(dlmmPool: DLMM, close: CloseReclaimResul
     const spot = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
     const pos = await dlmmPool.getPosition(key);
     if (isValidSpot(spot) && pos?.positionData) {
-      lowestBinPrice = calculateBinPriceUsd(spot, activeBin.binId, pos.positionData.lowerBinId, 10);
-      highestBinPrice = calculateBinPriceUsd(spot, activeBin.binId, pos.positionData.upperBinId, 10);
+      lowestBinPrice = calculateBinPriceUsd(spot, activeBin.binId, pos.positionData.lowerBinId, poolBinStep);
+      highestBinPrice = calculateBinPriceUsd(spot, activeBin.binId, pos.positionData.upperBinId, poolBinStep);
     }
   } catch (err: any) {
     console.warn("[CLOSE] re-attach range read failed:", err?.message || err);
@@ -2173,9 +2198,10 @@ async function topUpExistingPosition(dlmmPool: DLMM): Promise<void> {
     // regime: idle capital tops up the existing bins, and a regime flip shouldn't trigger rebalancing swaps.
     const splitRegime: MarketRegime = entryStopLock?.regime ?? DEFAULT_REGIME;
     const config = { regime: splitRegime, ...REGIME_PROFILES[splitRegime] };
-    const totalBins = Math.max(1, config.bidBins + config.askBins);
-    const askRatio = config.askBins / totalBins;
-    const bidRatio = config.bidBins / totalBins;
+    const splitRange = rangeForProfile(config);
+    const totalBins = Math.max(1, splitRange.bidBins + splitRange.askBins);
+    const askRatio = splitRange.askBins / totalBins;
+    const bidRatio = splitRange.bidBins / totalBins;
     const targetAskUsd = idleUsd * askRatio;
     const targetBidUsd = idleUsd * bidRatio;
 
@@ -2332,9 +2358,11 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     // DEPLOY_PCT overrides regime capitalDeployPct (default 1.0 = deploy ~100% idle).
     const targetDeployCapital = totalWorkingCapital * DEPLOY_PCT;
 
-    const totalBins = Math.max(1, config.bidBins + config.askBins);
-    const askRatio = config.askBins / totalBins;
-    const bidRatio = config.bidBins / totalBins;
+    const range = rangeForProfile(config);
+    if (range.clamped || range.source !== "regime profile") console.log(`[RANGE] ${range.bidBins}/${range.askBins} bins (${range.source})`);
+    const totalBins = Math.max(1, range.bidBins + range.askBins);
+    const askRatio = range.askBins / totalBins;
+    const bidRatio = range.bidBins / totalBins;
     const targetAskUsd = targetDeployCapital * askRatio;
     const targetBidUsdcUsd = targetDeployCapital * bidRatio;
 
@@ -2369,9 +2397,8 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     }
 
     const activeBinIdNum = Number(activeBin.binId);
-    const clamped = clampBinRange(activeBinIdNum, config.bidBins, config.askBins);
-    const minBinId = clamped.minBinId;
-    const maxBinId = clamped.maxBinId;
+    const minBinId = activeBinIdNum - range.bidBins;
+    const maxBinId = activeBinIdNum + range.askBins;
     const newPositionKeypair = Keypair.generate();
 
     const postSwapUsdcAcc = await getAccount(connection, botUsdcAta);
@@ -2451,8 +2478,8 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     }
 
     activePositionPubkey = newPositionKeypair.publicKey;
-    lowestBinPrice = calculateBinPriceUsd(spotPriceUsd, activeBin.binId, minBinId, 10);
-    highestBinPrice = calculateBinPriceUsd(spotPriceUsd, activeBin.binId, maxBinId, 10);
+    lowestBinPrice = calculateBinPriceUsd(spotPriceUsd, activeBin.binId, minBinId, poolBinStep);
+    highestBinPrice = calculateBinPriceUsd(spotPriceUsd, activeBin.binId, maxBinId, poolBinStep);
     belowRangeTickCount = 0;
     markStopsArmed();
 
@@ -2607,6 +2634,10 @@ async function executeFullEmergencyExit(dlmmPool: DLMM) {
 // ==================== RESILIENT TELEGRAM COMMAND LISTENER ====================
 async function listenTelegramCommands() {
   if (!TELEGRAM_BOT_TOKEN) return;
+  if (!TELEGRAM_COMMANDS_ENABLED) {
+    console.log("🤖 Telegram commands DISABLED (TELEGRAM_COMMANDS_ENABLED=false) — notifications only, no getUpdates polling.");
+    return;
+  }
 
   let offset = 0;
   console.log("🤖 Telegram Interactive Command Listener active.");
@@ -2667,7 +2698,10 @@ async function listenTelegramCommands() {
             (config.holdReason ? `• <b>Hysteresis:</b> ${escapeHtml(config.holdReason)}\n` : "") +
             (config.lastFailure ? `• <b>Last error:</b> ${escapeHtml(redactSecrets(config.lastFailure))}\n` : "") +
             `• <b>Price stop (open position):</b> ${activePositionPubkey ? stopLockLabel() : "N/A"}\n` +
-            `• <b>Active Profile:</b> -${(config.bidBins * 0.1).toFixed(1)}% Bids / +${(config.askBins * 0.1).toFixed(1)}% Asks\n` +
+            (() => {
+              const r = rangeForProfile(config);
+              return `• <b>Active Profile:</b> -${r.bidPct.toFixed(1)}% Bids / +${r.askPct.toFixed(1)}% Asks (${r.bidBins}/${r.askBins} bins @ ${poolBinStep} bps${r.source === "regime profile" ? "" : `; ${escapeHtml(r.source)}`})\n`;
+            })() +
             `• <b>Target Deploy:</b> ${(DEPLOY_PCT * 100).toFixed(0)}% (env DEPLOY_PCT; regime table kept for bins/stops)`;
           await notify(rMsg);
         } else if (text === "/emergency_exit") {
@@ -2722,8 +2756,8 @@ async function listenTelegramCommands() {
             const pos = userPositions.find((p: any) => activePositionPubkey && p.publicKey.equals(activePositionPubkey)) || userPositions[0];
             if (!activePositionPubkey) activePositionPubkey = pos.publicKey;
             if (isValidSpot(currentPrice) && pos?.positionData && pos.publicKey.equals(activePositionPubkey)) {
-              const lo = calculateBinPriceUsd(currentPrice, activeBin.binId, pos.positionData.lowerBinId, 10);
-              const hi = calculateBinPriceUsd(currentPrice, activeBin.binId, pos.positionData.upperBinId, 10);
+              const lo = calculateBinPriceUsd(currentPrice, activeBin.binId, pos.positionData.lowerBinId, poolBinStep);
+              const hi = calculateBinPriceUsd(currentPrice, activeBin.binId, pos.positionData.upperBinId, poolBinStep);
               if (isValidSpot(lo) && isValidSpot(hi) && hi > lo) {
                 lowestBinPrice = lo;
                 highestBinPrice = hi;
@@ -2839,7 +2873,7 @@ async function listenTelegramCommands() {
     } catch (err: any) {
       if (err.response?.status === 409) {
         // Common during Railway rolling deploys when old+new both poll getUpdates.
-        console.error("❌ [TELEGRAM 409 CONFLICT] Duplicate bot instance detected. Backing off 30s...");
+        console.error("❌ [TELEGRAM 409 CONFLICT] Another process is polling this bot token (rolling deploy, or a second instance — set TELEGRAM_COMMANDS_ENABLED=false or its own TELEGRAM_BOT_TOKEN there). Backing off 30s...");
         await new Promise((resolve) => setTimeout(resolve, 30000));
         continue;
       }
@@ -2948,9 +2982,34 @@ async function runCatchupSolSweep(attempt = 1): Promise<void> {
 
 // ==================== MAIN LIFECYCLE CONTROLLER ====================
 async function runKeeper() {
-  await notify("🚀 DLMM Automated Keeper initialized on Railway.");
+  await notify(
+    "🚀 DLMM Automated Keeper initialized on Railway." +
+      (POOL_ADDRESS !== DEFAULT_POOL_ADDRESS ? ` Pool: ${poolName()} <code>${POOL_ADDRESS}</code>` : "") +
+      (TELEGRAM_BOT_TOKEN && !TELEGRAM_COMMANDS_ENABLED ? " (notifications only — Telegram commands disabled)" : "")
+  );
   void emitLedger({ event: "BOOT", notes: "Keeper process started", is_estimate: true });
   dlmmPoolInstance = await DLMM.create(connection, SOL_USDC_POOL);
+  {
+    const lb: any = (dlmmPoolInstance as any).lbPair;
+    const xMint = lb?.tokenXMint?.toBase58?.();
+    const yMint = lb?.tokenYMint?.toBase58?.();
+    // Spot math (PRICE_DECIMAL_FACTOR), swaps and balances assume X = SOL (9 dp), Y = USDC (6 dp).
+    if (xMint !== WSOL_MINT.toBase58() || yMint !== USDC_MINT.toBase58()) {
+      throw new Error(`POOL_ADDRESS ${POOL_ADDRESS} is not a SOL(X)/USDC(Y) pool (X=${xMint}, Y=${yMint}) — refusing to start.`);
+    }
+    const step = Number(lb?.binStep);
+    if (!(step > 0)) throw new Error(`Could not read bin step for pool ${POOL_ADDRESS}`);
+    const known = KNOWN_SOL_USDC_POOLS[POOL_ADDRESS]?.binStep;
+    if (known && known !== step) console.warn(`[POOL] bin step on chain ${step} ≠ expected ${known} — using on-chain value.`);
+    poolBinStep = step;
+    const r = rangeForProfile(REGIME_PROFILES[DEFAULT_REGIME]);
+    const g2 = gate2ThresholdBps(GATE2_MAX_VARIABLE_FEE_BPS_ENV, Number(lb?.parameters?.variableFeeControl ?? 0));
+    console.log(
+      `[POOL] ${poolName()} ${POOL_ADDRESS}${INSTANCE_LABEL ? ` | instance "${INSTANCE_LABEL}"` : ""} | ` +
+        `default range ${r.bidBins}/${r.askBins} bins (−${r.bidPct.toFixed(2)}% / +${r.askPct.toFixed(2)}%; ${r.source}) | ` +
+        `Gate 2 ≤ ${g2.bps} bps (${g2.source}) | Telegram commands ${TELEGRAM_COMMANDS_ENABLED ? "on" : "off"}`
+    );
+  }
   // Fee-sweep clock + prior swept total from chain (bounded by a timeout; never blocks boot on failure).
   await initSweepClock();
   if (CATCHUP_SOL_SWEEP_LAMPORTS > 0) {
@@ -3032,8 +3091,8 @@ async function runKeeper() {
     const freshSpotUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
     const spotPriceUsd = isValidSpot(freshSpotUsd) ? freshSpotUsd : bootSpotUsd;
 
-    lowestBinPrice = calculateBinPriceUsd(spotPriceUsd, attachBinId, activePos.positionData.lowerBinId, 10);
-    highestBinPrice = calculateBinPriceUsd(spotPriceUsd, attachBinId, activePos.positionData.upperBinId, 10);
+    lowestBinPrice = calculateBinPriceUsd(spotPriceUsd, attachBinId, activePos.positionData.lowerBinId, poolBinStep);
+    highestBinPrice = calculateBinPriceUsd(spotPriceUsd, attachBinId, activePos.positionData.upperBinId, poolBinStep);
     belowRangeTickCount = 0;
     markStopsArmed();
 
