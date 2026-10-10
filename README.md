@@ -129,6 +129,14 @@ On restart the bot re-anchors entry (and therefore both stops) to the live spot/
 - `CLOSE_AFTER_SWEEP_DELAY_MS` (1.5 s) spaces the pre-close fee sweep and the close.
 - If every attempt fails: **CLOSE INCOMPLETE** Telegram alert (attempt count + last error, scrubbed), one `ERROR` ledger row (no `CLOSE` row for failed attempts), the bot re-attaches to the still-open position and never redeploys on top of it. A failed recenter / take-profit is retried after `RECENTER_FAIL_RETRY_SEC` (180 s, never longer than `RECENTER_COOLDOWN_SEC`) once `BELOW_RANGE_TICKS` fresh ticks confirm it; a failed circuit-breaker close is retried after ~2 min.
 
+### RPC credit budget
+
+- Each 15 s tick does ONE `getMultipleAccounts` (1 credit): pool (active bin → spot, Gate 2 state), clock, LP wallet (native SOL), USDC + WSOL ATAs, the tracked position(s) and their bin arrays (fetched once, then cached). Position amounts/fees are decoded with the SDK's own `wrapPosition` + `DLMM.processPosition`, and the equity stop keeps its fail-closed rules (failed/partial read or missing position → stop skipped, STOPS BLIND watchdog unchanged). Both stops are still evaluated every tick.
+- The wallet's positions in the pool are re-discovered with a key-only `getProgramAccounts` (10 credits) every `POSITION_DISCOVERY_SEC` (900 s) and after every deploy / close / re-attach; untracked ones are counted in equity as before.
+- The idle top-up probe only does its own reads when the tick's wallet read shows ≥ `TOPUP_MIN_USD` idle; a probe that did not top up waits `TOPUP_PROBE_BACKOFF_SEC` (300 s).
+- An `[RPC]` log line every `RPC_CREDIT_LOG_SEC` (3600 s; 0 = off) lists calls/credits by method (≈ credits/day). Expected ≈ 7–8k credits/day per bot (was ≈ 100–150k).
+- `node dist-test/tools/rpc-sim.js <pool> <wallet> <position> [ticks] [rpc]` (after `npm test`) replays the old and new tick read-only against a public RPC and prints both credit counts and equity.
+
 ## Deploy on Railway
 
 1. Create a service from this repo (worker / no public HTTP needed).

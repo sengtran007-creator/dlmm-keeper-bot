@@ -2,6 +2,9 @@ import DLMM, {
   StrategyType,
   DEFAULT_BIN_PER_POSITION,
   getVariableFee,
+  positionLbPairFilter,
+  positionOwnerFilter,
+  positionV2Filter,
 } from "@meteora-ag/dlmm";
 import {
   Connection,
@@ -68,6 +71,9 @@ import {
   retryTxWithChainCheck,
   shortTxError,
 } from "./txretry";
+import { RpcCallCounter, attachRpcCounter, creditsPerDay } from "./rpccredits";
+import { equityFromSnapshot, idleUsdUpperBound, isDue } from "./tickstate";
+import { TickReader, TickSnapshot } from "./tickreader";
 import {
   ATA_RENT_LAMPORTS,
   TRANSFER_OUT_CONFIRM_TTL_MS,
@@ -263,6 +269,17 @@ const CLOSE_RETRY_MAX_MS = envInt("CLOSE_RETRY_MAX_MS", 16_000, 1000, 120_000);
 const CLAIM_MAX_ATTEMPTS = envInt("CLAIM_MAX_ATTEMPTS", 3, 1, 6);
 // Pause between the pre-close fee sweep and the close so the two do not burst the RPC back to back.
 const CLOSE_AFTER_SWEEP_DELAY_MS = envInt("CLOSE_AFTER_SWEEP_DELAY_MS", 1500, 0, 15_000);
+
+// ---- RPC credit budget (all optional) ----
+// The 15 s tick reads pool + clock + wallet + ATAs + tracked positions (+ their bin arrays) in ONE
+// getMultipleAccounts (1 credit). Positions owned by the wallet in this pool are re-discovered with a
+// getProgramAccounts (10 credits) only every POSITION_DISCOVERY_SEC (and after every deploy/close).
+const POSITION_DISCOVERY_SEC = envInt("POSITION_DISCOVERY_SEC", 900, 60, 86_400);
+// Hourly "[RPC]" log line: calls/credits by method since the last line (0 = off). No args/URLs are logged.
+const RPC_CREDIT_LOG_SEC = envInt("RPC_CREDIT_LOG_SEC", 3600, 0, 86_400);
+// After a top-up probe that did not top up (idle below minimum after its own reads, or an error), wait this
+// long before probing again (the probe costs ~6 credits; it used to run on every tick).
+const TOPUP_PROBE_BACKOFF_SEC = envInt("TOPUP_PROBE_BACKOFF_SEC", 300, 0, 86_400);
 // Optional entry PIN for restarts. Applied ONLY at boot-attach and ONLY when the attached
 // position pubkey equals ENTRY_POSITION_PUBKEY. After a take-profit / recenter / new deploy the
 // position pubkey changes, so a stale pin is ignored automatically (with a warning) on the next boot.
@@ -291,6 +308,8 @@ const MAX_POSITION_WIDTH = DEFAULT_BIN_PER_POSITION.toNumber(); // 70
 
 // ==================== SYSTEM STATE ====================
 const connection = new Connection(RPC_URL, "confirmed");
+const rpcCounter = new RpcCallCounter();
+attachRpcCounter(connection, rpcCounter);
 const wallet = Keypair.fromSecretKey(bs58.decode(BOT_PRIVATE_KEY));
 
 // ---- /transfer_out (allow-listed, confirmed transfer of funds out of the LP wallet; see transferout.ts) ----
@@ -380,6 +399,15 @@ let belowRangeTickCount = 0;
 /** Unix seconds of last soft recenter (below-range or take-profit recycle). */
 let lastRecenterAt = 0;
 let lastTopupAt = 0;
+let topupProbeBackoffUntil = 0;
+/** One-batched-read tick reader (created after DLMM.create). */
+let tickReader: TickReader | null = null;
+/** Positions of this wallet in this pool from the last discovery (getProgramAccounts). */
+let discoveredPositionKeys: PublicKey[] = [];
+let lastPositionDiscoveryAt = 0;
+let positionDiscoveryForced = true;
+let lastRpcLogAt = Math.floor(Date.now() / 1000);
+let lastTickActiveKey = "";
 let lastSnapshotAt = 0;
 /** In-memory cumulative fees claimed (USD) this process lifetime — sheet is source of truth long-term. */
 let cumulativeFeesUsd = 0;
@@ -3569,6 +3597,78 @@ async function runCatchupSolSweep(attempt = 1): Promise<void> {
 }
 
 // ==================== MAIN LIFECYCLE CONTROLLER ====================
+// ==================== RPC CREDIT DIET: batched tick read + low-cadence position discovery ====================
+/** This wallet's position accounts in this pool (keys only; getProgramAccounts with an empty data slice). */
+async function discoverPositionKeys(): Promise<PublicKey[]> {
+  const programId: PublicKey = (dlmmPoolInstance as any).program.programId;
+  const res = await connection.getProgramAccounts(programId, {
+    commitment: "confirmed",
+    filters: [positionV2Filter(), positionOwnerFilter(wallet.publicKey), positionLbPairFilter(SOL_USDC_POOL)],
+    dataSlice: { offset: 0, length: 0 },
+  });
+  return res.map((r) => r.pubkey);
+}
+
+/**
+ * Refresh discoveredPositionKeys every POSITION_DISCOVERY_SEC, on the first tick and whenever the active
+ * position changes (deploy / close / re-attach). A failure keeps the previous list and retries in ~60 s.
+ */
+async function maybeDiscoverPositions(now: number): Promise<void> {
+  if (!isDue(now, lastPositionDiscoveryAt, POSITION_DISCOVERY_SEC, positionDiscoveryForced)) return;
+  try {
+    const keys = await discoverPositionKeys();
+    const known = new Set(discoveredPositionKeys.map((k) => k.toBase58()));
+    const active = activePositionPubkey?.toBase58() ?? "";
+    for (const k of keys) {
+      const b = k.toBase58();
+      if (b !== active && !known.has(b)) {
+        console.warn(`[POSITIONS] Untracked position of this wallet in this pool: ${b} (counted in equity, not managed)`);
+      }
+    }
+    discoveredPositionKeys = keys;
+    lastPositionDiscoveryAt = now;
+    positionDiscoveryForced = false;
+  } catch (err: any) {
+    console.warn("[POSITIONS] discovery failed (keeping previous list):", redactSecrets(String(err?.message || err)).slice(0, 160));
+    lastPositionDiscoveryAt = now - POSITION_DISCOVERY_SEC + 60;
+    positionDiscoveryForced = false;
+  }
+}
+
+/** Active position + every other discovered position of this wallet in this pool (deduplicated). */
+function trackedPositionKeys(): PublicKey[] {
+  const m = new Map<string, PublicKey>();
+  if (activePositionPubkey) m.set(activePositionPubkey.toBase58(), activePositionPubkey);
+  for (const k of discoveredPositionKeys) m.set(k.toBase58(), k);
+  return [...m.values()];
+}
+
+/** Mark-to-market from one tick snapshot, with probeEquity()'s fail-closed rules. */
+function snapshotEquity(snap: TickSnapshot, expected: PublicKey | null, spotUsd: number): EquityProbe {
+  return equityFromSnapshot({
+    spotUsd,
+    nativeLamports: snap.nativeLamports,
+    wsolRaw: snap.wsolRaw,
+    usdcRaw: snap.usdcRaw,
+    positions: snap.amounts,
+    missing: snap.missing,
+    expectedKey: expected ? expected.toBase58() : null,
+  });
+}
+
+/** Periodic "[RPC]" usage line (method names and counts only). */
+function logRpcUsage(now: number): void {
+  if (!(RPC_CREDIT_LOG_SEC > 0) || now - lastRpcLogAt < RPC_CREDIT_LOG_SEC) return;
+  const span = Math.max(1, now - lastRpcLogAt);
+  const credits = rpcCounter.totalCredits();
+  console.log(
+    `[RPC] last ${Math.round(span / 60)} min: ${rpcCounter.totalCalls()} calls, ${credits} credits ` +
+      `(≈${creditsPerDay(credits, span)}/day) | ${rpcCounter.summary() || "none"}`
+  );
+  rpcCounter.reset();
+  lastRpcLogAt = now;
+}
+
 async function runKeeper() {
   await notify(
     "🚀 DLMM Automated Keeper initialized on Railway." +
@@ -3577,6 +3677,14 @@ async function runKeeper() {
   );
   void emitLedger({ event: "BOOT", notes: "Keeper process started", is_estimate: true });
   dlmmPoolInstance = await DLMM.create(connection, SOL_USDC_POOL);
+  tickReader = new TickReader(
+    connection,
+    dlmmPoolInstance,
+    wallet.publicKey,
+    getAssociatedTokenAddressSync(USDC_MINT, wallet.publicKey),
+    getAssociatedTokenAddressSync(WSOL_MINT, wallet.publicKey),
+    PRICE_DECIMAL_FACTOR
+  );
   {
     const lb: any = (dlmmPoolInstance as any).lbPair;
     const xMint = lb?.tokenXMint?.toBase58?.();
@@ -3805,14 +3913,32 @@ async function runKeeper() {
     if (keeperTickRunning) return;
     keeperTickRunning = true;
     try {
+      logRpcUsage(Math.floor(Date.now() / 1000));
       if (isBotPaused || isExiting) return;
 
       const now = Math.floor(Date.now() / 1000);
       if (now < inCooldownUntil) return;
 
-      await dlmmPoolInstance!.refetchStates();
-      const activeBin = await dlmmPoolInstance!.getActiveBin();
-      const currentPrice = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
+      // ONE batched read (1 credit): pool → active bin → spot, wallet SOL/USDC/WSOL, tracked positions.
+      // Same fail-closed read guard as before: a failed/partial read skips the tick (stops not evaluated,
+      // the STOPS BLIND watchdog alerts if it persists).
+      const activeKeyNow = activePositionPubkey?.toBase58() ?? "";
+      if (activeKeyNow !== lastTickActiveKey) {
+        positionDiscoveryForced = true;
+        lastTickActiveKey = activeKeyNow;
+      }
+      await maybeDiscoverPositions(now);
+      let snap = await tickReader!.read(trackedPositionKeys());
+      if (!snap.ok) {
+        noteReadFailure("tick read (all stops/TP/recenter)", snap.reason || "batched read failed", now);
+        return;
+      }
+      if (snap.missing.length > 0) {
+        // Discovered positions that are gone (closed) drop out; the ACTIVE one missing fails the equity read below.
+        const gone = new Set(snap.missing);
+        discoveredPositionKeys = discoveredPositionKeys.filter((k) => !gone.has(k.toBase58()) || (activePositionPubkey?.equals(k) ?? false));
+      }
+      const currentPrice = snap.spotUsd;
 
       // READ GUARD (spot): zero/NaN or an unconfirmed one-tick jump never reaches the price stop,
       // take-profit, below-range recenter, top-up or re-entry. Skip the tick; re-check next tick.
@@ -3830,7 +3956,9 @@ async function runKeeper() {
       // Scheduled sweep (before idle top-up so top-up doesn't absorb USDC about to be swept).
       // lastSweepTime only advances on an actual sweep (inside sweepRevenueToVault); if a due sweep
       // moves nothing, retry after SWEEP_RETRY_SEC instead of on every tick.
+      let walletMutated = false;
       if (now - lastSweepTime >= SWEEP_INTERVAL_SEC && now >= nextSweepRetryAt) {
+        walletMutated = true;
         const swept = await sweepRevenueToVault(dlmmPoolInstance!);
         if (!(swept > 0)) {
           nextSweepRetryAt = now + SWEEP_RETRY_SEC;
@@ -3839,15 +3967,34 @@ async function runKeeper() {
       }
 
       // Idle top-up AFTER sweep so we do not absorb USDC about to be sent to revenue wallet.
-      if (activePositionPubkey) {
+      // Its own fresh reads (~6 credits) only run when this tick's wallet read shows enough idle capital
+      // (an upper bound of what the top-up itself computes); a probe that did not top up backs off.
+      if (
+        activePositionPubkey &&
+        now >= topupProbeBackoffUntil &&
+        idleUsdUpperBound(currentPrice, snap.nativeLamports, snap.wsolRaw, snap.usdcRaw, GAS_RESERVE_LAMPORTS) >= TOPUP_MIN_USD
+      ) {
+        const topupBefore = lastTopupAt;
         await topUpExistingPosition(dlmmPoolInstance!);
+        walletMutated = true;
+        if (lastTopupAt === topupBefore) topupProbeBackoffUntil = now + TOPUP_PROBE_BACKOFF_SEC;
+      }
+      if (walletMutated) {
+        // A sweep / top-up may have moved funds: re-read before snapshot + stops (1 more credit, rare).
+        snap = await tickReader!.read(trackedPositionKeys());
+        if (!snap.ok) {
+          noteReadFailure("tick re-read after sweep/top-up", snap.reason || "batched read failed", now);
+          return;
+        }
       }
 
       if (now - lastSnapshotAt >= SNAPSHOT_INTERVAL_SEC) {
         lastSnapshotAt = now;
         try {
-          const mtm = await getMarkToMarketEquityUsd(dlmmPoolInstance!, currentPrice);
-          const walletEq = await getWalletLiquidEquityUsd(currentPrice);
+          const se = snapshotEquity(snap, activePositionPubkey, currentPrice);
+          if (!se.ok) throw new Error(se.reason);
+          const mtm = se.totalUsd!;
+          const walletEq = { totalUsd: se.walletUsd! };
           let posUsd = Math.max(0, mtm - walletEq.totalUsd);
           // Unrealized vs entry; fees swept since entry are added back (a sweep is not a loss).
           const uPnL = entryEquityUsd > 0 ? Number((mtm + sweptSinceEntryUsd - entryEquityUsd).toFixed(2)) : 0;
@@ -3907,7 +4054,7 @@ async function runKeeper() {
       let equityStopHit = false;
       let equityReadOk = false;
       if (activePositionPubkey) {
-        const eq = vetEquityProbe(await probeEquity(dlmmPoolInstance!, currentPrice, activePositionPubkey), currentPrice);
+        const eq = vetEquityProbe(snapshotEquity(snap, activePositionPubkey, currentPrice), currentPrice);
         if (eq.ok) {
           equityReadOk = true;
           liveEquityUsd = eq.totalUsd;
