@@ -5,6 +5,7 @@ import DLMM, {
   positionLbPairFilter,
   positionOwnerFilter,
   positionV2Filter,
+  POSITION_FEE,
 } from "@meteora-ag/dlmm";
 import {
   Connection,
@@ -74,6 +75,13 @@ import {
 import { RpcCallCounter, attachRpcCounter, creditsPerDay } from "./rpccredits";
 import { equityFromSnapshot, idleUsdUpperBound, isDue } from "./tickstate";
 import { TickReader, TickSnapshot } from "./tickreader";
+import {
+  BIN_ARRAY_RENT_LAMPORTS,
+  deployHoldbackLamports,
+  deploySolLamports,
+  openCostLamports,
+  positionAccountBytes,
+} from "./gasreserve";
 import {
   ATA_RENT_LAMPORTS,
   TRANSFER_OUT_CONFIRM_TTL_MS,
@@ -205,6 +213,12 @@ const PRICE_DECIMAL_FACTOR = 1000;
 //   Default 0.12 SOL leaves headroom for one unexpected bin-array create + fee spike.
 const GAS_RESERVE_LAMPORTS = Number(process.env.GAS_RESERVE_LAMPORTS ?? 120_000_000); // 0.12 SOL
 const GAS_WARN_LAMPORTS = Number(process.env.GAS_WARN_LAMPORTS ?? 80_000_000); // 0.08 SOL
+// Opening a position also pays the new position's rent (~0.042 SOL on SOL-USDC, refunded on close) and, rarely,
+// bin-array / bitmap rent. Deploy holds back GAS_RESERVE + that open cost + this buffer for the open's tx fees,
+// so native SOL after the open stays ≥ GAS_RESERVE (it used to land at ≈ reserve − rent ≈ 0.078 SOL).
+const DEPLOY_FEE_BUFFER_LAMPORTS = Math.max(0, Number(process.env.DEPLOY_FEE_BUFFER_LAMPORTS ?? 5_000_000)); // 0.005 SOL
+// If the open-cost quote fails, assume this many new bin arrays (fail toward keeping SOL in the wallet).
+const DEPLOY_BIN_ARRAYS_IF_UNKNOWN = Math.max(0, Number(process.env.DEPLOY_BIN_ARRAYS_IF_UNKNOWN ?? 2));
 // Fraction of idle wallet capital to deploy into the grid (overrides regime capitalDeployPct). Default 100%.
 const DEPLOY_PCT = Math.min(1, Math.max(0, Number(process.env.DEPLOY_PCT ?? 1)));
 const MIN_SWAP_USD = Number(process.env.MIN_SWAP_USD ?? 10);
@@ -2557,6 +2571,49 @@ async function topUpExistingPosition(dlmmPool: DLMM): Promise<void> {
 }
 
 // ==================== GATE 4: POSITION DEPLOYMENT ====================
+/**
+ * One-off SOL cost of opening [minBinId, maxBinId]: position-account rent (exact, from the cluster's
+ * rent-exempt minimum for the account size) + rent of bin arrays / bitmap extension the open would create
+ * (SDK quote). Read-only. Errors fall back to conservative values so the wallet keeps its reserve.
+ */
+async function estimateOpenCost(
+  dlmmPool: DLMM,
+  minBinId: number,
+  maxBinId: number
+): Promise<{ lamports: number; detail: string }> {
+  const binCount = maxBinId - minBinId + 1;
+  let positionRent: number;
+  let posSrc = "rent-exempt";
+  try {
+    positionRent = await connection.getMinimumBalanceForRentExemption(positionAccountBytes(binCount));
+  } catch {
+    positionRent = Math.round(POSITION_FEE * 1e9); // SDK constant (slightly above the real rent)
+    posSrc = "SDK POSITION_FEE fallback";
+  }
+  let binArrays = DEPLOY_BIN_ARRAYS_IF_UNKNOWN;
+  let bitmapLamports = 0;
+  let arraySrc = "quote";
+  try {
+    const q = await (dlmmPool as any).quoteCreatePosition({
+      strategy: { minBinId, maxBinId, strategyType: StrategyType.Spot },
+    });
+    binArrays = Math.max(0, Number(q.binArraysCount) || 0);
+    bitmapLamports = Math.max(0, Math.round(Number(q.bitmapExtensionCost || 0) * 1e9));
+  } catch (e: any) {
+    arraySrc = `quote failed (${shortTxError(e)}) — assuming ${DEPLOY_BIN_ARRAYS_IF_UNKNOWN}`;
+  }
+  const lamports = openCostLamports({
+    positionRentLamports: positionRent,
+    binArraysToCreate: binArrays,
+    binArrayRentLamports: BIN_ARRAY_RENT_LAMPORTS,
+    bitmapExtensionLamports: bitmapLamports,
+  });
+  const detail =
+    `position rent ${(positionRent / 1e9).toFixed(6)} (${posSrc}) + ${binArrays} bin array(s) [${arraySrc}]` +
+    (bitmapLamports > 0 ? ` + bitmap ${(bitmapLamports / 1e9).toFixed(6)}` : "");
+  return { lamports, detail };
+}
+
 async function deployAsymmetricPosition(dlmmPool: DLMM) {
   if (isDeploying || isBotPaused || isExiting || isLiquidating) return;
   isDeploying = true;
@@ -2590,15 +2647,28 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
       usdcBalanceUnits = Number(acc.amount) / 1e6;
     } catch {}
 
-    // Idle capital = USDC + native SOL above gas reserve (WSOL already unwrapped above).
+    const range = rangeForProfile(config);
+    if (range.clamped || range.source !== "regime profile") console.log(`[RANGE] ${range.bidBins}/${range.askBins} bins (${range.source})`);
+    const activeBinIdNum = Number(activeBin.binId);
+    const minBinId = activeBinIdNum - range.bidBins;
+    const maxBinId = activeBinIdNum + range.askBins;
+
+    // SOL that must stay in the wallet: gas reserve + the open's one-off rent + a fee buffer. Without the
+    // open cost the position rent came out of the reserve and every open landed at ≈ reserve − rent.
+    const openCost = await estimateOpenCost(dlmmPool, minBinId, maxBinId);
+    const holdbackLamports = deployHoldbackLamports(GAS_RESERVE_LAMPORTS, openCost.lamports, DEPLOY_FEE_BUFFER_LAMPORTS);
+    console.log(
+      `[DEPLOY] SOL holdback ${(holdbackLamports / 1e9).toFixed(6)} = reserve ${(GAS_RESERVE_LAMPORTS / 1e9).toFixed(4)} + ` +
+        `open cost ${(openCost.lamports / 1e9).toFixed(6)} (${openCost.detail}) + fee buffer ${(DEPLOY_FEE_BUFFER_LAMPORTS / 1e9).toFixed(4)}`
+    );
+
+    // Idle capital = USDC + native SOL above the holdback (WSOL already unwrapped above).
     const preSolBal = await connection.getBalance(wallet.publicKey);
-    const existingSolUsd = (Math.max(0, preSolBal - GAS_RESERVE_LAMPORTS) / 1e9) * spotPriceUsd;
+    const existingSolUsd = (Math.max(0, preSolBal - holdbackLamports) / 1e9) * spotPriceUsd;
     const totalWorkingCapital = usdcBalanceUnits + existingSolUsd;
     // DEPLOY_PCT overrides regime capitalDeployPct (default 1.0 = deploy ~100% idle).
     const targetDeployCapital = totalWorkingCapital * DEPLOY_PCT;
 
-    const range = rangeForProfile(config);
-    if (range.clamped || range.source !== "regime profile") console.log(`[RANGE] ${range.bidBins}/${range.askBins} bins (${range.source})`);
     const totalBins = Math.max(1, range.bidBins + range.askBins);
     const askRatio = range.askBins / totalBins;
     const bidRatio = range.bidBins / totalBins;
@@ -2625,19 +2695,18 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     }
 
     const solBal = await connection.getBalance(wallet.publicKey);
-    if (solBal < GAS_RESERVE_LAMPORTS + 5_000_000) {
-      throw new Error(`SOL ${(solBal / 1e9).toFixed(4)} below gas reserve after rebalance — refusing deploy`);
+    if (solBal < holdbackLamports) {
+      throw new Error(
+        `SOL ${(solBal / 1e9).toFixed(4)} below gas reserve + open cost ${(holdbackLamports / 1e9).toFixed(4)} after rebalance — refusing deploy`
+      );
     }
     const targetAskLamports = Math.floor((targetAskUsd / spotPriceUsd) * 1e9);
-    const usableSolLamports = Math.max(0, Math.min(solBal - GAS_RESERVE_LAMPORTS, targetAskLamports));
+    const usableSolLamports = deploySolLamports(solBal, holdbackLamports, targetAskLamports);
     // NOTE: no manual WSOL wrap — SDK wraps totalXAmount from native SOL.
     if (usableSolLamports <= 0 && targetAskUsd > MIN_SWAP_USD) {
-      throw new Error("No SOL above gas reserve available for ask inventory");
+      throw new Error("No SOL above gas reserve + open cost available for ask inventory");
     }
 
-    const activeBinIdNum = Number(activeBin.binId);
-    const minBinId = activeBinIdNum - range.bidBins;
-    const maxBinId = activeBinIdNum + range.askBins;
     const newPositionKeypair = Keypair.generate();
 
     const postSwapUsdcAcc = await getAccount(connection, botUsdcAta);
@@ -2712,7 +2781,8 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     // Post-deploy must still hold the gas reserve
     if (postDeploy.nativeLamports < GAS_RESERVE_LAMPORTS) {
       console.warn(
-        `[DEPLOY] WARNING: native SOL ${(postDeploy.nativeLamports / 1e9).toFixed(4)} < reserve after open — rent/fees ate into buffer`
+        `[DEPLOY] WARNING: native SOL ${(postDeploy.nativeLamports / 1e9).toFixed(4)} < reserve ${(GAS_RESERVE_LAMPORTS / 1e9).toFixed(4)} after open ` +
+          `(held back ${(holdbackLamports / 1e9).toFixed(4)}; open cost estimate ${(openCost.lamports / 1e9).toFixed(6)} — ${openCost.detail})`
       );
     }
 
