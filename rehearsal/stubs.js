@@ -2,6 +2,7 @@
 // local validator) and the Google Sheet ledger webhook (rows appended to .state/ledger.jsonl).
 // Fault injection: POST /control {"jupiterFail": n, "mode": ...} for the next n swaps:
 //   "expire"   swap tx with a dead blockhash (never lands)      "http500" /swap returns 500
+//   "http429"  every /jup call returns 429 + x-ratelimit-reset (resetSec, default 3 s) — live 4bps Oct 12 5:33 AM PT
 //   "http503"  /quote returns 503 (live 4bps Oct 11 7:10 PM PT)
 //   "slippage" quotes 1.2% too optimistic and the swap enforces min-out = quote × (1 − slippageBps): fails in
 //              preflight with the DLMM ExceededAmountSlippageTolerance error unless slippageBps ≳ 120 (live: 0x1771).
@@ -72,6 +73,13 @@ function start() {
       }
       if (req.method === "POST" && u.pathname === "/control") { Object.assign(control, await body(req)); return send(res, 200, control); }
       if (req.method === "GET" && u.pathname === "/control") return send(res, 200, control);
+      if (u.pathname.startsWith("/jup/") && control.jupiterFail > 0 && control.mode === "http429") {
+        // Live 4bps Oct 12 5:33 AM PT: lite-api answered every call with this body. api.jup.ag adds x-ratelimit-* headers.
+        control.jupiterFail--; control.failed++;
+        res.writeHead(429, { "Content-Type": "application/json", "x-ratelimit-remaining": "-1", "x-ratelimit-current": "31",
+          "x-ratelimit-reset": String(Math.floor(Date.now() / 1000) + Number(control.resetSec ?? 3)) });
+        return res.end(JSON.stringify({ error: "Rate limit exceeded, please try again later." }));
+      }
       if (req.method === "GET" && u.pathname === "/jup/quote") {
         if (control.jupiterFail > 0 && control.mode === "http503") { control.jupiterFail--; control.failed++; return send(res, 503, { error: "Service Unavailable (injected)" }); }
         return send(res, 200, await quote(u.searchParams.get("inputMint"), u.searchParams.get("amount"), u.searchParams.get("slippageBps")));

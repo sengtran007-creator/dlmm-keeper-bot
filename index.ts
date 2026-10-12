@@ -94,7 +94,15 @@ import {
   resolveBootFlatGuard,
   FlatGuardState,
 } from "./flatguard";
-import { classifySwapFailure, nextSlippageBps, swapRetryDelayMs } from "./jupretry";
+import {
+  classifySwapFailure,
+  nextSlippageBps,
+  swapRetryDelayMs,
+  normalizeJupiterBase,
+  rateLimitWaitMs,
+  jupiterMinIntervalMs,
+  shouldFallbackToPool,
+} from "./jupretry";
 import {
   ATA_RENT_LAMPORTS,
   TRANSFER_OUT_CONFIRM_TTL_MS,
@@ -240,7 +248,9 @@ const TOPUP_COOLDOWN_SEC = Math.max(60, Number(process.env.TOPUP_COOLDOWN_SEC ??
 const SNAPSHOT_INTERVAL_SEC = Math.max(60, Number(process.env.SNAPSHOT_INTERVAL_SEC ?? 3600));
 
 // Jupiter Swap API base (lite free tier). Override with JUPITER_API_BASE or set JUPITER_API_KEY for api.jup.ag.
-const JUPITER_API_BASE = (process.env.JUPITER_API_BASE?.trim() || "https://lite-api.jup.ag/swap/v1").replace(/\/$/, "");
+// api.jup.ag (keyless 0.5 RPS, free key 1 RPS). A configured lite-api.jup.ag base is rewritten: that host is being
+// throttled down and retired, and returned 429 to every call from Oct 12 2026 5:33 AM PT.
+const JUPITER_API_BASE = normalizeJupiterBase(process.env.JUPITER_API_BASE);
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY?.trim() || "";
 const JUPITER_SLIPPAGE_BPS = Number(process.env.JUPITER_SLIPPAGE_BPS ?? 50);
 
@@ -1599,6 +1609,8 @@ interface SwapResult {
   /** Failure message / HTTP status of the last attempt (for the retry classifier). */
   error?: string;
   httpStatus?: number;
+  /** Response headers of a failed HTTP call (rate-limit headers only). */
+  rateHeaders?: Record<string, string>;
 }
 
 function isPreflightRejection(err: any): boolean {
@@ -1681,6 +1693,110 @@ const JUPITER_SLIPPAGE_MAX_BPS = Math.max(JUPITER_SLIPPAGE_BPS, Number(process.e
 /** Attempts per swap call (re-quote each time). */
 const JUPITER_SWAP_ATTEMPTS = Math.max(1, Math.min(6, Number(process.env.JUPITER_SWAP_ATTEMPTS ?? 3)));
 
+/** Fall back to a direct swap in the bot's own Meteora pool when Jupiter keeps failing (default on). */
+const JUPITER_POOL_FALLBACK = !/^(0|false|no|off)$/i.test(process.env.JUPITER_POOL_FALLBACK ?? "");
+/** Max price impact accepted on the pool fallback, percent. */
+const POOL_SWAP_MAX_IMPACT_PCT = Math.max(0.05, Number(process.env.POOL_SWAP_MAX_IMPACT_PCT ?? 1));
+const JUPITER_MIN_INTERVAL_MS = jupiterMinIntervalMs(
+  !!JUPITER_API_KEY,
+  process.env.JUPITER_MIN_INTERVAL_MS != null && process.env.JUPITER_MIN_INTERVAL_MS !== "" ? Number(process.env.JUPITER_MIN_INTERVAL_MS) : undefined
+);
+let lastJupiterCallAt = 0;
+/** Space Jupiter HTTP calls to the plan's rate (keyless 0.5 RPS): quote + swap per attempt would otherwise burst. */
+async function paceJupiter(): Promise<void> {
+  const wait = lastJupiterCallAt + JUPITER_MIN_INTERVAL_MS - Date.now();
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+  lastJupiterCallAt = Date.now();
+}
+
+function pickRateHeaders(h: any): Record<string, string> | undefined {
+  if (!h) return undefined;
+  const out: Record<string, string> = {};
+  for (const k of ["retry-after", "x-ratelimit-reset", "x-ratelimit-remaining", "x-ratelimit-current"]) {
+    const v = typeof h.get === "function" ? h.get(k) : h[k];
+    if (v != null) out[k] = String(v);
+  }
+  return Object.keys(out).length ? out : undefined;
+}
+
+/**
+ * Direct swap in the bot's own Meteora DLMM pool (SOL/USDC) — fallback when Jupiter is rate-limited or down.
+ * Same SwapResult + SWAP ledger row as a Jupiter swap. Refuses mints outside the pool and price impact above
+ * POOL_SWAP_MAX_IMPACT_PCT.
+ */
+async function executePoolSwap(
+  inputMint: PublicKey,
+  outputMint: PublicKey,
+  amountRaw: string,
+  spotUsdForNotional: number,
+  slippageBps: number
+): Promise<SwapResult> {
+  const inIsSol = inputMint.equals(WSOL_MINT);
+  const direction = inIsSol ? "SOL→USDC" : "USDC→SOL";
+  const empty: SwapResult = {
+    sig: "", inAmount: Number(amountRaw) || 0, outAmountQuoted: 0, outAmountActual: null, direction,
+    inMint: inputMint.toBase58(), outMint: outputMint.toBase58(), slippageBps, usdNotional: 0, isEstimate: true,
+  };
+  let attemptedSig = "";
+  try {
+    const pool = dlmmPoolInstance;
+    if (!pool) throw new Error("pool not loaded");
+    const x = (pool as any).lbPair.tokenXMint as PublicKey;
+    const y = (pool as any).lbPair.tokenYMint as PublicKey;
+    const ok = (inputMint.equals(x) && outputMint.equals(y)) || (inputMint.equals(y) && outputMint.equals(x));
+    if (!ok) throw new Error("mints are not this pool's pair");
+    const swapForY = inputMint.equals(x);
+    await pool.refetchStates();
+    const binArrays = await pool.getBinArrayForSwap(swapForY, 8);
+    const q: any = pool.swapQuote(new BN(amountRaw), swapForY, new BN(slippageBps), binArrays, true);
+    const impactPct = Math.abs(Number(q.priceImpact?.toString?.() ?? q.priceImpact ?? 0)); // SDK: already a percent
+    if (impactPct > POOL_SWAP_MAX_IMPACT_PCT) throw new Error(`price impact ${impactPct.toFixed(2)}% > ${POOL_SWAP_MAX_IMPACT_PCT}%`);
+    if (q.consumedInAmount.lt(new BN(amountRaw).muln(99).divn(100))) throw new Error("pool cannot fill ≥ 99% of the amount");
+    const native = await connection.getBalance(wallet.publicKey);
+    if (native < TX_FEE_FLOOR_LAMPORTS) throw new Error("native SOL below fee floor");
+    const tx: any = await pool.swap({
+      inToken: inputMint, outToken: outputMint, inAmount: q.consumedInAmount, minOutAmount: q.minOutAmount,
+      lbPair: (pool as any).pubkey, user: wallet.publicKey, binArraysPubkey: q.binArraysPubkey,
+    });
+    attemptedSig = "pending";
+    const sig = await sendTx(tx, [wallet], "pool swap (Jupiter fallback)");
+    attemptedSig = sig;
+    const meta = await fetchTxWalletDeltas(sig);
+    const fee = meta.feeLamports ?? 0;
+    let inAmt = Number(q.consumedInAmount.toString());
+    let outAmt: number | null = Number(q.outAmount.toString());
+    if (meta.ok) {
+      if (inIsSol) { inAmt = Math.max(0, -meta.solEffectiveDelta - fee); outAmt = Math.max(0, meta.usdcRawDelta); }
+      else { inAmt = Math.max(0, -meta.usdcRawDelta); outAmt = Math.max(0, meta.solEffectiveDelta + fee); }
+    }
+    if (fee > 0) cumulativeGasSol += fee / 1e9;
+    const outQuoted = Number(q.outAmount.toString());
+    const realized = outQuoted > 0 && outAmt ? Math.round(((outQuoted - outAmt) / outQuoted) * 10_000) : slippageBps;
+    const usd = spotUsdForNotional > 0 ? (inIsSol ? (inAmt / 1e9) * spotUsdForNotional : inAmt / 1e6) : 0;
+    const inUi = inIsSol ? inAmt / 1e9 : inAmt / 1e6;
+    const outUi = outAmt == null ? 0 : inIsSol ? outAmt / 1e6 : outAmt / 1e9;
+    console.log(`[POOL SWAP] ${direction} in ${inUi} out ${outUi} (impact ${impactPct.toFixed(3)}%) tx ${sig}`);
+    void emitLedger({
+      event: "SWAP", swap_direction: direction, swap_in_amount: inUi, swap_out_amount: outUi,
+      swap_out_quoted: inIsSol ? outQuoted / 1e6 : outQuoted / 1e9, slippage_bps: realized, swap_usd: usd,
+      gas_fee_sol: fee > 0 ? fee / 1e9 : undefined,
+      gas_fee_usd: fee > 0 && spotUsdForNotional > 0 ? (fee / 1e9) * spotUsdForNotional : undefined,
+      tx_sig: sig, is_estimate: !meta.ok,
+      notes: "Direct Meteora pool swap (Jupiter fallback)" + (meta.ok ? " — actuals from tx meta" : ""),
+    });
+    return {
+      sig, inAmount: inAmt, outAmountQuoted: outQuoted, outAmountActual: outAmt, direction,
+      inMint: inputMint.toBase58(), outMint: outputMint.toBase58(), slippageBps: realized, usdNotional: usd,
+      isEstimate: !meta.ok, attemptedSig: sig, landedStatus: "landed",
+    };
+  } catch (err: any) {
+    const ls: LandedStatus | undefined = attemptedSig ? ((err as any)?.landedStatus ?? "unknown") : "not_landed";
+    console.error(`[POOL SWAP ERROR]: ${shortTxError(err)}`);
+    void emitLedger({ event: "ERROR", notes: `Pool swap fallback failed: ${shortTxError(err)}`, is_estimate: true });
+    return { ...empty, attemptedSig: attemptedSig && attemptedSig !== "pending" ? attemptedSig : undefined, landedStatus: ls, error: String(err?.message || err) };
+  }
+}
+
 /**
  * Jupiter swap with in-process retry: each attempt re-quotes (fresh route + blockhash). 0x1771 (slippage) →
  * retry with a higher slippage cap (≤ JUPITER_SLIPPAGE_MAX_BPS); 5xx / 429 / network / expired → backoff
@@ -1715,11 +1831,22 @@ async function executeJupiterSwap(
       console.warn(`[JUPITER] slippage exceeded (0x1771) at ${slippage} bps — re-quoting at ${next} bps (attempt ${attempt + 1}/${JUPITER_SWAP_ATTEMPTS})`);
       slippage = next;
       await new Promise((res) => setTimeout(res, 500));
+    } else if (kind === "ratelimit") {
+      const d = rateLimitWaitMs(attempt, r.rateHeaders, Date.now());
+      const hdr = r.rateHeaders ? ` ${JSON.stringify(r.rateHeaders)}` : "";
+      console.warn(`[JUPITER] rate limited (429${hdr}) on ${JUPITER_API_BASE.replace(/^https?:\/\//, "").split("/")[0]}${JUPITER_API_KEY ? " with API key" : " keyless"} — retry ${attempt + 1}/${JUPITER_SWAP_ATTEMPTS} in ${(d / 1000).toFixed(1)}s`);
+      await new Promise((res) => setTimeout(res, d));
     } else {
       const d = swapRetryDelayMs(attempt);
       console.warn(`[JUPITER] transient failure (${(r.error || "").slice(0, 100)}) — retry ${attempt + 1}/${JUPITER_SWAP_ATTEMPTS} in ${(d / 1000).toFixed(1)}s`);
       await new Promise((res) => setTimeout(res, d));
     }
+  }
+  const lastKind = classifySwapFailure({ message: last!.error || "", httpStatus: last!.httpStatus, attemptedSig: last!.attemptedSig, landedStatus: last!.landedStatus });
+  if (shouldFallbackToPool(lastKind, JUPITER_POOL_FALLBACK)) {
+    console.warn(`[JUPITER] ${lastKind} after ${JUPITER_SWAP_ATTEMPTS} attempt(s) — falling back to a direct swap in the Meteora pool`);
+    const p = await executePoolSwap(inputMint, outputMint, amountLamports, spotUsdForNotional, Math.max(slippage, 100));
+    if (p.sig) return p;
   }
   return last!;
 }
@@ -1754,6 +1881,7 @@ async function executeJupiterSwapOnce(
       `${JUPITER_API_BASE}/quote?inputMint=${inputMint.toBase58()}` +
       `&outputMint=${outputMint.toBase58()}&amount=${amountLamports}` +
       `&slippageBps=${slippageBps}&restrictIntermediateTokens=true`;
+    await paceJupiter();
     const quoteRes = await axios.get(quoteUrl, { timeout: 10000, headers });
     const quoteResponse = quoteRes.data;
     if (!quoteResponse || quoteResponse.error || !quoteResponse.outAmount) {
@@ -1785,6 +1913,7 @@ async function executeJupiterSwapOnce(
       }
     }
 
+    await paceJupiter();
     const swapRes = await axios.post(
       `${JUPITER_API_BASE}/swap`,
       {
@@ -1956,6 +2085,7 @@ async function executeJupiterSwapOnce(
       landedStatus: attemptedSig ? (landedStatus ?? "unknown") : "not_landed",
       error: String(err?.message || err),
       httpStatus: Number(err?.response?.status) || undefined,
+      rateHeaders: pickRateHeaders(err?.response?.headers),
     };
   }
 }

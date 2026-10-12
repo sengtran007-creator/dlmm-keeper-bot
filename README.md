@@ -210,3 +210,10 @@ Use it as a gate: run at least the quick set before shipping any change to open/
 ## License / disclaimer
 
 Provided as-is for educational and operational use. Automated market making involves impermanent loss, smart-contract risk, RPC/API failures, and liquidation-style stops that can realize losses. You are solely responsible for funds and compliance.
+
+### Jupiter rate limits (`jup-ratelimit`)
+- Default base is `https://api.jup.ag/swap/v1` (a configured `lite-api.jup.ag` base is rewritten; that host is being retired).
+- `JUPITER_API_KEY` (optional, recommended): sent as `x-api-key`. Free key = 1 RPS (keyless = 0.5 RPS). Get one at https://developers.jup.ag/portal.
+- Calls are paced (`JUPITER_MIN_INTERVAL_MS`, default 2100 ms keyless / 1050 ms with key). A 429 waits until `x-ratelimit-reset` / `Retry-After`, else 5 s, 15 s, 30 s.
+- `JUPITER_POOL_FALLBACK` (default on): after the Jupiter attempts fail with 429/5xx/slippage (never when a signed tx may still land), swap directly in the bot's own Meteora SOL/USDC pool; refused above `POOL_SWAP_MAX_IMPACT_PCT` (default 1%).
+- Rehearsal: `node rehearsal/run.js open,jupiter429` (stub `http429` mode).

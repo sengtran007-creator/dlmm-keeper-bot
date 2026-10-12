@@ -333,6 +333,40 @@ const STEPS = {
       check(sub.tag, "exactly one SWAP landed for the rebalance (no double swap)", swaps.length === 1, `${swaps.length} SWAP row(s)`);
     }
   },
+  async jupiter429() {
+    // Live 4bps Oct 12 2026 from 5:33 AM PT: every Jupiter call 429 for 30+ min; each redeploy burned 3 quick retries
+    // and the bot sat flat with ~$453 of SOL. (a) two 429s with x-ratelimit-reset 3 s ahead → honoured, lands via
+    // Jupiter in the same deploy. (b) Jupiter fully rate-limited → direct Meteora-pool swap fallback, same deploy.
+    const ctl = (b) => fetch(`http://127.0.0.1:${stubs.PORT}/control`, { method: "POST", body: JSON.stringify(b) });
+    for (const sub of [
+      { tag: "jupiter-429(a) reset header", fault: { jupiterFail: 2, mode: "http429", resetSec: 3 }, move: (r) => r.lower - 3,
+        want: /rate limited \(429[^\n]*x-ratelimit-reset[^\n]*retry 2\/3 in [2-5]\.\ds/, via: /swap landed on attempt [23]/ },
+      { tag: "jupiter-429(b) pool fallback", fault: { jupiterFail: 100000, mode: "http429", resetSec: 1 }, move: (r) => r.upper + 3,
+        want: /falling back to a direct swap in the Meteora pool/, via: /\[POOL SWAP\] /, poolRow: true },
+    ]) {
+      const c0 = await ensurePosition(sub.tag);
+      const r = rangeOf(c0);
+      if (!r) { check(sub.tag, "precondition: position", false, "none"); continue; }
+      const from = logBuf.length;
+      const rowsFrom = ledgerRows().length;
+      await ctl(sub.fault);
+      await market.moveToBin(whale, sub.move(r));
+      const pre = await chain();
+      const dep = await waitLog(/GRID DEPLOYED|DEPLOYMENT FAILED/, from, 300_000);
+      await ctl({ jupiterFail: 0, mode: "expire" });
+      check(sub.tag, "redeploy lands in the same cycle despite 429s", dep && /GRID DEPLOYED/.test(dep.m[0]), dep ? dep.m[0] : "no outcome in 300 s");
+      const w = lastMatch(sub.want, from);
+      check(sub.tag, "429 handled with the right policy", !!w, w ? w[0].slice(0, 160) : "no matching log line");
+      const v = lastMatch(sub.via, from);
+      check(sub.tag, "swap landed via the expected route", !!v, v ? v[0].slice(0, 120) : "none");
+      await sleep(3000);
+      const post = await positionInvariants(sub.tag, from, pre);
+      const rows = await ledgerInvariants(sub.tag, rowsFrom, pre, post);
+      const swaps = rows.filter((x) => x.event === "SWAP");
+      check(sub.tag, "exactly one SWAP landed for the rebalance (no double swap)", swaps.length === 1, `${swaps.length} SWAP row(s)`);
+      if (sub.poolRow) check(sub.tag, "SWAP row marks the pool fallback", swaps.some((x) => /Direct Meteora pool swap/.test(x.notes || "")), swaps.map((x) => x.notes).join(" | ").slice(0, 120));
+    }
+  },
   async recenterDeployRetry() {
     // Recenter closes, the redeploy's Jupiter swap fails once (injected), Jupiter heals: the owed redeploy must be
     // retried on the short backoff (60 s) — not the 600 s cooldown + Gate 3 — and the SOL stays guarded meanwhile.
@@ -533,7 +567,7 @@ const STEPS = {
 };
 
 (async () => {
-  const want = (process.argv[2] || "open,tpLowGas,fees,recenterBelow,takeProfit,jupiterFaults,topUp,recenterDeployRetry,recenterDeployFail,restartMidClose,stopOut").split(",");
+  const want = (process.argv[2] || "open,tpLowGas,fees,recenterBelow,takeProfit,jupiterFaults,jupiter429,topUp,recenterDeployRetry,recenterDeployFail,restartMidClose,stopOut").split(",");
   const srv = await stubs.start();
   await market.airdrop(whale.publicKey, 20000).catch(() => {});
   const c = await chain();
