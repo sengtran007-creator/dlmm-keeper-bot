@@ -18,6 +18,8 @@ export interface PositionAmounts {
   y: number;
   feeX: number;
   feeY: number;
+  /** M2: lamports held by the position account (refundable rent). */
+  rentLamports?: number;
 }
 
 export interface SnapshotEquityInput {
@@ -52,7 +54,9 @@ export function walletUsdFromRaw(spotUsd: number, nativeLamports: number, wsolRa
 }
 
 export function positionUsd(p: PositionAmounts, spotUsd: number): number {
-  return ((p.x + p.feeX) / 1e9) * spotUsd + (p.y + p.feeY) / 1e6;
+  // M2: the position account's rent is refunded to the wallet on close, so it is part of equity.
+  const rent = Number.isFinite(p.rentLamports as number) ? (p.rentLamports as number) : 0;
+  return ((p.x + p.feeX + rent) / 1e9) * spotUsd + (p.y + p.feeY) / 1e6;
 }
 
 /** Full MTM from one snapshot; ok:false on anything that probeEquity() would also reject. */
@@ -111,4 +115,15 @@ export function idleUsdUpperBound(spotUsd: number, nativeLamports: number, wsolR
 /** Due when never run, forced, or the interval elapsed. */
 export function isDue(nowSec: number, lastSec: number, intervalSec: number, force = false): boolean {
   return force || lastSec <= 0 || nowSec - lastSec >= intervalSec;
+}
+
+/** SOL units held inside the positions of a snapshot (liquidity + unclaimed SOL fees); NaN entries count 0. */
+export function positionSolUnitsFromAmounts(amounts: PositionAmounts[]): number {
+  let lamports = 0;
+  for (const a of amounts) {
+    if (!a.ok) continue;
+    if (Number.isFinite(a.x)) lamports += a.x;
+    if (Number.isFinite(a.feeX)) lamports += a.feeX;
+  }
+  return lamports / 1e9;
 }

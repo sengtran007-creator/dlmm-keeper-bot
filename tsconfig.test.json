@@ -1,5 +1,26 @@
 {
   "extends": "./tsconfig.json",
-  "compilerOptions": { "outDir": "./dist-test", "noEmit": false },
-  "include": ["regime.ts", "feesweep.ts", "multipool.ts", "transferout.ts", "txretry.ts", "rpccredits.ts", "tickstate.ts", "tickreader.ts", "gasreserve.ts", "flatguard.ts", "jupretry.ts", "tools/**/*.ts", "tests/**/*.ts"]
+  "compilerOptions": {
+    "outDir": "./dist-test",
+    "noEmit": false
+  },
+  "include": [
+    "txmeta.ts",
+    "invariants.ts",
+    "moneylock.ts",
+    "entrymemo.ts",
+    "regime.ts",
+    "feesweep.ts",
+    "multipool.ts",
+    "transferout.ts",
+    "txretry.ts",
+    "rpccredits.ts",
+    "tickstate.ts",
+    "tickreader.ts",
+    "gasreserve.ts",
+    "flatguard.ts",
+    "jupretry.ts",
+    "tools/**/*.ts",
+    "tests/**/*.ts"
+  ]
 }

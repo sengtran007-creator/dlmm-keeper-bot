@@ -17,6 +17,10 @@ const market = require("./market");
 const PORT = Number(process.env.STUB_PORT || 8787);
 const LEDGER = path.join(L.STATE_DIR, "ledger.jsonl");
 const control = { jupiterFail: 0, mode: "expire", swaps: 0, failed: 0 };
+// Telegram stand-in (TELEGRAM_API_BASE=http://127.0.0.1:PORT/tg): the harness queues commands with POST /tg-cmd
+// {"text": "/pause"}; getUpdates hands them to the bot; sendMessage texts are kept in tg.sent.
+const tg = { updates: [], nextId: 1, sent: [] };
+const TG_CHAT = "4242";
 
 async function quote(inputMint, amount, slippageBps = 100) {
   const p = await market.pool();
@@ -73,6 +77,22 @@ function start() {
       }
       if (req.method === "POST" && u.pathname === "/control") { Object.assign(control, await body(req)); return send(res, 200, control); }
       if (req.method === "GET" && u.pathname === "/control") return send(res, 200, control);
+      if (req.method === "POST" && u.pathname === "/tg-cmd") {
+        const b = await body(req);
+        tg.updates.push({ update_id: tg.nextId++, message: { chat: { id: Number(TG_CHAT) }, from: { id: Number(TG_CHAT) }, text: String(b.text) } });
+        return send(res, 200, { ok: true });
+      }
+      if (u.pathname.startsWith("/tg/") && u.pathname.endsWith("/getUpdates")) {
+        const offset = Number(u.searchParams.get("offset") || 0);
+        tg.updates = tg.updates.filter((x) => x.update_id >= offset); // confirmed updates are gone (as on Telegram)
+        for (let i = 0; i < 20 && !tg.updates.some((x) => x.update_id >= offset); i++) await new Promise((r) => setTimeout(r, 100));
+        return send(res, 200, { ok: true, result: tg.updates.filter((x) => x.update_id >= offset) });
+      }
+      if (u.pathname.startsWith("/tg/") && u.pathname.endsWith("/sendMessage")) {
+        const b = await body(req);
+        tg.sent.push(String(b.text || ""));
+        return send(res, 200, { ok: true, result: { message_id: tg.sent.length } });
+      }
       if (u.pathname.startsWith("/jup/") && control.jupiterFail > 0 && control.mode === "http429") {
         // Live 4bps Oct 12 5:33 AM PT: lite-api answered every call with this body. api.jup.ag adds x-ratelimit-* headers.
         control.jupiterFail--; control.failed++;
@@ -100,5 +120,5 @@ function start() {
   });
   return new Promise((r) => srv.listen(PORT, "127.0.0.1", () => r(srv)));
 }
-module.exports = { start, control, LEDGER, PORT };
+module.exports = { start, control, LEDGER, PORT, tg, TG_CHAT };
 if (require.main === module) start().then(() => console.log(`stubs on :${PORT}`));

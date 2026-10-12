@@ -107,9 +107,10 @@ function lastMatch(re, from = 0) {
 /** Shared invariants after a step that should leave exactly one managed position. */
 async function positionInvariants(step, from, pre, opts = {}) {
   const c = await chain();
-  const deployed = lastMatch(/Position: <code>([1-9A-HJ-NP-Za-km-z]{32,44})<\/code>/, from) || lastMatch(/Re-attached to still-open position ([1-9A-HJ-NP-Za-km-z]{32,44})/, from) || lastMatch(/\[ATTACH\][^\n]*?([1-9A-HJ-NP-Za-km-z]{43,44})/, from);
+  const deployed = lastMatch(/Position: <code>([1-9A-HJ-NP-Za-km-z]{32,44})<\/code>|POSITION ADOPTED\]<\/b> <code>([1-9A-HJ-NP-Za-km-z]{32,44})/, from) || lastMatch(/Re-attached to still-open position ([1-9A-HJ-NP-Za-km-z]{32,44})/, from) || lastMatch(/\[ATTACH\][^\n]*?([1-9A-HJ-NP-Za-km-z]{43,44})/, from);
   check(step, "exactly one position on chain (no orphans)", c.positions.length === 1, `${c.positions.length} position(s): ${c.positions.map((q) => q.key.slice(0, 8)).join(",")}`);
-  if (deployed && c.positions.length) check(step, "bot tracks the on-chain position", c.positions.some((q) => q.key === deployed[1]), `bot says ${deployed[1].slice(0, 8)}`);
+  const dKey = deployed ? deployed[1] || deployed[2] : null;
+  if (dKey && c.positions.length) check(step, "bot tracks the on-chain position", c.positions.some((q) => q.key === dKey), `bot says ${dKey.slice(0, 8)}`);
   if (!opts.skipReserve) check(step, "native SOL ≥ GAS_RESERVE after open", c.native >= GAS_RESERVE, `native ${(c.native / 1e9).toFixed(6)} SOL (reserve 0.12)`);
   const stop = lastMatch(/Floor Stop: \$([\d.]+)/, from) || lastMatch(/floor stop \$([\d.]+)/i, from) || lastMatch(/Floor Stop: \$([\d.]+)/);
   check(step, "stops armed (price stop logged > 0)", stop && Number(stop[1]) > 0 && !/STOPS BLIND/.test(logBuf.slice(from)), stop ? `price stop $${stop[1]}` : "no stop line");
@@ -196,9 +197,170 @@ async function ensurePosition(tag) {
   await sleep(3000);
   return chain();
 }
+const tgEnv = () => ({
+  TELEGRAM_BOT_TOKEN: "rehearsal-fake-token", TELEGRAM_CHAT_ID: stubs.TG_CHAT, TELEGRAM_COMMANDS_ENABLED: "true",
+  TELEGRAM_API_BASE: `http://127.0.0.1:${stubs.PORT}/tg`,
+});
+const tgCmd = (text) => fetch(`http://127.0.0.1:${stubs.PORT}/tg-cmd`, { method: "POST", body: JSON.stringify({ text }) });
+const ctl = (b) => fetch(`http://127.0.0.1:${stubs.PORT}/control`, { method: "POST", body: JSON.stringify(b) });
+/** Restart the bot (optionally with extra env) and wait for its boot line. */
+async function restart(extra = {}, wait = /BOOTED|ATTACHED TO LIVE|FLAT WITH SOL/i) {
+  killBot();
+  const f = startBot(extra);
+  const b = await waitLog(wait, f, 150_000);
+  return { from: f, boot: b };
+}
+/** Entry restored at boot must equal the entry before the restart (not the live spot). */
+async function checkEntryRecovered(step, want) {
+  const { from, boot } = await restart({ BELOW_RANGE_TICKS: "10000" });
+  check(step, "reboot attaches", boot && /ATTACHED TO LIVE/.test(boot.m[0]), boot ? boot.m[0] : "no boot line");
+  const how = await waitLog(/\[ENTRY\] boot entry: (\w+) — ([^\n]*)/, from, 5_000) || { m: lastMatch(/\[ENTRY\] boot entry: (\w+) — ([^\n]*)/, from) };
+  check(step, "entry recovered from the on-chain memo (no pins set)", how.m && how.m[1] === "memo", how.m ? how.m[0].slice(0, 160) : "no boot-entry line");
+  const att = lastMatch(/\(entry \$([\d.]+)\)/, from);
+  check(step, "recovered entry spot = entry before restart", att && Math.abs(Number(att[1]) - want.spot) < 0.01, att ? `boot entry $${att[1]} vs before $${want.spot.toFixed(2)}` : "no entry in attach line");
+  const st = lastMatch(/Floor Stop: \$([\d.]+)/, from);
+  check(step, "price stop unchanged across restart", st && Math.abs(Number(st[1]) - want.stop) < 0.02, st ? `$${st[1]} vs $${want.stop}` : "no stop line");
+  await sleep(35_000);
+  check(step, "no STOPS BLIND after reboot", !/STOPS BLIND/.test(logBuf.slice(from)), "log");
+  return from;
+}
+function entryBefore(from) {
+  const m = lastMatch(/\[ENTRY\] memo written \((\w+)\)[^\n]* spot=([\d.]+) eq=([\d.]+) stop=([\d.]+)/, from);
+  const st = lastMatch(/Floor Stop: \$([\d.]+)/, from) || lastMatch(/Floor Stop: \$([\d.]+)/);
+  return m ? { src: m[1], spot: Number(m[2]), eq: Number(m[3]), stopPct: Number(m[4]), stop: st ? Number(st[1]) : NaN } : null;
+}
 const rangeOf = (c) => (c.positions[0] ? { lower: c.positions[0].lower, upper: c.positions[0].upper } : null);
 
 const STEPS = {
+  async restartAfterRecenter() {
+    // H2: the entry is kept across a recenter and must survive a restart with NO ENTRY_* pins (on-chain memo).
+    const c0 = await ensurePosition("restart-after-recenter");
+    const r = rangeOf(c0);
+    if (!r) return check("restart-after-recenter", "precondition: position", false, "none");
+    const from = logBuf.length;
+    await market.moveToBin(whale, r.lower - 3);
+    const dep = await waitLog(/GRID DEPLOYED|DEPLOYMENT FAILED/, from, 300_000);
+    check("restart-after-recenter", "recenter redeployed", dep && /GRID DEPLOYED/.test(dep.m[0]), dep ? dep.m[0] : "none");
+    const mw = await waitLog(/\[ENTRY\] memo written \(recenter\)/, from, 30_000);
+    check("restart-after-recenter", "entry memo written for the new position (src=recenter)", !!mw, mw ? "yes" : "no memo line");
+    const want = entryBefore(from);
+    const kept = lastMatch(/Recenter deploy: keeping original entry spot=\$([\d.]+)/, from);
+    check("restart-after-recenter", "memo carries the ORIGINAL entry", want && kept && Math.abs(want.spot - Number(kept[1])) < 0.01, want && kept ? `memo $${want.spot} vs kept $${kept[1]}` : "missing");
+    // A newer CORRUPT memo for the same position must be ignored (valid older one wins).
+    const c1 = await chain();
+    const posKey = c1.positions[0]?.key;
+    if (posKey && want) {
+      const memoProgram = new PublicKey("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+      const bad = `dlmm-keeper:entry v=1 pos=${posKey} spot=${(want.spot * 0.9).toFixed(4)} eq=${want.eq.toFixed(2)} stop=0.0500 regime=X cd=0 src=deploy ck=deadbeef`;
+      const tx = new Transaction().add({ programId: memoProgram, keys: [], data: Buffer.from(bad) });
+      await sendAndConfirmTransaction(market.conn, tx, [bk], { commitment: "confirmed" });
+    }
+    await sleep(2000);
+    if (want) await checkEntryRecovered("restart-after-recenter", want);
+    const bl = lastMatch(/\[BOOT\] entry memos found in wallet history: (\d+)/);
+    check("restart-after-recenter", "boot scan found the memos", bl && Number(bl[1]) >= 1, bl ? bl[0] : "none");
+  },
+  async restartAfterTP() {
+    // H2: a take-profit opens with a NEW entry; after a restart that new entry must come back (not the old one, not live).
+    const { from: f0 } = await restart({}, /ATTACHED TO LIVE|BOOTED|FLAT WITH SOL/i);
+    await sleep(20_000);
+    const c0 = await ensurePosition("restart-after-tp");
+    const r = rangeOf(c0);
+    if (!r) return check("restart-after-tp", "precondition: position", false, "none");
+    const from = logBuf.length;
+    await market.moveToBin(whale, r.upper + 3);
+    const dep = await waitLog(/GRID DEPLOYED|DEPLOYMENT FAILED/, from, 300_000);
+    check("restart-after-tp", "TP redeployed", dep && /GRID DEPLOYED/.test(dep.m[0]), dep ? dep.m[0] : "none");
+    const mw = await waitLog(/\[ENTRY\] memo written \(deploy\)/, from, 30_000);
+    check("restart-after-tp", "entry memo written (src=deploy, fresh entry)", !!mw, mw ? "yes" : "no memo line");
+    const want = entryBefore(from);
+    if (want) await checkEntryRecovered("restart-after-tp", want);
+    void f0;
+  },
+  async deployUnknown() {
+    // C2: the create lands but the bot sees an error (timeout) → it must find + adopt the position, never open a second.
+    const { from: f0 } = await restart({ REHEARSAL_FAULT: "deploy-unknown,memo-fail", ENTRY_MEMO_RETRY_SEC: "45" });
+    await sleep(20_000);
+    const c0 = await ensurePosition("deploy-unknown");
+    const r = rangeOf(c0);
+    if (!r) return check("deploy-unknown", "precondition: position", false, "none");
+    const from = logBuf.length;
+    await market.moveToBin(whale, r.lower - 3);
+    const fail = await waitLog(/Deployment failed: REHEARSAL fault/, from, 300_000);
+    check("deploy-unknown", "deploy outcome reported unknown (injected)", !!fail, fail ? "yes" : "no fault line");
+    const ad = await waitLog(/\[ADOPT\] Adopted position ([1-9A-HJ-NP-Za-km-z]{32,44})/, from, 60_000);
+    check("deploy-unknown", "landed position adopted (chain re-check before any retry)", !!ad, ad ? ad.m[0].slice(0, 120) : "no adopt");
+    await sleep(40_000);
+    check("deploy-unknown", "no second deploy", (logBuf.slice(from).match(/GRID DEPLOYED/g) || []).length === 0, "no GRID DEPLOYED after the adopt");
+    await positionInvariants("deploy-unknown", from, null);
+    // memo-fail: the adopt memo's first write fails → alert, then retried on a later tick.
+    check("deploy-unknown", "failed memo alerted", /ENTRY NOT PERSISTED/.test(logBuf.slice(f0)), "alert line");
+    const retried = await waitLog(/\[ENTRY\] memo written \(adopt\)/, from, 120_000);
+    check("deploy-unknown", "memo retried and written", !!retried, retried ? "yes" : "not written in 120 s");
+    await restart({}, /ATTACHED TO LIVE|BOOTED/i);
+    await sleep(20_000);
+  },
+  async sweepDuringWithdraw() {
+    // H1: a fee sweep in flight when /withdraw_pct arrives must not sweep the withdrawn USDC.
+    await ensurePosition("sweep-during-withdraw");
+    await market.washTrade(whale, 6, 20);
+    const pre = await chain();
+    const rowsFrom = ledgerRows().length;
+    const { from } = await restart({ ...tgEnv(), REHEARSAL_FAULT: "sweep-due,slow-sweep", BELOW_RANGE_TICKS: "10000" }, /ATTACHED TO LIVE/i);
+    const hold = await waitLog(/slow sweep holding/, from, 120_000);
+    check("sweep-during-withdraw", "sweep in flight (held 40 s)", !!hold, hold ? "yes" : "no sweep");
+    await tgCmd("/withdraw_pct 30");
+    const wd = await waitLog(/PARTIAL WITHDRAW 30%\]<\/b> Moved to wallet: ([\d.]+) SOL \+ \$([\d.]+) USDC/, from, 180_000);
+    check("sweep-during-withdraw", "withdrawal landed", !!wd, wd ? wd.m[0].slice(0, 120) : "none");
+    const sw = lastMatch(/\[FEE SWEEP\][^\n]*/, from);
+    const tSweep = logBuf.slice(from).search(/USDC → revenue|No surplus|\[FEE SWEEP\]/);
+    const tWd = wd ? wd.at - from : -1;
+    check("sweep-during-withdraw", "withdrawal waited for the sweep (money lock)", tSweep >= 0 && tWd > tSweep, `sweep@${tSweep} withdraw@${tWd}`);
+    await sleep(5000);
+    const post = await chain();
+    const rows = ledgerRows().slice(rowsFrom);
+    const claimed = rows.filter((x) => x.event === "FEE_CLAIM").reduce((a, x) => a + Number(x.fees_claimed_usd || 0), 0);
+    const revDelta = revenueUsd(post, post.spot) - revenueUsd(pre, post.spot);
+    check("sweep-during-withdraw", "revenue received ≤ fees claimed (no capital swept)", revDelta <= claimed * 1.01 + 0.01, `revenue +$${revDelta.toFixed(4)} vs claimed $${claimed.toFixed(4)}`);
+    const wUsdc = wd ? Number(wd.m[2]) : 0;
+    check("sweep-during-withdraw", "withdrawn USDC still in the LP wallet", post.usdc / 1e6 >= wUsdc - 0.01, `wallet $${(post.usdc / 1e6).toFixed(2)} vs withdrawn $${wUsdc.toFixed(2)}`);
+    await ledgerInvariants("sweep-during-withdraw", rowsFrom, pre, post);
+    void sw;
+    // /resume re-bases entry equity and persists it (memo src=resume); idle funds are topped back in.
+    const f2 = logBuf.length;
+    await tgCmd("/resume");
+    const rb = await waitLog(/Entry equity re-based/, f2, 60_000);
+    check("sweep-during-withdraw", "/resume re-based entry equity", !!rb, rb ? "yes" : "none");
+    const mr = await waitLog(/\[ENTRY\] memo written \(resume\)/, f2, 60_000);
+    check("sweep-during-withdraw", "re-based entry persisted on chain (memo src=resume)", !!mr, mr ? "yes" : "none");
+  },
+  async pausedWithPosition() {
+    // M3: paused with a position → the price stop stays live and fires a full exit.
+    const { from } = await restart({ ...tgEnv(), BELOW_RANGE_TICKS: "10000" }, /ATTACHED TO LIVE|BOOTED/i);
+    await sleep(20_000);
+    const c0 = await ensurePosition("paused-with-position");
+    if (!c0.positions.length) return check("paused-with-position", "precondition: position", false, "none");
+    await tgCmd("/pause");
+    const al = await waitLog(/PAUSED WITH POSITION\][^\n]*Price stop \$([\d.]+) stays ACTIVE/, from, 60_000);
+    check("paused-with-position", "paused-with-position alert names the live price stop", !!al, al ? al.m[0].slice(0, 140) : "none");
+    const priceStop = al ? Number(al.m[1]) : NaN;
+    await sleep(70_000);
+    check("paused-with-position", "no STOPS BLIND while paused with a position", !/STOPS BLIND/.test(logBuf.slice(from)), "log");
+    const s = await market.spot();
+    const binsDown = Math.ceil(Math.log(priceStop / s.price) / Math.log(1.0004)) - 3;
+    const f2 = logBuf.length;
+    await market.moveToBin(whale, s.binId + binsDown, { stepSol: 2500, stepUsdc: 275000 });
+    const st = await waitLog(/STOP WHILE PAUSED/, f2, 90_000);
+    check("paused-with-position", "price stop fired while paused", !!st, st ? "yes" : "no stop");
+    const ex = await waitLog(/EMERGENCY EXIT COMPLETE|EMERGENCY EXIT INCOMPLETE/, f2, 240_000);
+    check("paused-with-position", "full exit completed", ex && /COMPLETE/.test(ex.m[0]) && !/INCOMPLETE/.test(ex.m[0]), ex ? ex.m[0] : "none");
+    await sleep(3000);
+    const post = await chain();
+    check("paused-with-position", "no position left", post.positions.length === 0, `${post.positions.length}`);
+    check("paused-with-position", "native SOL ≥ reserve after the exit dump (L1)", post.native >= GAS_RESERVE, `native ${(post.native / 1e9).toFixed(6)}`);
+    await restart({}, /BOOTED|FLAT WITH SOL|ATTACHED/i);
+    await sleep(20_000);
+  },
   async open() {
     killBot();
     const from = startBot();
@@ -370,6 +532,9 @@ const STEPS = {
   async recenterDeployRetry() {
     // Recenter closes, the redeploy's Jupiter swap fails once (injected), Jupiter heals: the owed redeploy must be
     // retried on the short backoff (60 s) — not the 600 s cooldown + Gate 3 — and the SOL stays guarded meanwhile.
+    // These steps need the deploy to FAIL: turn off jup-ratelimit's direct-pool fallback (it would land the swap).
+    await restart({ JUPITER_POOL_FALLBACK: "false" }, /ATTACHED TO LIVE|BOOTED|FLAT WITH SOL/i);
+    await sleep(20_000);
     const c0 = await ensurePosition("recenter-deploy-retry");
     const r = rangeOf(c0);
     if (!r) return check("recenter-deploy-retry", "precondition: position", false, "none");
@@ -398,6 +563,9 @@ const STEPS = {
     // Recenter closes the position, then the redeploy's Jupiter rebalance keeps failing (injected: expired blockhash)
     // while the price crashes through the kept entry stop. The flat guard must fire on the SOL held while flat and,
     // once Jupiter heals, liquidate it to USDC (like the circuit breaker would have).
+    // These steps need the deploy to FAIL: turn off jup-ratelimit's direct-pool fallback (it would land the swap).
+    await restart({ JUPITER_POOL_FALLBACK: "false" }, /ATTACHED TO LIVE|BOOTED|FLAT WITH SOL/i);
+    await sleep(20_000);
     const c0 = await ensurePosition("recenter-deploy-fail");
     const r = rangeOf(c0);
     if (!r) return check("recenter-deploy-fail", "precondition: position", false, "none");
@@ -567,7 +735,7 @@ const STEPS = {
 };
 
 (async () => {
-  const want = (process.argv[2] || "open,tpLowGas,fees,recenterBelow,takeProfit,jupiterFaults,jupiter429,topUp,recenterDeployRetry,recenterDeployFail,restartMidClose,stopOut").split(",");
+  const want = (process.argv[2] || "open,tpLowGas,fees,recenterBelow,takeProfit,restartAfterRecenter,restartAfterTP,deployUnknown,sweepDuringWithdraw,pausedWithPosition,jupiterFaults,jupiter429,topUp,recenterDeployRetry,recenterDeployFail,restartMidClose,stopOut").split(",");
   const srv = await stubs.start();
   await market.airdrop(whale.publicKey, 20000).catch(() => {});
   const c = await chain();

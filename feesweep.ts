@@ -354,3 +354,21 @@ function round6(n: number): number {
 function round9(n: number): number {
   return Number(n.toFixed(9));
 }
+
+/**
+ * H1: USDC the sweep may send = the wallet's USDC increase since before the claim, CAPPED at what the claim tx
+ * meta proves was claimed plus the actual Jupiter proceeds of the fee SOL. Anything else that landed in the
+ * window (an /emergency_exit or /withdraw_pct close, a deposit) is capital and stays. Without meta the
+ * wallet delta is used (the money lock already keeps other money actions out of the window).
+ */
+export function usdcSweepCapRaw(p: { walletDeltaRaw: bigint; claimedUsdcMetaRaw: bigint | null; swapProceedsRaw: bigint }): bigint {
+  const delta = p.walletDeltaRaw > 0n ? p.walletDeltaRaw : 0n;
+  if (p.claimedUsdcMetaRaw == null) return delta;
+  const cap = (p.claimedUsdcMetaRaw > 0n ? p.claimedUsdcMetaRaw : 0n) + (p.swapProceedsRaw > 0n ? p.swapProceedsRaw : 0n);
+  return delta < cap ? delta : cap;
+}
+
+/** Sweep alert lines: this run's amount and the cumulative total (the old line called this run's amount "total"). */
+export function sweepTotalsLine(thisRunUsd: number, cumulativeUsd: number): string {
+  return `• Swept this run: <b>$${thisRunUsd.toFixed(2)}</b> | cumulative to revenue: <b>$${cumulativeUsd.toFixed(2)}</b>`;
+}

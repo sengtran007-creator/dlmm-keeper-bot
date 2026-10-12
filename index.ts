@@ -67,6 +67,8 @@ import {
   parseSweepTx,
   resolveLanded,
   solSweepLamports,
+  usdcSweepCapRaw,
+  sweepTotalsLine,
 } from "./feesweep";
 import {
   TxSendError,
@@ -75,7 +77,20 @@ import {
   shortTxError,
 } from "./txretry";
 import { RpcCallCounter, attachRpcCounter, creditsPerDay } from "./rpccredits";
-import { equityFromSnapshot, idleUsdUpperBound, isDue } from "./tickstate";
+import { equityFromSnapshot, idleUsdUpperBound, isDue, positionSolUnitsFromAmounts } from "./tickstate";
+import { buildEntryMemo, findEntryMemos, resolveBootEntry, EntryLookup, EntryResolution, SigWithMemo, ENTRY_MEMO_TAG } from "./entrymemo";
+import { MoneyLock } from "./moneylock";
+import {
+  AlertGate,
+  gasBelowReserveAfterOpen,
+  unexplainedEquityJump,
+  creditSpike,
+  idleFundsAlert,
+  orphanPositions,
+  ledgerDrift,
+  bootJitterSec,
+} from "./invariants";
+import { unsupportedTxVersion, walletDeltasFromRawParsedTx } from "./txmeta";
 import { TickReader, TickSnapshot } from "./tickreader";
 import {
   BIN_ARRAY_RENT_LAMPORTS,
@@ -252,6 +267,32 @@ const SNAPSHOT_INTERVAL_SEC = Math.max(60, Number(process.env.SNAPSHOT_INTERVAL_
 // throttled down and retired, and returned 429 to every call from Oct 12 2026 5:33 AM PT.
 const JUPITER_API_BASE = normalizeJupiterBase(process.env.JUPITER_API_BASE);
 const JUPITER_API_KEY = process.env.JUPITER_API_KEY?.trim() || "";
+/** Telegram Bot API base (override only for the local rehearsal stub). */
+const TELEGRAM_API_BASE = (process.env.TELEGRAM_API_BASE?.trim() || "https://api.telegram.org").replace(/\/$/, "");
+/** 0x1774 fix: active-bin tolerance (percent) for the position create; 0.25% = 7 bins at 4 bps, 3 bins at 10 bps. */
+const DEPLOY_BIN_SLIPPAGE_PCT = Math.max(0.05, Number(process.env.DEPLOY_BIN_SLIPPAGE_PCT ?? 0.25));
+/** H2: write the entry memo after every open (default on). */
+const ENTRY_MEMO_ENABLED = !/^(0|false|no|off)$/i.test(process.env.ENTRY_MEMO_ENABLED ?? "");
+/** M5: max deterministic boot delay per instance (seconds). */
+const BOOT_JITTER_MAX_SEC = Math.max(0, Number(process.env.BOOT_JITTER_MAX_SEC ?? 20));
+/** Part 3 invariant alerts. */
+const ALERT_REPEAT_SEC = Math.max(300, Number(process.env.ALERT_REPEAT_SEC ?? 1800));
+const EQUITY_JUMP_MIN_USD = Math.max(1, Number(process.env.EQUITY_JUMP_MIN_USD ?? 5));
+const RPC_CREDIT_BUDGET_PER_HOUR = Math.max(50, Number(process.env.RPC_CREDIT_BUDGET_PER_HOUR ?? 500));
+const IDLE_ALERT_MIN_USD = Math.max(1, Number(process.env.IDLE_ALERT_MIN_USD ?? 25));
+const IDLE_ALERT_SEC = Math.max(300, Number(process.env.IDLE_ALERT_SEC ?? 1800));
+const LEDGER_DRIFT_CHECK_SEC = Math.max(0, Number(process.env.LEDGER_DRIFT_CHECK_SEC ?? 86400));
+/** Test hook (rehearsal only): "deploy-unknown" makes the first deploy send report an unknown outcome after it lands. */
+const REHEARSAL_FAULT = process.env.REHEARSAL_FAULT?.trim() || "";
+const faultFired = new Set<string>();
+const ENTRY_MEMO_RETRY_SEC = Math.max(30, Number(process.env.ENTRY_MEMO_RETRY_SEC ?? 300));
+/** Rehearsal-only fault hooks (comma list in REHEARSAL_FAULT; unset in production → always false). Each fires once. */
+function faultOnce(name: string): boolean {
+  if (!REHEARSAL_FAULT || !REHEARSAL_FAULT.split(",").map((x) => x.trim()).includes(name) || faultFired.has(name)) return false;
+  faultFired.add(name);
+  console.warn(`[REHEARSAL] fault injected: ${name}`);
+  return true;
+}
 const JUPITER_SLIPPAGE_BPS = Number(process.env.JUPITER_SLIPPAGE_BPS ?? 50);
 
 // ---- Claimed fee SOL handling (sweepRevenueToVault) ----
@@ -412,6 +453,23 @@ let isDeploying = false;
 let isBotPaused = false;
 /** Set by /withdraw_pct: liquidity was pulled into the wallet for an external transfer. /resume re-bases entry equity. */
 let partialWithdrawPending = false;
+/** H2: entry memos seen in the LP wallet's signature list (newest first), from the boot scan + this process. */
+let walletMemoSigs: SigWithMemo[] = [];
+let walletMemoScanError: string | null = "not scanned yet";
+/** H2: an entry memo that still has to be written (memo tx failed, or entry equity not known yet). */
+let entryMemoPending: { src: string; nextAt: number; attempts: number } | null = null;
+/** H1: one lock around every money-moving action. */
+const moneyLock = new MoneyLock();
+/** Part 3 invariant alerts. */
+const alertGate = new AlertGate();
+/** C2: a deploy whose outcome is unknown — its position key is watched for a late landing. */
+let deployOutcomeWatch: { key: PublicKey; minBinId: number; maxBinId: number; until: number; regime: MarketRegime } | null = null;
+/** Part 3: last time a money operation ran (equity-jump check skips reads that straddle one). */
+let lastMoneyOpAt = 0;
+let lastEqSample: { eq: number; spot: number; solUnits: number; at: number } | null = null;
+let idleSince: number | null = null;
+let lastLedgerDriftAt = Math.floor(Date.now() / 1000);
+let bootRpcCredits: number | null = null;
 /** USD moved out by /transfer_out: before this boot (chain, else TRANSFER_OUT_PRIOR_USD) + this process. */
 let priorTransferOutUsd = 0;
 let priorTransferOutSource = "none";
@@ -514,7 +572,7 @@ async function notify(rawMsg: string) {
   if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
 
   try {
-    await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    await axios.post(`${TELEGRAM_API_BASE}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       chat_id: TELEGRAM_CHAT_ID.trim(),
       text: msg,
       parse_mode: "HTML",
@@ -523,7 +581,7 @@ async function notify(rawMsg: string) {
   } catch (err: any) {
     try {
       const plainText = msg.replace(/<[^>]*>/g, "");
-      await axios.post(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      await axios.post(`${TELEGRAM_API_BASE}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
         chat_id: TELEGRAM_CHAT_ID.trim(),
         text: plainText,
         disable_web_page_preview: true,
@@ -715,6 +773,20 @@ async function fetchTxWalletDeltas(sig: string): Promise<TxWalletDeltas> {
       solEffectiveDelta: nativeLamportsDelta + wsolRawDelta,
     };
   } catch (err: any) {
+    const v = unsupportedTxVersion(err?.message);
+    if (v != null) {
+      // L2: newer tx version — read the raw jsonParsed meta at that version instead of falling back to estimates.
+      try {
+        const raw: any = await (connection as any)._rpcRequest("getTransaction", [
+          sig,
+          { commitment: "confirmed", encoding: "jsonParsed", maxSupportedTransactionVersion: v },
+        ]);
+        const d = walletDeltasFromRawParsedTx(raw?.result, wallet.publicKey.toBase58(), WSOL_MINT.toBase58(), USDC_MINT.toBase58());
+        if (d.ok) return d;
+      } catch (e2: any) {
+        console.warn("[TX META] raw v" + v + " read failed", sig.slice(0, 8), e2?.message || e2);
+      }
+    }
     console.warn("[TX META]", sig.slice(0, 8), err?.message || err);
     return empty;
   }
@@ -994,6 +1066,16 @@ async function probeEquity(dlmmPool: DLMM, spotUsd: number, expectedPosition: Pu
     return { ok: false, reason: `position read failed: ${err?.message || err}` };
   }
   if (!Array.isArray(userPositions)) return { ok: false, reason: "position read returned no list" };
+  // M2: refundable position-account rent counts toward equity (same basis as the tick snapshot).
+  const rentByKey = new Map<string, number>();
+  if (userPositions.length > 0) {
+    try {
+      const infos = await connection.getMultipleAccountsInfo(userPositions.map((p: any) => p.publicKey), "confirmed");
+      userPositions.forEach((p: any, i: number) => rentByKey.set(p.publicKey.toBase58(), infos?.[i]?.lamports ?? 0));
+    } catch (err: any) {
+      return { ok: false, reason: `position rent read failed: ${err?.message || err}` };
+    }
+  }
   let positionsUsd = 0;
   let activePositionUsd = 0;
   let activeFound = false;
@@ -1006,7 +1088,7 @@ async function probeEquity(dlmmPool: DLMM, spotUsd: number, expectedPosition: Pu
     if (!Number.isFinite(x) || !Number.isFinite(y)) {
       return { ok: false, reason: `position ${key.slice(0, 8)} amounts missing/non-finite (partial read)` };
     }
-    const v = getPositionInventoryUsd(pos, spotUsd);
+    const v = getPositionInventoryUsd(pos, spotUsd) + ((rentByKey.get(key) ?? 0) / 1e9) * spotUsd;
     if (!Number.isFinite(v) || v < 0) return { ok: false, reason: `position ${key.slice(0, 8)} value ${v} invalid` };
     positionsUsd += v;
     if (expectedPosition && pos.publicKey?.equals?.(expectedPosition)) {
@@ -1134,7 +1216,8 @@ function markStopsArmed() {
 async function checkStopBlindness() {
   const now = Math.floor(Date.now() / 1000);
   // A flat guard (SOL held while flat) counts as an armed stop: it is watched for blindness too.
-  if ((!activePositionPubkey && !flatGuard) || isBotPaused || isExiting || isLiquidating) return;
+  // M3: paused WITH a position is still watched (its price stop stays live); paused flat is not.
+  if ((!activePositionPubkey && !flatGuard) || (isBotPaused && !activePositionPubkey) || isExiting || isLiquidating) return;
   const priceBlind = now - lastPriceStopEvalAt;
   const equityBlind = entryEquityUsd > 0 || entryEquityPending ? now - lastEquityStopEvalAt : 0;
   const worst = Math.max(priceBlind, equityBlind);
@@ -1226,6 +1309,53 @@ function clearEntryState() {
  * @param fallbackEquityUsd used only if the MTM probe throws (previously the per-deploy
  *   baseline, i.e. the USD value just deposited — preserved so stop behavior is unchanged).
  */
+/**
+ * H2: persist the current entry (spot, equity, locked stop %) of the active position on chain as a memo-only tx
+ * from the LP wallet (~5000 lamports). Never blocks stops: a failure schedules a retry (5 min, ≤ 6 tries) and
+ * alerts once. Boot recovers it from the wallet's signature list (no getTransaction needed).
+ */
+async function writeEntryMemo(src: string): Promise<boolean> {
+  if (!ENTRY_MEMO_ENABLED || !activePositionPubkey) return false;
+  const now = Math.floor(Date.now() / 1000);
+  if (!(entrySpotUsd > 0) || !(entryEquityUsd > 0) || entryEquityPending || !entryStopLock) {
+    entryMemoPending = { src, nextAt: now + 60, attempts: entryMemoPending?.attempts ?? 0 };
+    return false;
+  }
+  const memoText = buildEntryMemo({
+    pos: activePositionPubkey.toBase58(),
+    spot: entrySpotUsd,
+    eq: entryEquityUsd,
+    stopPct: entryStopLock.stopPct,
+    regime: String(entryStopLock.regime ?? ""),
+    cooldownSec: Number(entryStopLock.cooldownSec ?? 0),
+    src,
+  });
+  try {
+    if (!(await ensureTxFeeFloor("entry memo"))) throw new Error("native SOL below fee floor");
+    if (faultOnce("memo-fail")) throw new Error("REHEARSAL fault: memo tx failed");
+    const tx = new Transaction().add(
+      new TransactionInstruction({ programId: new PublicKey(MEMO_PROGRAM_ID), keys: [], data: Buffer.from(memoText, "utf8") })
+    );
+    const sig = await sendTx(tx, [wallet], "entry memo");
+    walletMemoSigs.unshift({ signature: sig, memo: memoText, err: null, blockTime: now });
+    entryMemoPending = null;
+    console.log(`[ENTRY] memo written (${src}) tx ${sig}: ${memoText}`);
+    return true;
+  } catch (err: any) {
+    const attempts = (entryMemoPending?.attempts ?? 0) + 1;
+    entryMemoPending = attempts < 6 ? { src, nextAt: now + ENTRY_MEMO_RETRY_SEC, attempts } : null;
+    const msg = redactSecrets(shortTxError(err, 160));
+    console.warn(`[ENTRY] memo write failed (${src}, attempt ${attempts}): ${msg}`);
+    if (attempts === 1 || !entryMemoPending) {
+      await notify(
+        `⚠️ <b>[ENTRY NOT PERSISTED]</b> Entry memo for <code>${activePositionPubkey.toBase58()}</code> failed (${escapeHtml(msg)}). ` +
+          (entryMemoPending ? `Retrying in ${Math.round(ENTRY_MEMO_RETRY_SEC / 60)} min.` : "Gave up — set ENTRY_* pins before the next restart.")
+      );
+    }
+    return false;
+  }
+}
+
 async function recordEntryAfterOpen(
   dlmmPool: DLMM,
   spotUsd: number,
@@ -2196,7 +2326,7 @@ async function sendSolToRevenue(
 async function sweepClaimedFeeSol(
   claimedSolLamports: number,
   spotUsd: number
-): Promise<{ mode: "swap" | "transfer" | "kept" | "none"; solUsd: number; line: string }> {
+): Promise<{ mode: "swap" | "transfer" | "kept" | "none"; solUsd: number; line: string; usdcOutRaw?: number }> {
   const solUi = (claimedSolLamports / 1e9).toFixed(6);
   let swapNote = "";
   const native = await connection.getBalance(wallet.publicKey, "confirmed");
@@ -2211,6 +2341,7 @@ async function sweepClaimedFeeSol(
         return {
           mode: "swap",
           solUsd: 0, // proceeds are swept with the USDC leg
+          usdcOutRaw: Math.floor(r.outAmountActual ?? r.outAmountQuoted),
           line: `• SOL: ${(r.inAmount / 1e9).toFixed(6)} SOL swapped → ${outUsdc.toFixed(6)} USDC (in the USDC sweep above; tx <code>${r.sig}</code>)`,
         };
       }
@@ -2255,6 +2386,10 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
 
     const preClaim = await snapshotWalletBalances();
     let usdcBefore = BigInt(preClaim.usdcRaw);
+    if (faultOnce("slow-sweep")) {
+      console.warn("[REHEARSAL] slow sweep holding 40s after the pre-claim snapshot");
+      await sleepMs(40_000);
+    }
 
     const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
     const targetPos = userPositions.find((p: any) => p.publicKey.equals(activePositionPubkey!));
@@ -2305,6 +2440,7 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
     let claimedUsdcRaw = 0;
     let claimFeeLamports = 0;
     let claimActual = false;
+    let claimMetaSigs = 0;
     for (const sig of claimSigs) {
       const d = await fetchTxWalletDeltas(sig);
       if (d.ok) {
@@ -2313,8 +2449,11 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
         claimedUsdcRaw += Math.max(0, d.usdcRawDelta);
         claimFeeLamports += d.feeLamports ?? 0;
         claimActual = true;
+        claimMetaSigs += 1;
       }
     }
+    // H1: claimed USDC from tx meta only (null when any claim tx had no meta) — caps the USDC sweep below.
+    const claimedUsdcMetaRaw: bigint | null = claimSigs.length > 0 && claimMetaSigs === claimSigs.length ? BigInt(claimedUsdcRaw) : null;
     if (!claimActual) {
       claimedSolLamports = Math.max(0, postClaim.solEffectiveLamports - preClaim.solEffectiveLamports);
       claimedUsdcRaw = Math.max(0, postClaim.usdcRaw - preClaim.usdcRaw);
@@ -2365,7 +2504,20 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
     let usdcSweptUsd = 0;
     let usdcSweepSig = "";
     const finalUsdcAcc = await getAccount(connection, botUsdcAta);
-    const freshlyClaimedUsdc = finalUsdcAcc.amount > usdcBefore ? (finalUsdcAcc.amount - usdcBefore) : 0n;
+    const walletUsdcDelta = finalUsdcAcc.amount > usdcBefore ? (finalUsdcAcc.amount - usdcBefore) : 0n;
+    // H1: never more than what this sweep itself claimed (+ the fee-SOL swap proceeds) — USDC that arrived
+    // from a withdrawal / emergency close in the same window is capital and stays in the wallet.
+    const freshlyClaimedUsdc = usdcSweepCapRaw({
+      walletDeltaRaw: walletUsdcDelta,
+      claimedUsdcMetaRaw,
+      swapProceedsRaw: BigInt(solLeg.mode === "swap" ? solLeg.usdcOutRaw ?? 0 : 0),
+    });
+    if (freshlyClaimedUsdc < walletUsdcDelta) {
+      console.warn(
+        `[SWEEP] USDC sweep capped at ${(Number(freshlyClaimedUsdc) / 1e6).toFixed(6)} (wallet rose ${(Number(walletUsdcDelta) / 1e6).toFixed(6)}; ` +
+          `the excess is not fees and stays)`
+      );
+    }
 
     if (freshlyClaimedUsdc >= 50_000n) {
       const sweepTx = new Transaction().add(
@@ -2416,7 +2568,7 @@ async function sweepRevenueToVault(dlmmPool: DLMM): Promise<number> {
           : `• USDC → revenue: nothing swept (below $0.05 or no new USDC)`,
       ];
       if (solLeg.line) lines.push(solLeg.line);
-      lines.push(`• Total swept to revenue now: <b>$${totalSweptUsd.toFixed(2)}</b>`);
+      lines.push(sweepTotalsLine(totalSweptUsd, sweptForPnlUsd()));
       lines.push(`• Destination: <code>${LP_REVENUE_VAULT.toBase58()}</code>`);
       await notify(lines.join("\n"));
     }
@@ -2454,6 +2606,8 @@ async function isPositionAccountClosed(key: PublicKey): Promise<boolean> {
 
 const BENIGN_CLOSE_RACE_RE = /AccountOwnedByWrongProgram|3007|0xbbf|already been closed/i;
 
+let lastCloseFees: { x: number; y: number } | null = null;
+
 async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResult> {
   const empty: CloseReclaimResult = {
     ok: false, remaining: [], sigs: [], solReceivedLamports: 0, usdcReceivedRaw: 0, feeLamports: 0, isEstimate: true, attempts: 0, lastError: "",
@@ -2469,6 +2623,10 @@ async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResu
     let lastError = "";
     let lowGas = false;
     let firstFloorCheck = true;
+    // L3: unclaimed fees still in the position when it is closed (accrued after the pre-close claim) — the
+    // close pays them out; booked as FEE_CLAIM below so they are not counted as capital.
+    let residualFeeXLamports = 0;
+    let residualFeeYRaw = 0;
 
     for (const pos of userPositions) {
       if (lowGas) break;
@@ -2488,6 +2646,7 @@ async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResu
               `(${redactSecrets(shortTxError(error))}) — re-reading chain and retrying in ${(delayMs / 1000).toFixed(1)}s`
           ),
         attempt: async (n) => {
+          lastCloseFees = null;
           // The pre-snapshot just read native SOL; reuse it for the first floor check (one fewer RPC read).
           const floorOk = firstFloorCheck && pre.nativeLamports >= TX_FEE_FLOOR_LAMPORTS ? true : await ensureTxFeeFloor("close");
           firstFloorCheck = false;
@@ -2496,6 +2655,10 @@ async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResu
             throw new Error("insufficient funds: native SOL below TX_FEE_FLOOR_LAMPORTS"); // non-retryable
           }
           const p = n === 1 ? pos : await dlmmPool.getPosition(pos.publicKey);
+          lastCloseFees = {
+            x: Number(p.positionData?.feeX?.toString?.() ?? 0) || 0,
+            y: Number(p.positionData?.feeY?.toString?.() ?? 0) || 0,
+          };
           // closePosition (closePosition2) only closes an EMPTY position — on a funded one it fails with
           // NonEmptyPosition (6030). Withdraw 100% + claim fees + close in one SDK call when it holds liquidity.
           const closeTx = positionHasLiquidity(p.positionData)
@@ -2542,6 +2705,10 @@ async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResu
       } else if (outcome.attempts > 1) {
         console.warn(`[CLOSE] ${pos.publicKey.toBase58().slice(0, 8)}… closed on attempt ${outcome.attempts}`);
       }
+      if (outcome.status === "ok" && lastCloseFees) {
+        residualFeeXLamports += lastCloseFees.x;
+        residualFeeYRaw += lastCloseFees.y;
+      }
     }
 
     // Ledger CLOSE only for txs that actually landed — failed attempts produce no (misleading) CLOSE row.
@@ -2576,6 +2743,27 @@ async function closePositionAndReclaim(dlmmPool: DLMM): Promise<CloseReclaimResu
         swap_out_amount: usdcReceived / 1e6,
         swap_direction: "CLOSE→wallet",
       });
+      if (residualFeeXLamports > 0 || residualFeeYRaw > 0) {
+        let spot = NaN;
+        try {
+          spot = Number((await dlmmPool.getActiveBin()).price) * PRICE_DECIMAL_FACTOR;
+        } catch {}
+        if (!isValidSpot(spot)) spot = lastGoodSpotUsd;
+        const f = feeClaimLedgerFields(residualFeeYRaw, residualFeeXLamports, spot);
+        cumulativeFeesUsd += f.fees_claimed_usd;
+        void emitLedger({
+          event: "FEE_CLAIM",
+          spot_usd: isValidSpot(spot) ? spot : undefined,
+          fees_claimed_usd: f.fees_claimed_usd,
+          cumulative_fees_usd: cumulativeFeesUsd,
+          fees_sol: f.fees_sol,
+          fees_usdc: f.fees_usdc,
+          fees_sol_usd: f.fees_sol_usd,
+          tx_sig: sigs.join(","),
+          notes: `Residual fees paid out by the close (accrued after the last claim; kept in the LP wallet). ${f.notes}`,
+          is_estimate: true,
+        });
+      }
     }
 
     // Verify on chain: anything still open means the close did NOT happen (callers must not redeploy
@@ -2650,6 +2838,138 @@ async function reattachAfterFailedClose(dlmmPool: DLMM, close: CloseReclaimResul
   belowRangeTickCount = 0;
   markStopsArmed();
   console.warn(`[CLOSE] Re-attached to still-open position ${key.toBase58()}`);
+}
+
+/**
+ * C2: take over a live position of this wallet that the bot is not tracking (deploy whose outcome was unknown,
+ * or found by discovery while flat). Sets the range from chain, arms stops, keeps any existing entry (recenter)
+ * or records a fresh one, clears the owed redeploy, and persists the entry memo.
+ */
+async function adoptPosition(dlmmPool: DLMM, key: PublicKey, why: string): Promise<boolean> {
+  try {
+    await dlmmPool.refetchStates();
+    const activeBin = await dlmmPool.getActiveBin();
+    const spot = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
+    const pos = await dlmmPool.getPosition(key);
+    if (!isValidSpot(spot) || !pos?.positionData) throw new Error("position/spot read failed");
+    activePositionPubkey = key;
+    lowestBinPrice = calculateBinPriceUsd(spot, activeBin.binId, pos.positionData.lowerBinId, poolBinStep);
+    highestBinPrice = calculateBinPriceUsd(spot, activeBin.binId, pos.positionData.upperBinId, poolBinStep);
+    belowRangeTickCount = 0;
+    markStopsArmed();
+    redeployPending = null;
+    disarmFlatGuard();
+    deployOutcomeWatch = null;
+    positionDiscoveryForced = true;
+    if (entrySpotUsd > 0) {
+      console.log(`[ADOPT] keeping entry spot=$${entrySpotUsd.toFixed(2)} equity=$${entryEquityUsd.toFixed(2)}`);
+    } else {
+      const config = await macroSentinel.evaluateRegime(SOL_USDC_POOL.toBase58());
+      await recordEntryAfterOpen(dlmmPool, spot, `adopt (${why})`, 0, config.regime);
+    }
+    if (!entryStopLock) entryStopLock = resolveAttachStopLock("", false).lock;
+    console.warn(`[ADOPT] Adopted position ${key.toBase58()} (${why}) range $${lowestBinPrice.toFixed(2)}–$${highestBinPrice.toFixed(2)}`);
+    await notify(
+      `🧭 <b>[POSITION ADOPTED]</b> <code>${key.toBase58()}</code> (${escapeHtml(why)}). ` +
+        `Range $${lowestBinPrice.toFixed(2)} ➔ $${highestBinPrice.toFixed(2)}, stops armed (${stopLockLabel()}).`
+    );
+    await writeEntryMemo("adopt");
+    return true;
+  } catch (err: any) {
+    console.warn(`[ADOPT] failed for ${key.toBase58()}: ${redactSecrets(String(err?.message || err)).slice(0, 160)}`);
+    return false;
+  }
+}
+
+/** M3: price stop while paused with a position (re-alerts every 30 min). A hit runs the full emergency exit. */
+async function pausedPositionGuard(spotUsd: number, now: number): Promise<void> {
+  lastPriceStopEvalAt = now;
+  lastEquityStopEvalAt = now; // equity stop intentionally suspended while paused (not "blind")
+  const priceStop = priceStopFromEntry();
+  if (alertGate.shouldFire("paused-with-position", now, 1800)) {
+    await notify(
+      `⏸️ <b>[PAUSED WITH POSITION]</b> <code>${activePositionPubkey!.toBase58()}</code> is still open. ` +
+        (entrySpotUsd > 0 && priceStop > 0
+          ? `Price stop $${priceStop.toFixed(2)} stays ACTIVE (spot $${spotUsd.toFixed(2)}); equity stop suspended until /resume.`
+          : `No entry recorded — no price stop available. /resume or /emergency_exit.`)
+    );
+  }
+  if (entrySpotUsd > 0 && priceStop > 0 && isValidSpot(spotUsd) && spotUsd <= priceStop && !isExiting && !isLiquidating) {
+    await notify(`🛑 <b>[STOP WHILE PAUSED]</b> Spot $${spotUsd.toFixed(2)} ≤ price stop $${priceStop.toFixed(2)} — running full exit.`);
+    await executeFullEmergencyExit(dlmmPoolInstance!);
+    alertGate.clear("paused-with-position");
+  }
+}
+
+/** Part 3: alert-only invariant checks on the tick snapshot (never move money). */
+async function runTickInvariants(snap: TickSnapshot, spotUsd: number, now: number, walletMutated: boolean): Promise<void> {
+  // Orphan: live positions of this wallet the bot does not manage while it HAS a position.
+  if (activePositionPubkey) {
+    const orphans = orphanPositions(discoveredPositionKeys.map((k) => k.toBase58()), activePositionPubkey.toBase58());
+    if (orphans.length > 0 && alertGate.shouldFire("orphan", now, ALERT_REPEAT_SEC)) {
+      await notify(`🚨 <b>[ORPHAN POSITION]</b> ${orphans.length} unmanaged position(s) of this wallet: ${orphans.map((k) => `<code>${k}</code>`).join(", ")} (counted in equity, not managed).`);
+    }
+    if (orphans.length === 0) alertGate.clear("orphan");
+  }
+  // Unexplained equity jump between consecutive good reads with no money action in between.
+  const se = snapshotEquity(snap, activePositionPubkey, spotUsd);
+  if (se.ok && se.totalUsd != null) {
+    const solUnits = (snap.nativeLamports + Number(snap.wsolRaw ?? 0)) / 1e9 + positionSolUnitsFromAmounts(snap.amounts);
+    const quiet = !walletMutated && now - lastMoneyOpAt > 120 && !isDeploying && !isExiting && !isLiquidating;
+    if (lastEqSample && quiet && now - lastEqSample.at <= 120) {
+      const j = unexplainedEquityJump({
+        prevEquityUsd: lastEqSample.eq, prevSpotUsd: lastEqSample.spot, equityUsd: se.totalUsd, spotUsd,
+        solUnits: lastEqSample.solUnits, minUsd: EQUITY_JUMP_MIN_USD,
+      });
+      if (j.jump && alertGate.shouldFire("equity-jump", now, ALERT_REPEAT_SEC)) {
+        await notify(
+          `⚠️ <b>[UNEXPLAINED EQUITY CHANGE]</b> $${lastEqSample.eq.toFixed(2)} → $${se.totalUsd.toFixed(2)} in ${now - lastEqSample.at}s ` +
+            `with no bot money action (residual ${fmtSignedUsd(j.residualUsd)} vs tolerance $${j.tolUsd.toFixed(2)}). Check the wallet.`
+        );
+      }
+    }
+    lastEqSample = { eq: se.totalUsd, spot: spotUsd, solUnits, at: now };
+  }
+  // Idle funds: above-reserve capital sitting in the wallet too long.
+  const idleUsd = idleUsdUpperBound(spotUsd, snap.nativeLamports, snap.wsolRaw, snap.usdcRaw, GAS_RESERVE_LAMPORTS);
+  if (idleUsd >= IDLE_ALERT_MIN_USD) {
+    if (idleSince == null) idleSince = now;
+  } else {
+    idleSince = null;
+    alertGate.clear("idle");
+  }
+  if (idleFundsAlert({ idleUsd, idleSinceSec: idleSince, nowSec: now, minUsd: IDLE_ALERT_MIN_USD, maxIdleSec: IDLE_ALERT_SEC }) &&
+      alertGate.shouldFire("idle", now, ALERT_REPEAT_SEC * 4)) {
+    await notify(
+      `ℹ️ <b>[IDLE FUNDS]</b> ~$${idleUsd.toFixed(2)} above the gas reserve has sat in the LP wallet since ${formatUnixPt(idleSince!)} ` +
+        (activePositionPubkey ? "(not topped up)." : "(flat — waiting for re-entry gates).")
+    );
+  }
+}
+
+/** Part 3: daily on-chain rescan of sweeps vs the in-memory total (skipped if a sweep ran during the scan). */
+async function checkLedgerDrift(): Promise<void> {
+  const before = cumulativeSweptUsd;
+  const h = await scanSweepHistoryOnChain();
+  lastLedgerDriftAt = Math.floor(Date.now() / 1000);
+  if (!h.ok || !h.complete || cumulativeSweptUsd !== before) return;
+  const d = ledgerDrift(priorSweptUsd + cumulativeSweptUsd, h.totalSweptUsd);
+  console.log(`[LEDGER] drift check: on-chain swept $${h.totalSweptUsd.toFixed(2)} vs in-memory $${(priorSweptUsd + cumulativeSweptUsd).toFixed(2)} (diff ${d.diffUsd})`);
+  if (d.drift) {
+    await notify(
+      `⚠️ <b>[LEDGER DRIFT]</b> On-chain swept total $${h.totalSweptUsd.toFixed(2)} vs bot's $${(priorSweptUsd + cumulativeSweptUsd).toFixed(2)} ` +
+        `(diff ${fmtSignedUsd(d.diffUsd)}). The next restart re-reads from chain.`
+    );
+  }
+}
+
+/** C2: the wallet's live positions in this pool straight from chain (throws on RPC failure). */
+async function livePositionKeys(): Promise<PublicKey[]> {
+  const keys = await discoverPositionKeys();
+  const out: PublicKey[] = [];
+  const infos = keys.length ? await connection.getMultipleAccountsInfo(keys, "confirmed") : [];
+  keys.forEach((k, i) => { if (infos[i]) out.push(k); });
+  return out;
 }
 
 // ==================== IDLE TOP-UP INTO EXISTING POSITION ====================
@@ -2880,9 +3200,29 @@ async function estimateOpenCost(
 
 async function deployAsymmetricPosition(dlmmPool: DLMM) {
   if (isDeploying || isBotPaused || isExiting || isLiquidating) return;
+  if (activePositionPubkey) return; // C2: never open a second position
   isDeploying = true;
+  let newPositionKeypair: Keypair | null = null;
+  let deployRange: { minBinId: number; maxBinId: number; regime: MarketRegime } | null = null;
 
   try {
+    // C2: reconcile on chain before opening — an earlier deploy may have landed after we gave up on it.
+    {
+      let live: PublicKey[];
+      try {
+        live = await livePositionKeys();
+      } catch (err: any) {
+        throw new Error(`pre-deploy position check failed (${redactSecrets(String(err?.message || err)).slice(0, 80)}) — not deploying blind`);
+      }
+      if (live.length > 0) {
+        isDeploying = false;
+        await adoptPosition(dlmmPool, live[0], "found live before deploy");
+        if (live.length > 1) {
+          await notify(`🚨 <b>[ORPHAN POSITION]</b> ${live.length} live positions for this wallet; managing <code>${live[0].toBase58()}</code> only.`);
+        }
+        return;
+      }
+    }
     await dlmmPool.refetchStates();
     const activeBin = await dlmmPool.getActiveBin();
     const spotPriceUsd = Number(activeBin.price) * PRICE_DECIMAL_FACTOR;
@@ -2984,7 +3324,8 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
       throw new Error("No SOL above gas reserve + open cost available for ask inventory");
     }
 
-    const newPositionKeypair = Keypair.generate();
+    newPositionKeypair = Keypair.generate();
+    const posKp = newPositionKeypair;
 
     const postSwapUsdcAcc = await getAccount(connection, botUsdcAta);
     const availableUsdcUnits = Number(postSwapUsdcAcc.amount) / 1e6;
@@ -2999,26 +3340,41 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
       throw new Error("Abort deploy — exit/pause lock set mid-flight");
     }
 
+    // 0x1774 (ExceededBinSlippageTolerance): the active bin read before the rebalance swap can be stale by the
+    // time the create lands (our own swap moves it). Re-read it and centre the range on the live bin, and give
+    // the SDK an explicit active-bin tolerance instead of its 3-bin default.
+    await dlmmPool.refetchStates();
+    const deployBin = await dlmmPool.getActiveBin();
+    const shift = Number(deployBin.binId) - activeBinIdNum;
+    const dMin = minBinId + shift;
+    const dMax = maxBinId + shift;
+    if (shift !== 0) console.log(`[DEPLOY] active bin moved ${shift} bin(s) since the pre-swap read — range re-centred`);
+    deployRange = { minBinId: dMin, maxBinId: dMax, regime: config.regime };
+
     const preDeploy = await snapshotWalletBalances();
     const deploySigs: string[] = [];
     const createPositionTx = await (dlmmPool as any).initializePositionAndAddLiquidityByStrategy({
-      positionPubKey: newPositionKeypair.publicKey,
+      positionPubKey: posKp.publicKey,
       user: wallet.publicKey,
       totalXAmount: new BN(usableSolLamports),
       totalYAmount: new BN(usableUsdcRaw),
       strategy: {
-        maxBinId,
-        minBinId,
+        maxBinId: dMax,
+        minBinId: dMin,
         strategyType: StrategyType.Spot,
       },
+      slippage: DEPLOY_BIN_SLIPPAGE_PCT,
     });
 
     if (Array.isArray(createPositionTx)) {
       for (const tx of createPositionTx) {
-        deploySigs.push(await sendTx(tx, [wallet, newPositionKeypair], "deploy"));
+        deploySigs.push(await sendTx(tx, [wallet, posKp], "deploy"));
       }
     } else {
-      deploySigs.push(await sendTx(createPositionTx, [wallet, newPositionKeypair], "deploy"));
+      deploySigs.push(await sendTx(createPositionTx, [wallet, posKp], "deploy"));
+    }
+    if (faultOnce("deploy-unknown")) {
+      throw new Error("REHEARSAL fault: deploy confirmation timed out (outcome unknown)");
     }
     const postDeploy = await snapshotWalletBalances();
 
@@ -3058,7 +3414,7 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     {
       let posRent = openCost.positionRentLamports;
       try {
-        const b = await connection.getBalance(newPositionKeypair.publicKey);
+        const b = await connection.getBalance(posKp.publicKey);
         if (b > 0) posRent = b;
       } catch {}
       const rentPaid = posRent + Math.max(0, openCost.lamports - openCost.positionRentLamports);
@@ -3074,9 +3430,14 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
       );
     }
 
-    activePositionPubkey = newPositionKeypair.publicKey;
-    lowestBinPrice = calculateBinPriceUsd(spotPriceUsd, activeBin.binId, minBinId, poolBinStep);
-    highestBinPrice = calculateBinPriceUsd(spotPriceUsd, activeBin.binId, maxBinId, poolBinStep);
+    activePositionPubkey = posKp.publicKey;
+    deployOutcomeWatch = null;
+    {
+      const liveSpot = Number(deployBin.price) * PRICE_DECIMAL_FACTOR;
+      const s0 = isValidSpot(liveSpot) ? liveSpot : spotPriceUsd;
+      lowestBinPrice = calculateBinPriceUsd(s0, deployBin.binId, dMin, poolBinStep);
+      highestBinPrice = calculateBinPriceUsd(s0, deployBin.binId, dMax, poolBinStep);
+    }
     belowRangeTickCount = 0;
     markStopsArmed();
     if (redeployPending || flatGuard) {
@@ -3093,13 +3454,25 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     const deployedValueUsd = Number(
       ((depositedSol > 0 || depositedUsdc > 0) ? deployedSolValueUsd + deployedUsdcValueUsd : intendedDeployUsd).toFixed(2)
     );
-    if (entrySpotUsd > 0) {
+    const keptEntry = entrySpotUsd > 0;
+    if (keptEntry) {
       console.log(`[ENTRY] Recenter deploy: keeping original entry spot=$${entrySpotUsd.toFixed(2)} equity=$${entryEquityUsd.toFixed(2)}`);
     } else {
       await recordEntryAfterOpen(dlmmPool, spotPriceUsd, "deploy", deployedValueUsd, config.regime);
     }
     if (!entryStopLock) entryStopLock = resolveAttachStopLock("", false).lock; // defensive: never run unlocked
     logEntryPinHint();
+    // H2: persist the entry for this position on chain (recenter memos carry the ORIGINAL entry).
+    await writeEntryMemo(keptEntry ? "recenter" : "deploy");
+    // Part 3: gas must still cover the reserve after an open.
+    {
+      const gasLamports = postDeploy.nativeLamports;
+      if (gasBelowReserveAfterOpen(gasLamports, GAS_RESERVE_LAMPORTS) && alertGate.shouldFire("gas-after-open", Math.floor(Date.now() / 1000), ALERT_REPEAT_SEC)) {
+        await notify(
+          `⚠️ <b>[GAS BELOW RESERVE]</b> native SOL ${(gasLamports / 1e9).toFixed(4)} < reserve ${(GAS_RESERVE_LAMPORTS / 1e9).toFixed(4)} right after the open.`
+        );
+      }
+    }
     let postDeployEquityUsd: number | null = null;
     try {
       postDeployEquityUsd = await getMarkToMarketEquityUsd(dlmmPool, spotPriceUsd);
@@ -3132,6 +3505,25 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
   } catch (err: any) {
     const msg = err?.message || String(err);
     console.error("Deployment failed:", msg);
+    // C2: the create may have landed even though we saw an error (timeout / blockhash expiry / RPC drop).
+    // Check the new position account before any retry; adopt it if it exists, else watch it for ~180 s
+    // so a late landing is adopted instead of opening a second position.
+    if (newPositionKeypair && !activePositionPubkey) {
+      const key = newPositionKeypair.publicKey;
+      let exists = false;
+      try {
+        exists = (await connection.getAccountInfo(key, "confirmed")) != null;
+      } catch {}
+      if (exists) {
+        isDeploying = false;
+        await adoptPosition(dlmmPool, key, `deploy reported "${msg.slice(0, 60)}" but landed`);
+        void emitLedger({ event: "ERROR", notes: `Deploy outcome unknown (${msg}); position ${key.toBase58()} found on chain and adopted`, is_estimate: true });
+        return;
+      }
+      if (deployRange) {
+        deployOutcomeWatch = { key, ...deployRange, until: Math.floor(Date.now() / 1000) + 180 };
+      }
+    }
     const abortedForExit = /Abort deploy — exit\/pause lock/i.test(msg);
     if (!abortedForExit && redeployPending) {
       // C1: a redeploy owed after a close is retried on a bounded backoff (no 600 s cooldown, no Gate 3);
@@ -3280,6 +3672,9 @@ async function initTransferOutHistory(): Promise<void> {
           break;
         }
         if (signatureHasTransferOutMemo(x)) hits.push(x.signature);
+        if (typeof (x as any).memo === "string" && (x as any).memo.includes(ENTRY_MEMO_TAG)) {
+          walletMemoSigs.push({ signature: x.signature, memo: (x as any).memo, err: x.err, blockTime: x.blockTime ?? null });
+        }
       }
       if (reachedEpoch || page.length < limit) {
         h.complete = true;
@@ -3295,11 +3690,13 @@ async function initTransferOutHistory(): Promise<void> {
       }
     }
     h.ok = true;
+    walletMemoScanError = null;
   })();
   try {
     await Promise.race([work, new Promise((_, rej) => setTimeout(() => rej(new Error("timeout 45s")), 45_000))]);
   } catch (err: any) {
     h.ok = false;
+    walletMemoScanError = redactSecrets(String(err?.message || err)).slice(0, 120);
     console.warn(`[TRANSFER_OUT] history scan failed: ${redactSecrets(String(err?.message || err))}`);
   }
   transferOutHistory = h;
@@ -3533,7 +3930,7 @@ async function executeFullEmergencyExit(dlmmPool: DLMM) {
   }
 
   const solBal = await connection.getBalance(wallet.publicKey);
-  const dumpSolLamports = Math.floor(solBal - GAS_RESERVE_LAMPORTS);
+  const dumpSolLamports = Math.floor(solBal - GAS_RESERVE_LAMPORTS - FEE_SOL_SWEEP_MARGIN_LAMPORTS); // L1: + swap-gate margin
   let swapSig = "";
 
   if (dumpSolLamports > 0.05 * 1e9) {
@@ -3608,7 +4005,7 @@ async function listenTelegramCommands() {
 
   while (true) {
     try {
-      const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${offset}&timeout=15`;
+      const url = `${TELEGRAM_API_BASE}/bot${TELEGRAM_BOT_TOKEN}/getUpdates?offset=${offset}&timeout=15`;
       const response = await axios.get(url, { timeout: 20000 });
       const updates = response.data?.result || [];
 
@@ -3675,14 +4072,19 @@ async function listenTelegramCommands() {
         } else if (text.startsWith("/transfer_out")) {
           await handleTransferOutRequest(String(msg.text), incomingChatId, String(msg.from?.id ?? ""));
         } else if (text.startsWith("/confirm")) {
-          await handleTransferOutConfirm(String(msg.text), incomingChatId, String(msg.from?.id ?? ""));
+          await moneyLock.run("/confirm transfer_out", () => handleTransferOutConfirm(String(msg.text), incomingChatId, String(msg.from?.id ?? "")));
+          lastMoneyOpAt = Math.floor(Date.now() / 1000);
         } else if (text === "/cancel") {
           await notify(transferConfirmations.cancel() ? "❎ Pending /transfer_out cancelled." : "Nothing pending.");
         } else if (text.startsWith("/withdraw_pct")) {
           const pct = Number(text.split(/\s+/)[1]);
-          if (dlmmPoolInstance) await withdrawPartial(dlmmPoolInstance, pct);
+          if (dlmmPoolInstance) await moneyLock.run("/withdraw_pct", () => withdrawPartial(dlmmPoolInstance!, pct));
+          lastMoneyOpAt = Math.floor(Date.now() / 1000);
         } else if (text === "/emergency_exit") {
-          if (dlmmPoolInstance) await executeFullEmergencyExit(dlmmPoolInstance);
+          // Pause first so no new tick work starts, then take the money lock (waits for an in-flight tick).
+          isBotPaused = true;
+          if (dlmmPoolInstance) await moneyLock.run("/emergency_exit", () => executeFullEmergencyExit(dlmmPoolInstance!));
+          lastMoneyOpAt = Math.floor(Date.now() / 1000);
         } else if (text === "/pause") {
           isBotPaused = true;
           await notify("⏸️ <b>[PAUSED]</b> Deployments frozen. Standing by in current state.");
@@ -3711,13 +4113,14 @@ async function listenTelegramCommands() {
                   : `Funds moved out by hand: set NET_DEPOSITS_USD for the amount and update/remove ENTRY_EQUITY_USD before the next restart.`)
             );
             logEntryPinHint();
+            await moneyLock.run("/resume entry memo", () => writeEntryMemo("resume"));
           }
           isBotPaused = false;
           inCooldownUntil = 0;
           markStopsArmed(); // don't fire a "stops blind" alert for the paused period
           await notify("▶️ <b>[RESUMED]</b> Keeper active. Re-centering liquidity grid...");
           if (dlmmPoolInstance && !activePositionPubkey) {
-            await deployAsymmetricPosition(dlmmPoolInstance);
+            await moneyLock.run("/resume deploy", () => deployAsymmetricPosition(dlmmPoolInstance!));
           }
         } else if (text === "/balance" || text === "balance" || text === "bal") {
           const rawSolBal = await connection.getBalance(wallet.publicKey);
@@ -3864,7 +4267,8 @@ async function listenTelegramCommands() {
             continue;
           }
           await notify("⏳ Checking and sweeping fees to LP Revenue...");
-          const sweptAmount = await sweepRevenueToVault(dlmmPoolInstance);
+          const sweptAmount = await moneyLock.run("/harvest", () => sweepRevenueToVault(dlmmPoolInstance!));
+          lastMoneyOpAt = Math.floor(Date.now() / 1000);
           if (sweptAmount > 0) {
             await notify(`✅ Sweep complete: $${sweptAmount.toFixed(2)} sent to LP Revenue (USDC + any native fee SOL).`);
           } else {
@@ -3903,7 +4307,7 @@ async function runCatchupSolSweep(attempt = 1): Promise<void> {
       return;
     }
     console.warn(`[CATCHUP] deferred (${why}); retry in 5 min`);
-    setTimeout(() => void runCatchupSolSweep(attempt + 1), 5 * 60 * 1000);
+    setTimeout(() => void moneyLock.run("catch-up SOL sweep", () => runCatchupSolSweep(attempt + 1)), 5 * 60 * 1000);
   };
   if (isExiting || isDeploying || isLiquidating || solTransferInFlight || !dlmmPoolInstance) {
     retryLater("bot busy (exit/deploy/transfer in progress)");
@@ -4047,10 +4451,23 @@ function logRpcUsage(now: number): void {
   if (!(RPC_CREDIT_LOG_SEC > 0) || now - lastRpcLogAt < RPC_CREDIT_LOG_SEC) return;
   const span = Math.max(1, now - lastRpcLogAt);
   const credits = rpcCounter.totalCredits();
+  // The first window after boot includes the one-off boot scans (sweep + transfer-out history): label them
+  // separately so the /day extrapolation is not read as steady state (the 4bps "24k/day" was this artifact).
+  const firstWindow = bootRpcCredits != null;
+  const bootPart = bootRpcCredits ?? 0;
+  bootRpcCredits = null;
+  const steady = Math.max(0, credits - bootPart);
   console.log(
-    `[RPC] last ${Math.round(span / 60)} min: ${rpcCounter.totalCalls()} calls, ${credits} credits ` +
-      `(≈${creditsPerDay(credits, span)}/day) | ${rpcCounter.summary() || "none"}`
+    `[RPC] last ${Math.round(span / 60)} min: ${rpcCounter.totalCalls()} calls, ${credits} credits` +
+      (firstWindow ? ` (incl. ${bootPart} one-off boot-scan credits; ex-boot ≈${creditsPerDay(steady, span)}/day)` : ` (≈${creditsPerDay(credits, span)}/day)`) +
+      ` | ${rpcCounter.summary() || "none"}`
   );
+  const hourly = (steady * 3600) / span;
+  if (creditSpike(hourly, RPC_CREDIT_BUDGET_PER_HOUR) && alertGate.shouldFire("credit-spike", now, 3 * 3600)) {
+    void notify(
+      `⚠️ <b>[RPC CREDIT SPIKE]</b> ≈${Math.round(hourly)} credits/hour (budget ${RPC_CREDIT_BUDGET_PER_HOUR}/h) | ${escapeHtml(rpcCounter.summary() || "none")}`
+    );
+  }
   rpcCounter.reset();
   lastRpcLogAt = now;
 }
@@ -4139,6 +4556,16 @@ async function liquidateFlatSol(reason: string, spotUsd: number): Promise<void> 
 }
 
 async function runKeeper() {
+  // M5: both services redeploy together on a merge and share one free RPC account — stagger their boots.
+  const jitter = bootJitterSec(INSTANCE_LABEL || POOL_ADDRESS, BOOT_JITTER_MAX_SEC);
+  if (jitter > 0) {
+    console.log(`[BOOT] staggering boot by ${jitter}s (instance "${INSTANCE_LABEL || POOL_ADDRESS.slice(0, 8)}", BOOT_JITTER_MAX_SEC=${BOOT_JITTER_MAX_SEC})`);
+    await sleepMs(jitter * 1000);
+  }
+  console.log(
+    `[JUPITER] ${JUPITER_API_BASE.replace(/^https?:\/\//, "").split("/")[0]} | API key ${JUPITER_API_KEY ? "SET (x-api-key; value not logged)" : "NOT set (keyless 0.5 RPS)"} | ` +
+      `pacing ${JUPITER_MIN_INTERVAL_MS} ms | pool fallback ${JUPITER_POOL_FALLBACK ? "on" : "off"}`
+  );
   await notify(
     "🚀 DLMM Automated Keeper initialized on Railway." +
       (POOL_ADDRESS !== DEFAULT_POOL_ADDRESS ? ` Pool: ${poolName()} <code>${POOL_ADDRESS}</code>` : "") +
@@ -4176,14 +4603,19 @@ async function runKeeper() {
     );
   }
   // Fee-sweep clock + prior swept total from chain (bounded by a timeout; never blocks boot on failure).
+  const bootScanCredits0 = rpcCounter.totalCredits();
   await initSweepClock();
   await initTransferOutHistory();
+  bootRpcCredits = Math.max(0, rpcCounter.totalCredits() - bootScanCredits0);
+  console.log(
+    `[BOOT] entry memos found in wallet history: ${walletMemoSigs.length}` + (walletMemoScanError ? ` (scan problem: ${walletMemoScanError})` : "")
+  );
   if (CATCHUP_SOL_SWEEP_LAMPORTS > 0) {
     console.log(
       `[CATCHUP] One-time SOL catch-up configured: ${CATCHUP_SOL_SWEEP_LAMPORTS} lamports (id ${CATCHUP_SOL_SWEEP_ID}); ` +
         `guard scan + send in ${CATCHUP_SOL_SWEEP_DELAY_SEC}s`
     );
-    setTimeout(() => void runCatchupSolSweep(), CATCHUP_SOL_SWEEP_DELAY_SEC * 1000);
+    setTimeout(() => void moneyLock.run("catch-up SOL sweep", () => runCatchupSolSweep()), CATCHUP_SOL_SWEEP_DELAY_SEC * 1000);
   }
 
   // Capital baseline (reporting only — never read by stops/TP/recenter/sizing), set ONCE here:
@@ -4192,7 +4624,7 @@ async function runKeeper() {
   let bootEquityUsd: number | null = null;
   // Spot at boot: retry a few times; refuse to start on a garbage price (Railway restarts the worker).
   let bootSpotUsd = NaN;
-  for (let i = 0; i < 3 && !isValidSpot(bootSpotUsd); i++) {
+  for (let i = 0; i < 6 && !isValidSpot(bootSpotUsd); i++) {
     try {
       if (i > 0) await dlmmPoolInstance.refetchStates();
       const activeBin = await dlmmPoolInstance.getActiveBin();
@@ -4200,7 +4632,7 @@ async function runKeeper() {
     } catch (err: any) {
       console.warn(`[BOOT] spot read attempt ${i + 1} failed:`, err?.message || err);
     }
-    if (!isValidSpot(bootSpotUsd) && i < 2) await new Promise((r) => setTimeout(r, 2000));
+    if (!isValidSpot(bootSpotUsd) && i < 5) await new Promise((r) => setTimeout(r, Math.min(16_000, 2000 * 2 ** i)));
   }
   if (!isValidSpot(bootSpotUsd)) throw new Error(`Unable to read a valid spot price at boot (${bootSpotUsd}).`);
   lastGoodSpotUsd = bootSpotUsd;
@@ -4286,13 +4718,43 @@ async function runKeeper() {
       console.warn(`[ENTRY] ENTRY_POSITION_PUBKEY ${ENTRY_POSITION_PUBKEY_ENV} not found among open positions; attached ${attachedKey}.`);
     }
 
-    // Price-stop % lock: pinned value, else RANGE 5% (never the live regime — a restart can't move the stop).
+    // H2: no applicable pin → recover the entry from the on-chain memo of THIS position (pins stay an override).
+    const bootEntry = ENTRY_MEMO_ENABLED || walletMemoSigs.length > 0
+      ? resolveBootEntry({
+          attachedKey,
+          spotUsd: spotPriceUsd,
+          pinApplies,
+          pinSpot,
+          pinEquity,
+          pinStopPct: null,
+          lookup: walletMemoScanError ? null : findEntryMemos(walletMemoSigs, attachedKey),
+          lookupError: walletMemoScanError,
+        })
+      : null;
+    const memoEntry = bootEntry && bootEntry.source === "memo" ? (bootEntry as Extract<EntryResolution, { source: "memo" }>) : null;
+    if (bootEntry && bootEntry.source !== "pin") {
+      console.log(`[ENTRY] boot entry: ${bootEntry.source} — ${bootEntry.note}`);
+      if (memoEntry) pinStatus = `none — ${bootEntry.note}`;
+    }
+    const bootEntryAlert = bootEntry && bootEntry.source === "live" ? (bootEntry as Extract<EntryResolution, { source: "live" }>).alert : null;
+
+    // Price-stop % lock: pinned value, else the memo's lock, else RANGE 5% (never the live regime).
     const stopLockRes = resolveAttachStopLock(ENTRY_STOP_PCT_ENV, pinApplies);
     entryStopLock = stopLockRes.lock;
     if (stopLockRes.warning) console.warn(`[ENTRY] ${stopLockRes.warning}`);
+    if (memoEntry && !(pinApplies && ENTRY_STOP_PCT_ENV)) {
+      entryStopLock = {
+        stopPct: memoEntry.stopPct,
+        cooldownSec: memoEntry.cooldownSec,
+        regime: (memoEntry.regime || entryStopLock.regime) as MarketRegime,
+        source: "on-chain entry memo",
+      };
+    }
 
     if (pinApplies && pinSpot != null && pinSpot > 0) {
       entrySpotUsd = pinSpot;
+    } else if (memoEntry) {
+      entrySpotUsd = memoEntry.spot;
     } else {
       entrySpotUsd = spotPriceUsd;
       console.warn(
@@ -4311,6 +4773,14 @@ async function runKeeper() {
         );
       }
       entryEquityPending = false;
+    } else if (memoEntry) {
+      const m = findEntryMemos(walletMemoSigs, attachedKey).forPosition;
+      const eff = m && m.src === "resume"
+        ? { usd: memoEntry.eq, adjusted: false }
+        : effectivePinnedEntryEquity(memoEntry.eq, attachedKey, transferOutHistory.eqAfterByPosition);
+      entryEquityUsd = eff.usd;
+      entryEquityPending = false;
+      if (eff.adjusted) console.warn(`[ENTRY] memo entry equity lowered to $${eff.usd.toFixed(2)} by a later /transfer_out memo`);
     } else {
       const p = await probeEquityWithRetry(dlmmPoolInstance, spotPriceUsd, activePositionPubkey, 3);
       if (p.ok) {
@@ -4340,6 +4810,7 @@ async function runKeeper() {
       `• Capital Baseline: ${capitalBaselineLabel()}` +
       (bootEquityUsd != null && !capitalBaselinePending ? `\n• Net PnL: ${fmtSignedUsd(totalPnlUsd(bootEquityUsd))}` : "") +
       `\n• Entry pin: ${pinStatus}` +
+      (bootEntryAlert ? `\n• ⚠️ ${escapeHtml(bootEntryAlert)}` : "") +
       `\n• Next fee sweep: ${nextSweepLabel()}` +
       (entryEquityPending ? `\n• ⏳ Entry equity pending first good read (equity stop not armed yet)` : "")
     );
@@ -4372,12 +4843,23 @@ async function runKeeper() {
     }
     if (bootFlatSolUsd >= FLAT_SOL_GUARD_MIN_USD && isValidSpot(bootSpotUsd)) {
       const pinStop = parseStopPctPin(ENTRY_STOP_PCT_ENV);
+      // H2: with no pins, the newest on-chain entry memo (≤ 7 days old, within 30% of spot) is the kept entry
+      // — e.g. a restart between the close and the re-open of a recenter.
+      let memoFlat: { spot: number; eq: number; stopPct: number } | null = null;
+      if (!ENTRY_SPOT_USD_ENV && !ENTRY_EQUITY_USD_ENV && !walletMemoScanError) {
+        const n = findEntryMemos(walletMemoSigs, null).newest;
+        const ageOk = n && (n.blockTime == null || Date.now() / 1000 - n.blockTime <= 7 * 86400);
+        if (n && ageOk && Math.abs(n.spot / bootSpotUsd - 1) <= 0.3) {
+          memoFlat = { spot: n.spot, eq: n.eq, stopPct: n.stopPct };
+          console.log(`[ENTRY] flat boot: kept entry from on-chain memo ${n.sig.slice(0, 8)}… (${n.src}) spot $${n.spot.toFixed(2)}`);
+        }
+      }
       const r = resolveBootFlatGuard({
         spotUsd: bootSpotUsd,
         walletEquityUsd: bootEquityUsd,
-        pinSpotUsd: Number(ENTRY_SPOT_USD_ENV) > 0 ? Number(ENTRY_SPOT_USD_ENV) : null,
-        pinEquityUsd: Number(ENTRY_EQUITY_USD_ENV) > 0 ? Number(ENTRY_EQUITY_USD_ENV) : null,
-        pinStopPct: pinStop.ok ? pinStop.value : null,
+        pinSpotUsd: Number(ENTRY_SPOT_USD_ENV) > 0 ? Number(ENTRY_SPOT_USD_ENV) : memoFlat?.spot ?? null,
+        pinEquityUsd: Number(ENTRY_EQUITY_USD_ENV) > 0 ? Number(ENTRY_EQUITY_USD_ENV) : memoFlat?.eq ?? null,
+        pinStopPct: pinStop.ok ? pinStop.value : memoFlat?.stopPct ?? null,
         defaultStopPct: REGIME_PROFILES[DEFAULT_REGIME].floorStopPct,
         maxDrawdownPct: MAX_DRAWDOWN_PCT,
       });
@@ -4422,19 +4904,22 @@ async function runKeeper() {
     }
   }
 
+  // Part 3: daily ledger drift check (on-chain sweep rescan vs in-memory total; alert only).
+  if (LEDGER_DRIFT_CHECK_SEC > 0) {
+    setInterval(() => {
+      if (Date.now() / 1000 - lastLedgerDriftAt < LEDGER_DRIFT_CHECK_SEC) return;
+      checkLedgerDrift().catch((e) => console.warn("[LEDGER] drift check failed:", redactSecrets(String(e?.message || e)).slice(0, 120)));
+    }, 10 * 60 * 1000);
+  }
+
   // Stop-blindness watchdog (independent of the keeper tick so a hung tick is also caught).
   setInterval(() => {
     checkStopBlindness().catch((e) => console.error("[WATCHDOG]", e?.message || e));
   }, 30000);
 
-  // Master Strategy Polling Loop (Every 15s)
-  setInterval(async () => {
-    // Skip overlapping ticks — setInterval does not await the previous callback.
-    if (keeperTickRunning) return;
-    keeperTickRunning = true;
-    try {
-      logRpcUsage(Math.floor(Date.now() / 1000));
-      if (isBotPaused || isExiting) return;
+  // H1: the tick body runs under the money lock; a tick that finds a Telegram money command (or the
+  // catch-up sweep) in flight is skipped (the next one runs 15 s later).
+  const keeperTickBody = async (): Promise<void> => {
 
       const now = Math.floor(Date.now() / 1000);
       // In cooldown with a position: nothing to do (as before). Flat: keep reading so the flat guard can still
@@ -4468,6 +4953,13 @@ async function runKeeper() {
       const spotCheck = vetSpot(currentPrice);
       if (!spotCheck.ok) {
         noteReadFailure("spot (all stops/TP/recenter)", spotCheck.reason, now);
+        return;
+      }
+
+      // M3: paused with an open position — keep the PRICE stop live (the equity stop is suspended: a
+      // /withdraw_pct pause moves equity out on purpose). No sweep, top-up, recenter or TP while paused.
+      if (isBotPaused) {
+        if (activePositionPubkey) await pausedPositionGuard(currentPrice, now);
         return;
       }
 
@@ -4523,7 +5015,7 @@ async function runKeeper() {
       // lastSweepTime only advances on an actual sweep (inside sweepRevenueToVault); if a due sweep
       // moves nothing, retry after SWEEP_RETRY_SEC instead of on every tick.
       let walletMutated = false;
-      if (now - lastSweepTime >= SWEEP_INTERVAL_SEC && now >= nextSweepRetryAt) {
+      if ((now - lastSweepTime >= SWEEP_INTERVAL_SEC && now >= nextSweepRetryAt) || (activePositionPubkey && faultOnce("sweep-due"))) {
         walletMutated = true;
         const swept = await sweepRevenueToVault(dlmmPoolInstance!);
         if (!(swept > 0)) {
@@ -4584,8 +5076,37 @@ async function runKeeper() {
         }
       }
 
+      // ---- Part 3 invariants (alert-only) ----
+      await runTickInvariants(snap, currentPrice, now, walletMutated);
+      // H2: an entry memo that failed (or waited for entry equity) is retried here.
+      if (entryMemoPending && activePositionPubkey && now >= entryMemoPending.nextAt && !isDeploying) {
+        await writeEntryMemo(entryMemoPending.src);
+      }
+
       // Re-entry evaluation if parked in 100% USDC
       if (!activePositionPubkey) {
+        // C2: a deploy whose outcome was unknown — adopt it if it landed late; no new deploy while watching.
+        if (deployOutcomeWatch) {
+          const w = deployOutcomeWatch;
+          let exists = false;
+          try {
+            exists = (await connection.getAccountInfo(w.key, "confirmed")) != null;
+          } catch {}
+          if (exists) {
+            await adoptPosition(dlmmPoolInstance!, w.key, "deploy landed after an unknown outcome");
+            return;
+          }
+          if (now < w.until) return;
+          console.log(`[DEPLOY] unknown-outcome watch on ${w.key.toBase58()} expired — position never landed`);
+          deployOutcomeWatch = null;
+        }
+        // C2: a live position of this wallet while flat (late landing / manual open) is adopted, not doubled.
+        if (discoveredPositionKeys.length > 0 && !isDeploying) {
+          const orphan = discoveredPositionKeys[0];
+          await notify(`🚨 <b>[ORPHAN POSITION]</b> Found live position <code>${orphan.toBase58()}</code> while flat — adopting it (no new deploy).`);
+          await adoptPosition(dlmmPoolInstance!, orphan, "found while flat");
+          return;
+        }
         // C1: a redeploy owed after a close / found at boot bypasses Gate 3 (it is the second half of a
         // recenter or take-profit) but keeps Gate 2 and its own bounded backoff.
         if (redeployPending) {
@@ -4707,7 +5228,7 @@ async function runKeeper() {
           }
 
           const solBal = await connection.getBalance(wallet.publicKey);
-          const dumpSolLamports = Math.floor(solBal - GAS_RESERVE_LAMPORTS);
+          const dumpSolLamports = Math.floor(solBal - GAS_RESERVE_LAMPORTS - FEE_SOL_SWEEP_MARGIN_LAMPORTS); // L1: + swap-gate margin
           let swapSig = "";
 
           if (dumpSolLamports > 0.05 * 1e9) {
@@ -4791,7 +5312,7 @@ async function runKeeper() {
         try {
           await notify(
             `↩️ <b>[BELOW-RANGE RECENTER]</b> Spot $${currentPrice.toFixed(2)} < range floor $${lowestBinPrice.toFixed(2)} ` +
-            `for ${belowRangeTickCount} ticks. Closing & redeploying around spot (keeping SOL — no dump)...`
+            `for ${belowRangeTickCount} ticks. Closing & redeploying around spot (no stop-out; the redeploy rebalances SOL/USDC to the new range's split)...`
           );
           void emitLedger({
             event: "RECENTER",
@@ -4913,6 +5434,19 @@ async function runKeeper() {
           isExiting = false;
         }
       }
+  };
+
+  // Master Strategy Polling Loop (Every 15s)
+  setInterval(async () => {
+    // Skip overlapping ticks — setInterval does not await the previous callback.
+    if (keeperTickRunning) return;
+    keeperTickRunning = true;
+    try {
+      logRpcUsage(Math.floor(Date.now() / 1000));
+      // M3: paused WITH a position still reads and evaluates the price stop (inside the body); paused flat idles.
+      if (isExiting || (isBotPaused && !activePositionPubkey)) return;
+      const r = await moneyLock.tryRun("keeper tick", keeperTickBody);
+      if (!r.ran) console.log(`[LOCK] tick skipped — money action in flight (${(r as any).holder})`);
     } catch (err: any) {
       console.error("[Keeper Loop Error]:", err.message);
       // A tick that throws before the stop block leaves stops unevaluated; the watchdog alerts if it persists.

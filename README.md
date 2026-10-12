@@ -107,9 +107,41 @@ The regime only shapes **new** deploys (bid/ask bins) and the stop % a new posit
 
 When a position is deployed, its price-stop % and post-stop cooldown are taken from the regime **at that moment** and locked for the life of the position (kept across below-range recenters, like the entry spot). Later regime changes never move the stop. On a boot-attach the lock is `ENTRY_STOP_PCT` if pinned (see below), otherwise **RANGE_CHOP's 5%** — deliberately not the live regime, so a restart can't move the stop. Idle top-ups use the locked regime's bid/ask split (the shape the position was opened with), so a regime flip doesn't trigger rebalancing swaps. `/status`, deploy and attach messages show the locked % and its source. The equity stop (`MAX_DRAWDOWN_PCT`) is unchanged.
 
-### Entry pin across restarts
+### Entry across restarts (on-chain entry memo; pins optional)
+After every open (deploy, recenter, take-profit redeploy, adoption) and every `/resume` re-base the bot writes one small memo-only
+transaction from the LP wallet (~5,000 lamports): `dlmm-keeper:entry v=1 pos=<position> spot=<entry spot> eq=<entry equity> stop=<stop %> regime=.. cd=.. src=.. ck=<checksum>`.
+A recenter's memo carries the ORIGINAL entry (the entry is kept across recenters); a take-profit redeploy carries the new one.
+At boot the bot reads these memos from the wallet's signature list (the same scan as the /transfer_out history, no extra
+getTransaction calls) and restores entry spot, entry equity and the locked stop % for the attached position.
+Precedence: `ENTRY_*` pin for this exact position (override) > memo for this position (rejected if > 30% from spot) > live
+values with a ⚠️ line in the attach alert. Corrupt/truncated memos (checksum) are ignored. A failed memo write alerts
+`[ENTRY NOT PERSISTED]` and is retried every `ENTRY_MEMO_RETRY_SEC` (300) up to 6 times. Flat boots holding SOL use the newest
+memo (≤ 7 days, within 30% of spot) as the kept entry when no pins are set. `ENTRY_MEMO_ENABLED=false` turns writing off.
 
-On restart the bot re-anchors entry (and therefore both stops) to the live spot/equity unless pinned. To keep the original entry, set `ENTRY_POSITION_PUBKEY`, `ENTRY_SPOT_USD`, `ENTRY_EQUITY_USD` and `ENTRY_STOP_PCT` (fraction, e.g. `0.05`; must be 0.005–0.25). The pin is applied only when attaching at boot and only if the attached position equals `ENTRY_POSITION_PUBKEY`; otherwise it is ignored with a warning (so it can never be re-applied to a later position after a take-profit / recenter / new deploy). After every deploy/attach the bot logs the exact values to copy (`[ENTRY] To keep this entry across restarts set: ...`).
+The pins still work as before: `ENTRY_POSITION_PUBKEY`, `ENTRY_SPOT_USD`, `ENTRY_EQUITY_USD`, `ENTRY_STOP_PCT` (fraction 0.005–0.25),
+applied only at boot-attach and only if the attached position equals `ENTRY_POSITION_PUBKEY`. They are only needed for
+positions opened before the memo release.
+
+### Hardening (2026-10)
+- **Money lock:** the keeper tick, `/withdraw_pct`, `/emergency_exit`, `/harvest`, `/resume`, `/confirm` (transfer out) and the
+  catch-up sweep run one at a time (a busy tick is skipped). The USDC fee sweep is additionally capped at the USDC the claim
+  itself paid out (tx meta) + the fee-SOL swap proceeds, so withdrawal/exit USDC can never be swept.
+- **Unknown deploy outcome:** before every open the bot checks chain for a live position of this wallet and adopts it instead
+  of opening a second one; a deploy that errors is re-checked on chain (adopted if it landed; watched 180 s before any retry).
+  A position found while flat is adopted with an `[ORPHAN POSITION]` alert.
+- **Paused with a position:** the price stop stays live (full exit on a hit); the equity stop is suspended until `/resume`.
+  `[PAUSED WITH POSITION]` re-alerts every 30 min.
+- **Equity** counts the refundable position-account rent (~0.057 SOL per position).
+- **Deploy bin slippage:** the active bin is re-read after the rebalance swap and the range centred on it;
+  `DEPLOY_BIN_SLIPPAGE_PCT` (0.25 %) is passed to the SDK (fixes 0x1774 ExceededBinSlippageTolerance on first deploys).
+- **Boot jitter:** `BOOT_JITTER_MAX_SEC` (20) deterministic per instance. Boot logs whether `JUPITER_API_KEY` is set (never the value).
+- **Invariant alerts** (alert only, rate-limited by `ALERT_REPEAT_SEC`): gas below reserve after an open, unexplained equity
+  change (`EQUITY_JUMP_MIN_USD`), RPC credit spike (`RPC_CREDIT_BUDGET_PER_HOUR`), idle funds (`IDLE_ALERT_MIN_USD` for
+  `IDLE_ALERT_SEC`), stops blind (existing watchdog, now also while paused with a position), orphan position, daily ledger
+  drift (`LEDGER_DRIFT_CHECK_SEC`, on-chain sweep rescan vs in-memory).
+- The first `[RPC]` line after boot reports the one-off boot-scan credits separately (they made 4bps look like ~24k/day).
+- Sweep alert: "Swept this run" + cumulative total. Residual fees paid out by a close are booked as FEE_CLAIM. Liquidation dumps
+  keep reserve + 0.005 SOL. v1 transactions are parsed via a raw RPC fallback.
 
 ### Read guard (stop safety)
 

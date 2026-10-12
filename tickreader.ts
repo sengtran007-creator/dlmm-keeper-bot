@@ -125,6 +125,8 @@ export class TickReader {
     }
 
     const missing: string[] = [];
+    const rentByKey = new Map<string, number>();
+    uniqPositions.forEach((k, i) => { if (posInfos[i]) rentByKey.set(k.toBase58(), posInfos[i]!.lamports); });
     const wrappers: { key: PublicKey; wrapper: any }[] = [];
     const needArrays = new Map<string, PublicKey>();
     for (let i = 0; i < uniqPositions.length; i++) {
@@ -177,6 +179,7 @@ export class TickReader {
         y: numField(pd?.totalYAmount),
         feeX: numField(pd?.feeX),
         feeY: numField(pd?.feeY),
+        rentLamports: rentByKey.get(key.toBase58()) ?? 0,
       });
     }
 
