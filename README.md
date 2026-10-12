@@ -137,6 +137,41 @@ On restart the bot re-anchors entry (and therefore both stops) to the live spot/
 - An `[RPC]` log line every `RPC_CREDIT_LOG_SEC` (3600 s; 0 = off) lists calls/credits by method (≈ credits/day). Expected ≈ 7–8k credits/day per bot (was ≈ 100–150k).
 - `node dist-test/tools/rpc-sim.js <pool> <wallet> <position> [ticks] [rpc]` (after `npm test`) replays the old and new tick read-only against a public RPC and prints both credit counts and equity.
 
+## Full-cycle rehearsal (local validator, no real funds)
+
+`rehearsal/` runs the **real bot** (`dist/index.js`, unmodified) against a local `solana-test-validator` that has the
+Meteora DLMM program and the 4bps SOL/USDC pool (reserves, oracle, bitmap extension, ±12 bin arrays, USDC mint) cloned
+read-only from mainnet. Every key is a throwaway generated under `rehearsal/.state/` (gitignored): the bot wallet, a fake
+revenue wallet and a "whale" that moves the price by swapping through the cloned pool. Nothing touches mainnet funds.
+
+Stand-ins (in `rehearsal/stubs.js`): the Jupiter API (quotes + swap transactions routed through the cloned DLMM pool,
+with fault injection: `POST /control {"jupiterFail": n, "mode": "expire"|"http500"}`) and the Google Sheet webhook
+(rows appended to `rehearsal/.state/ledger.jsonl`). Telegram is disabled (empty token). The regime sentinel and Gate 3
+klines still read public market APIs.
+
+Steps (`node rehearsal/run.js [step,...]`): `open` (boot flat, V-reclaim pump, deploy) → `tpLowGas` (live Oct 11 6:05 PM PT deadlock: take-profit ends USDC-heavy with native SOL just below the reserve) → `fees` (wash trades) →
+`recenterBelow` → `takeProfit` → `recenterDeployFail` (Jupiter fails during the redeploy, then the price drops through
+the stop) → `restartMidClose` (SIGKILL before the close lands, and again right after it lands) → `stopOut`.
+Invariants asserted after every step: native SOL ≥ `GAS_RESERVE` after an open; exactly one position on chain and it is
+the one the bot tracks (no orphans); stops armed (price stop logged, no STOPS BLIND); equity + revenue conserved within
+fees/costs at a fixed price; FEE_SWEEP rows = revenue-wallet deltas; swept ≤ claimed; CLOSE/DEPLOY/SWAP rows = tx meta /
+pool-reserve deltas; flat-with-SOL is still stop-protected; idle funds are redeployed within 4 min.
+
+```bash
+# one-time: install the Solana/Agave CLI (solana-test-validator)
+sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+
+npm ci && npm run build
+bash rehearsal/start-validator.sh > /tmp/validator.log 2>&1 &   # ~40 s to clone + start (needs ~2 GB RAM)
+node rehearsal/run.js                 # full cycle, ~30-40 min; exit code 1 if any invariant fails
+node rehearsal/run.js open,fees,recenterBelow,takeProfit   # quick gate, ~3 min
+cat rehearsal/.state/report.json      # PASS/FAIL per invariant; bot log in rehearsal/.state/bot.log
+```
+
+Use it as a gate: run at least the quick set before shipping any change to open/close/sweep/stop code. Re-run
+`start-validator.sh` (it uses `--reset`) to start again from fresh mainnet state.
+
 ## Deploy on Railway
 
 1. Create a service from this repo (worker / no public HTTP needed).
