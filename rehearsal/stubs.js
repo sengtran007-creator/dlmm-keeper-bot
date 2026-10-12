@@ -22,10 +22,16 @@ const control = { jupiterFail: 0, mode: "expire", swaps: 0, failed: 0 };
 const tg = { updates: [], nextId: 1, sent: [] };
 const TG_CHAT = "4242";
 
+// Only bin arrays near the cloned price exist on the local validator; after a deep crash the SDK's 8-array lookahead
+// can hit an uncloned (null) array. Fall back to fewer arrays (plenty for the bot's swap sizes).
+async function binArraysFor(p, sellSol) {
+  for (const n of [8, 4, 2, 1]) { try { return await p.getBinArrayForSwap(sellSol, n); } catch (e) { if (n === 1) throw e; } }
+}
+
 async function quote(inputMint, amount, slippageBps = 100) {
   const p = await market.pool();
   const sellSol = inputMint === L.WSOL_MINT.toBase58();
-  const binArrays = await p.getBinArrayForSwap(sellSol, 8);
+  const binArrays = await binArraysFor(p, sellSol);
   const q = p.swapQuote(new BN(amount), sellSol, new BN(100), binArrays, true);
   const optimistic = control.jupiterFail > 0 && control.mode === "slippage";
   const out = optimistic ? q.outAmount.muln(1012).divn(1000) : q.outAmount;
@@ -39,7 +45,7 @@ async function quote(inputMint, amount, slippageBps = 100) {
 async function swapTx(quoteResponse, user) {
   const p = await market.pool();
   const sellSol = quoteResponse.inputMint === L.WSOL_MINT.toBase58();
-  const binArrays = await p.getBinArrayForSwap(sellSol, 8);
+  const binArrays = await binArraysFor(p, sellSol);
   const q = p.swapQuote(new BN(quoteResponse.inAmount), sellSol, new BN(100), binArrays, true);
   const tx = await p.swap({
     inToken: sellSol ? L.WSOL_MINT : L.USDC_MINT, outToken: sellSol ? L.USDC_MINT : L.WSOL_MINT,

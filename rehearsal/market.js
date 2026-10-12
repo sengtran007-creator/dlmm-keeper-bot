@@ -25,7 +25,8 @@ async function airdrop(pk, sol) {
 async function swapOnce(whale, sellSol, amountRaw) {
   const p = await pool();
   const swapForY = sellSol; // X = SOL, Y = USDC (SDK: swapForY = selling X for Y)
-  const binArrays = await p.getBinArrayForSwap(swapForY, 8);
+  let binArrays; // fewer arrays if the 8-array lookahead hits an uncloned (null) bin array on the local validator
+  for (const n of [8, 4, 2, 1]) { try { binArrays = await p.getBinArrayForSwap(swapForY, n); break; } catch (e) { if (n === 1) throw e; } }
   const q = p.swapQuote(new BN(amountRaw), swapForY, new BN(500), binArrays, true);
   const tx = await p.swap({
     inToken: sellSol ? L.WSOL_MINT : L.USDC_MINT,
