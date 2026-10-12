@@ -37,16 +37,18 @@ async function swapOnce(whale, sellSol, amountRaw) {
 }
 /** Swap in steps until the active bin reaches targetBin (inclusive). */
 async function moveToBin(whale, targetBin, { stepSol = 1500, stepUsdc = 165000 } = {}) {
+  let shrink = 1; // a step that crosses too many bins exceeds the CU limit: halve it after each failure
   for (let i = 0; i < 400; i++) {
     const s = await spot();
     if (s.binId === targetBin) return s;
     const down = s.binId > targetBin;
     const gap = Math.abs(s.binId - targetBin);
-    const scale = Math.min(1, gap / 10) || 0.05;
+    const scale = (Math.min(1, gap / 10) || 0.05) * shrink;
     try {
       await swapOnce(whale, down, down ? Math.max(1e7, Math.round(stepSol * scale * 1e9)) : Math.max(1e6, Math.round(stepUsdc * scale * 1e6)));
     } catch (e) {
       console.warn("[market] swap failed:", e.message?.slice(0, 200));
+      shrink = Math.max(0.01, shrink / 2);
       await new Promise((r) => setTimeout(r, 1000));
     }
     const s2 = await spot();
