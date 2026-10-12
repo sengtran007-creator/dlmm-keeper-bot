@@ -224,7 +224,8 @@ const STEPS = {
     const c0 = await ensurePosition("tp-low-gas");
     const r = rangeOf(c0);
     if (!r) return check("tp-low-gas", "precondition: position", false, "none");
-    const target = 80_100_000; // ≈ the pre-fix 0.0781 landing + a little fee SOL
+    // Native after the TP close = target + position rent refund (+ claimed fee SOL) ≈ 0.1220, like the live wallet (0.121951516).
+    const target = 121_950_000 - (c0.positions[0].rent || 0) - 500_000;
     if (c0.native > target) {
       const tx = new Transaction().add(SystemProgram.transfer({ fromPubkey: bk.publicKey, toPubkey: whale.publicKey, lamports: c0.native - target }));
       await sendAndConfirmTransaction(market.conn, tx, [bk], { commitment: "confirmed" });
