@@ -137,6 +137,63 @@ On restart the bot re-anchors entry (and therefore both stops) to the live spot/
 - An `[RPC]` log line every `RPC_CREDIT_LOG_SEC` (3600 s; 0 = off) lists calls/credits by method (≈ credits/day). Expected ≈ 7–8k credits/day per bot (was ≈ 100–150k).
 - `node dist-test/tools/rpc-sim.js <pool> <wallet> <position> [ticks] [rpc]` (after `npm test`) replays the old and new tick read-only against a public RPC and prints both credit counts and equity.
 
+## Flat-with-SOL guard, redeploy retry, swap retry (optional tunables)
+
+- `FLAT_SOL_GUARD_MIN_USD` (25): when there is no position but SOL above `GAS_RESERVE` is worth at least this much, the kept
+  entry price stop (and equity stop) are evaluated every tick on that SOL; a hit sells it to USDC (`[FLAT STOP TRIGGERED]`,
+  a `CIRCUIT_BREAKER` row). Telegram `[FLAT WITH SOL]` alert on entry and every `FLAT_SOL_ALERT_REPEAT_SEC` (1800). The
+  STOPS BLIND watchdog covers this state too.
+- `REDEPLOY_RETRY_BASE_SEC` (60) / `REDEPLOY_RETRY_MAX_SEC` (600) / `REDEPLOY_MAX_ATTEMPTS` (8): a redeploy owed after a
+  recenter or take-profit close is retried on 60 s, 120 s, 240 s … (Gate 2 still applies, Gate 3 does not).
+- `BOOT_FLAT_REDEPLOY` (off): booting flat with SOL arms the stop (ENTRY_SPOT_USD/ENTRY_STOP_PCT/ENTRY_EQUITY_USD when the pin
+  spot is within 10% of spot, else boot spot × (1 − 5%)); re-entry still waits for Gate 1-3 unless this is on.
+- `JUPITER_SWAP_ATTEMPTS` (3) / `JUPITER_SLIPPAGE_MAX_BPS` (150): each swap re-quotes per attempt; a slippage failure
+  (0x1771) retries at 2× the slippage cap (50 → 100 → 150 bps), 5xx/429/network/expired back off 2 s, 4 s; a signed swap
+  whose fate is unknown is never retried. A USDC→SOL swap only needs `TX_FEE_FLOOR_LAMPORTS` of gas; deploys and top-ups
+  buy any shortfall of the SOL holdback from USDC.
+
+## Full-cycle rehearsal (local validator, no real funds)
+
+`rehearsal/` runs the **real bot** (`dist/index.js`, unmodified) against a local `solana-test-validator` that has the
+Meteora DLMM program and the 4bps SOL/USDC pool (reserves, oracle, bitmap extension, ±12 bin arrays, USDC mint) cloned
+read-only from mainnet. Every key is a throwaway generated under `rehearsal/.state/` (gitignored): the bot wallet, a fake
+revenue wallet and a "whale" that moves the price by swapping through the cloned pool. Nothing touches mainnet funds.
+
+Stand-ins (in `rehearsal/stubs.js`): the Jupiter API (quotes + swap transactions routed through the cloned DLMM pool,
+with fault injection: `POST /control {"jupiterFail": n, "mode": "expire"|"http500"}`) and the Google Sheet webhook
+(rows appended to `rehearsal/.state/ledger.jsonl`). Telegram is disabled (empty token). The regime sentinel and Gate 3
+klines still read public market APIs.
+
+Steps (`node rehearsal/run.js [step,...]`): `open` (boot flat, V-reclaim pump, deploy) → `tpLowGas` (live Oct 11 6:05 PM PT
+deadlock: take-profit ends USDC-heavy with native SOL just below the reserve) → `fees` (wash trades) → `recenterBelow` →
+`takeProfit` → `jupiterFaults` (redeploy swaps with injected slippage failures — re-quote at a higher cap — and HTTP 503s —
+backoff) → `topUp` (idle USDC arrives while native SOL is below the reserve) → `recenterDeployRetry` (redeploy fails once,
+retried on the 60 s backoff) → `recenterDeployFail` (Jupiter keeps failing while the price drops through the stop: the flat
+guard must fire and liquidate) → `restartMidClose` (SIGKILL before the close lands, and again right after it lands) →
+`stopOut`.
+Invariants asserted after every step: native SOL ≥ `GAS_RESERVE` after an open / top-up; exactly one position on chain and
+it is the one the bot tracks (no orphans); stops armed (price stop logged, no STOPS BLIND), including while flat holding
+SOL; equity + revenue conserved within fees/costs at a fixed price; FEE_SWEEP rows = revenue-wallet deltas; swept ≤ claimed;
+CLOSE/DEPLOY/TOPUP/SWAP rows = tx meta / pool-reserve deltas; one SWAP per rebalance (no double swap); an owed redeploy
+lands within 4 min; a boot while flat with SOL arms a stop but does not deploy blindly.
+
+Fault injection (`POST http://127.0.0.1:8787/control`): `{"jupiterFail": n, "mode": "expire" | "http500" | "http503" | "slippage"}`.
+
+```bash
+# one-time: install the Solana/Agave CLI (solana-test-validator)
+sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+
+npm ci && npm run build
+bash rehearsal/start-validator.sh > /tmp/validator.log 2>&1 &   # ~40 s to clone + start (needs ~2 GB RAM)
+node rehearsal/run.js                 # full cycle, ~30-40 min; exit code 1 if any invariant fails
+node rehearsal/run.js open,fees,recenterBelow,takeProfit   # quick gate, ~3 min
+cat rehearsal/.state/report.json      # PASS/FAIL per invariant; bot log in rehearsal/.state/bot.log
+```
+
+Use it as a gate: run at least the quick set before shipping any change to open/close/sweep/stop code. Re-run
+`start-validator.sh` (it uses `--reset`) to start again from fresh mainnet state.
+
 ## Deploy on Railway
 
 1. Create a service from this repo (worker / no public HTTP needed).

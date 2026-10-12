@@ -40,6 +40,8 @@ import {
   resolveAttachStopLock,
   priceStopFromLock,
   entryPinLine,
+  parseStopPctPin,
+  regimeForStopPct,
 } from "./regime";
 import {
   positionHasLiquidity,
@@ -82,6 +84,17 @@ import {
   openCostLamports,
   positionAccountBytes,
 } from "./gasreserve";
+import {
+  swapGasGate,
+  planInventory,
+  redeployDelaySec,
+  flatSolExposureUsd,
+  flatGuardHit,
+  flatSolDumpLamports,
+  resolveBootFlatGuard,
+  FlatGuardState,
+} from "./flatguard";
+import { classifySwapFailure, nextSlippageBps, swapRetryDelayMs } from "./jupretry";
 import {
   ATA_RENT_LAMPORTS,
   TRANSFER_OUT_CONFIRM_TTL_MS,
@@ -358,6 +371,25 @@ let activePositionPubkey: PublicKey | null = null;
 let lowestBinPrice = 0;
 let highestBinPrice = 0;
 let inCooldownUntil = 0;
+
+// ---- C1: flat-with-SOL guard + bounded redeploy retry ----
+/** SOL above the reserve (USD) held while flat that the flat guard protects (default $25). */
+const FLAT_SOL_GUARD_MIN_USD = Math.max(1, Number(process.env.FLAT_SOL_GUARD_MIN_USD ?? 25));
+/** Pending-redeploy backoff after a recenter / take-profit / boot-flat redeploy fails: 60 s, 120 s, … ≤ 600 s. */
+const REDEPLOY_RETRY_BASE_SEC = Math.max(15, Number(process.env.REDEPLOY_RETRY_BASE_SEC ?? 60));
+const REDEPLOY_RETRY_MAX_SEC = Math.max(REDEPLOY_RETRY_BASE_SEC, Number(process.env.REDEPLOY_RETRY_MAX_SEC ?? 600));
+const REDEPLOY_MAX_ATTEMPTS = Math.max(1, Number(process.env.REDEPLOY_MAX_ATTEMPTS ?? 8));
+/** Boot flat with SOL: also owe an immediate redeploy (bypassing Gate 3). Default off — boot never deploys blindly. */
+const BOOT_FLAT_REDEPLOY = /^(1|true|yes)$/i.test(process.env.BOOT_FLAT_REDEPLOY ?? "");
+const FLAT_SOL_ALERT_REPEAT_SEC = Math.max(300, Number(process.env.FLAT_SOL_ALERT_REPEAT_SEC ?? 1800));
+/** Stop kept on SOL held while flat (null = not armed). */
+let flatGuard: FlatGuardState | null = null;
+let flatGuardSince = 0;
+let flatSolAlertedAt = 0;
+let flatLiquidationFailures = 0;
+let flatLiquidationRetryAt = 0;
+/** A redeploy owed after a close (recenter / take-profit) or found at boot; retried with backoff, bypassing Gate 3. */
+let redeployPending: { attempt: number; nextAt: number; reason: string } | null = null;
 /** Unix seconds of the last successful fee sweep. Set at boot from chain (else LAST_SWEEP_UNIX, else boot time). */
 let lastSweepTime = Math.floor(Date.now() / 1000);
 let lastSweepSource = "boot time (not yet resolved)";
@@ -1091,7 +1123,8 @@ function markStopsArmed() {
 /** Watchdog: alert if a stop has been blind (no trustworthy read) for STOP_BLIND_ALERT_SEC. Independent of the keeper tick. */
 async function checkStopBlindness() {
   const now = Math.floor(Date.now() / 1000);
-  if (!activePositionPubkey || isBotPaused || isExiting || isLiquidating) return;
+  // A flat guard (SOL held while flat) counts as an armed stop: it is watched for blindness too.
+  if ((!activePositionPubkey && !flatGuard) || isBotPaused || isExiting || isLiquidating) return;
   const priceBlind = now - lastPriceStopEvalAt;
   const equityBlind = entryEquityUsd > 0 || entryEquityPending ? now - lastEquityStopEvalAt : 0;
   const worst = Math.max(priceBlind, equityBlind);
@@ -1103,7 +1136,9 @@ async function checkStopBlindness() {
     ].filter(Boolean).join(", ");
     await notify(
       `⚠️ <b>[STOPS BLIND]</b> No trustworthy on-chain read for: ${which}. Stops are NOT being evaluated.\n` +
-      `• Position: <code>${activePositionPubkey.toBase58()}</code>\n` +
+      (activePositionPubkey
+        ? `• Position: <code>${activePositionPubkey.toBase58()}</code>\n`
+        : `• Flat holding SOL — flat stop $${(flatGuard?.stopPrice ?? 0).toFixed(2)} (${escapeHtml(flatGuard?.source ?? "")})\n`) +
       `• Last error: ${escapeHtml(lastReadFailureReason || "keeper tick not completing")}\n` +
       `• Check RPC / Railway logs. Use /emergency_exit if you need to unwind manually.`
     );
@@ -1152,6 +1187,21 @@ function formatFloorStopLine(): string {
     `$${(pStop || 0).toFixed(2)} (−${pct}% vs entry $${entrySpotUsd.toFixed(2)})` +
     (eStop > 0 ? ` | equity ≤ $${eStop.toFixed(2)} (−${dd}% vs $${entryEquityUsd.toFixed(2)})` : "")
   );
+}
+
+/** Arm the flat guard from the kept entry stop (recenter) — the SOL leaves the position but keeps its stop. */
+function armFlatGuardFromEntry(context: string) {
+  const p = priceStopFromEntry();
+  if (!(p > 0)) return;
+  flatGuard = { stopPrice: p, equityStop: equityStopFromEntry(), source: `${context}: entry $${entrySpotUsd.toFixed(2)} stop ${stopLockLabel()}` };
+}
+
+function disarmFlatGuard() {
+  flatGuard = null;
+  flatGuardSince = 0;
+  flatSolAlertedAt = 0;
+  flatLiquidationFailures = 0;
+  flatLiquidationRetryAt = 0;
 }
 
 function clearEntryState() {
@@ -1546,6 +1596,9 @@ interface SwapResult {
   attemptedSig?: string;
   /** "landed" on success; on failure: not_landed / failed (safe to retry) or unknown (do NOT retry). */
   landedStatus?: LandedStatus;
+  /** Failure message / HTTP status of the last attempt (for the retry classifier). */
+  error?: string;
+  httpStatus?: number;
 }
 
 function isPreflightRejection(err: any): boolean {
@@ -1623,11 +1676,60 @@ async function sendTx(tx: Transaction | VersionedTransaction, signers: Keypair[]
   throw new TxSendError(redactSecrets(`${label} tx ${sig.slice(0, 8)}… ${status}${detail}`), status, sig);
 }
 
+/** Jupiter slippage cap ceiling for re-quotes after 0x1771 (default 150 bps = 3× the 50 bps base). */
+const JUPITER_SLIPPAGE_MAX_BPS = Math.max(JUPITER_SLIPPAGE_BPS, Number(process.env.JUPITER_SLIPPAGE_MAX_BPS ?? 150));
+/** Attempts per swap call (re-quote each time). */
+const JUPITER_SWAP_ATTEMPTS = Math.max(1, Math.min(6, Number(process.env.JUPITER_SWAP_ATTEMPTS ?? 3)));
+
+/**
+ * Jupiter swap with in-process retry: each attempt re-quotes (fresh route + blockhash). 0x1771 (slippage) →
+ * retry with a higher slippage cap (≤ JUPITER_SLIPPAGE_MAX_BPS); 5xx / 429 / network / expired → backoff
+ * (2 s, 4 s …); a signed tx with unknown fate is never retried (it may land); gas-gate / 4xx failures are final.
+ */
 async function executeJupiterSwap(
   inputMint: PublicKey,
   outputMint: PublicKey,
   amountLamports: string,
   spotUsdForNotional: number = 0
+): Promise<SwapResult> {
+  let slippage = JUPITER_SLIPPAGE_BPS;
+  let last: SwapResult | null = null;
+  for (let attempt = 1; attempt <= JUPITER_SWAP_ATTEMPTS; attempt++) {
+    const r = await executeJupiterSwapOnce(inputMint, outputMint, amountLamports, spotUsdForNotional, slippage);
+    if (r.sig) {
+      if (attempt > 1) console.log(`[JUPITER] swap landed on attempt ${attempt} (slippage cap ${slippage} bps)`);
+      return r;
+    }
+    last = r;
+    const kind = classifySwapFailure({ message: r.error || "", httpStatus: r.httpStatus, attemptedSig: r.attemptedSig, landedStatus: r.landedStatus });
+    if (kind === "fatal" || kind === "unsafe" || attempt === JUPITER_SWAP_ATTEMPTS) {
+      if (attempt > 1 || kind === "unsafe") console.warn(`[JUPITER] giving up after ${attempt} attempt(s) (${kind}): ${(r.error || "").slice(0, 160)}`);
+      break;
+    }
+    if (kind === "slippage") {
+      const next = nextSlippageBps(slippage, JUPITER_SLIPPAGE_MAX_BPS);
+      if (next <= slippage) {
+        console.warn(`[JUPITER] slippage exceeded at the ${slippage} bps cap ceiling — giving up this call`);
+        break;
+      }
+      console.warn(`[JUPITER] slippage exceeded (0x1771) at ${slippage} bps — re-quoting at ${next} bps (attempt ${attempt + 1}/${JUPITER_SWAP_ATTEMPTS})`);
+      slippage = next;
+      await new Promise((res) => setTimeout(res, 500));
+    } else {
+      const d = swapRetryDelayMs(attempt);
+      console.warn(`[JUPITER] transient failure (${(r.error || "").slice(0, 100)}) — retry ${attempt + 1}/${JUPITER_SWAP_ATTEMPTS} in ${(d / 1000).toFixed(1)}s`);
+      await new Promise((res) => setTimeout(res, d));
+    }
+  }
+  return last!;
+}
+
+async function executeJupiterSwapOnce(
+  inputMint: PublicKey,
+  outputMint: PublicKey,
+  amountLamports: string,
+  spotUsdForNotional: number = 0,
+  slippageBps: number = JUPITER_SLIPPAGE_BPS
 ): Promise<SwapResult> {
   const empty: SwapResult = {
     sig: "",
@@ -1637,7 +1739,7 @@ async function executeJupiterSwap(
     direction: `${inputMint.toBase58().slice(0, 4)}→${outputMint.toBase58().slice(0, 4)}`,
     inMint: inputMint.toBase58(),
     outMint: outputMint.toBase58(),
-    slippageBps: JUPITER_SLIPPAGE_BPS,
+    slippageBps,
     usdNotional: 0,
     isEstimate: true,
   };
@@ -1651,7 +1753,7 @@ async function executeJupiterSwap(
     const quoteUrl =
       `${JUPITER_API_BASE}/quote?inputMint=${inputMint.toBase58()}` +
       `&outputMint=${outputMint.toBase58()}&amount=${amountLamports}` +
-      `&slippageBps=${JUPITER_SLIPPAGE_BPS}&restrictIntermediateTokens=true`;
+      `&slippageBps=${slippageBps}&restrictIntermediateTokens=true`;
     const quoteRes = await axios.get(quoteUrl, { timeout: 10000, headers });
     const quoteResponse = quoteRes.data;
     if (!quoteResponse || quoteResponse.error || !quoteResponse.outAmount) {
@@ -1665,9 +1767,22 @@ async function executeJupiterSwap(
     const inIsUsdc = inputMint.equals(USDC_MINT);
     const outIsUsdc = outputMint.equals(USDC_MINT);
 
-    // Keep a fee buffer so the swap itself cannot drain the gas reserve.
-    if (!(await ensureGasReserve(5_000_000))) {
-      throw new Error("SOL below gas reserve — refusing Jupiter swap");
+    // H0: a swap that BUYS SOL (USDC→SOL) only needs fee headroom — it raises native SOL, so gating it on
+    // reserve + buffer deadlocked the redeploy whenever native SOL sat just under the reserve after a
+    // take-profit. Swaps that spend SOL keep the old reserve + 0.005 SOL gate (callers size them to leave it).
+    {
+      const nativeNow = await connection.getBalance(wallet.publicKey);
+      const gate = swapGasGate({
+        inIsSol,
+        nativeLamports: nativeNow,
+        reserveLamports: GAS_RESERVE_LAMPORTS,
+        bufferLamports: 5_000_000,
+        feeFloorLamports: TX_FEE_FLOOR_LAMPORTS,
+      });
+      if (!gate.ok) {
+        console.warn(`[GAS] Jupiter ${inIsSol ? "SOL→" : "→SOL/other"} swap refused: ${gate.reason}`);
+        throw new Error("SOL below gas reserve — refusing Jupiter swap");
+      }
     }
 
     const swapRes = await axios.post(
@@ -1835,7 +1950,13 @@ async function executeJupiterSwap(
       is_estimate: true,
     });
     // Nothing signed yet (quote / gas gate / API error) → nothing can land → safe to retry.
-    return { ...empty, attemptedSig: attemptedSig || undefined, landedStatus: attemptedSig ? (landedStatus ?? "unknown") : "not_landed" };
+    return {
+      ...empty,
+      attemptedSig: attemptedSig || undefined,
+      landedStatus: attemptedSig ? (landedStatus ?? "unknown") : "not_landed",
+      error: String(err?.message || err),
+      httpStatus: Number(err?.response?.status) || undefined,
+    };
   }
 }
 
@@ -2454,23 +2575,36 @@ async function topUpExistingPosition(dlmmPool: DLMM): Promise<void> {
     const splitRange = rangeForProfile(config);
     const totalBins = Math.max(1, splitRange.bidBins + splitRange.askBins);
     const askRatio = splitRange.askBins / totalBins;
-    const bidRatio = splitRange.bidBins / totalBins;
-    const targetAskUsd = idleUsd * askRatio;
-    const targetBidUsd = idleUsd * bidRatio;
-
-    const solSurplusUsd = idleSolUsd - targetAskUsd;
-    if (solSurplusUsd > MIN_SWAP_USD) {
-      const sellLamports = Math.floor((solSurplusUsd / spotPriceUsd) * 1e9);
-      await executeJupiterSwap(WSOL_MINT, USDC_MINT, sellLamports.toString(), spotPriceUsd);
-    } else if (-solSurplusUsd > MIN_SWAP_USD) {
-      const buyUsd = Math.min(usdcUsd, -solSurplusUsd);
-      if (buyUsd > MIN_SWAP_USD) {
-        await executeJupiterSwap(USDC_MINT, WSOL_MINT, Math.floor(buyUsd * 1e6).toString(), spotPriceUsd);
+    // H3: keep reserve + fee buffer out of the top-up and, when native SOL is under it, buy the shortfall
+    // from the idle USDC (the old path gated the USDC→SOL buy on the very reserve it would have restored).
+    const topupHoldback = GAS_RESERVE_LAMPORTS + 5_000_000;
+    const plan = planInventory({
+      nativeLamports: solLamports,
+      usdcRaw: Math.floor(usdcUsd * 1e6),
+      holdbackLamports: topupHoldback,
+      spotUsd: spotPriceUsd,
+      askRatio,
+      deployPct: 1,
+      minSwapUsd: MIN_SWAP_USD,
+      slippageBps: Math.max(100, JUPITER_SLIPPAGE_BPS * 2),
+    });
+    if (!plan.ok) {
+      console.warn(`[TOPUP] Skipping — ${plan.reason}`);
+      return;
+    }
+    const targetAskUsd = plan.targetAskUsd;
+    const targetBidUsd = plan.targetBidUsd;
+    if (plan.sellSolLamports > 0) {
+      await executeJupiterSwap(WSOL_MINT, USDC_MINT, plan.sellSolLamports.toString(), spotPriceUsd);
+    } else if (plan.buyUsdcRaw > 0) {
+      if (plan.deficitLamports > 0) {
+        console.log(`[TOPUP] native SOL ${(solLamports / 1e9).toFixed(6)} is ${(plan.deficitLamports / 1e9).toFixed(6)} short of reserve+buffer — buying it from USDC`);
       }
+      await executeJupiterSwap(USDC_MINT, WSOL_MINT, plan.buyUsdcRaw.toString(), spotPriceUsd);
     }
 
     const solBal2 = await connection.getBalance(wallet.publicKey);
-    const addSolLamports = Math.max(0, Math.min(solBal2 - GAS_RESERVE_LAMPORTS, Math.floor((targetAskUsd / spotPriceUsd) * 1e9)));
+    const addSolLamports = Math.max(0, Math.min(solBal2 - topupHoldback, Math.floor((targetAskUsd / spotPriceUsd) * 1e9)));
     let addUsdcRaw = 0;
     try {
       addUsdcRaw = Math.floor(Math.min(Number((await getAccount(connection, botUsdcAta)).amount) / 1e6, targetBidUsd) * 1e6);
@@ -2580,7 +2714,7 @@ async function estimateOpenCost(
   dlmmPool: DLMM,
   minBinId: number,
   maxBinId: number
-): Promise<{ lamports: number; detail: string }> {
+): Promise<{ lamports: number; detail: string; positionRentLamports: number }> {
   const binCount = maxBinId - minBinId + 1;
   let positionRent: number;
   let posSrc = "rent-exempt";
@@ -2611,7 +2745,7 @@ async function estimateOpenCost(
   const detail =
     `position rent ${(positionRent / 1e9).toFixed(6)} (${posSrc}) + ${binArrays} bin array(s) [${arraySrc}]` +
     (bitmapLamports > 0 ? ` + bitmap ${(bitmapLamports / 1e9).toFixed(6)}` : "");
-  return { lamports, detail };
+  return { lamports, detail, positionRentLamports: positionRent };
 }
 
 async function deployAsymmetricPosition(dlmmPool: DLMM) {
@@ -2662,36 +2796,49 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
         `open cost ${(openCost.lamports / 1e9).toFixed(6)} (${openCost.detail}) + fee buffer ${(DEPLOY_FEE_BUFFER_LAMPORTS / 1e9).toFixed(4)}`
     );
 
-    // Idle capital = USDC + native SOL above the holdback (WSOL already unwrapped above).
+    // Idle capital = USDC + native SOL above the holdback (WSOL already unwrapped above). H0: when native SOL
+    // is BELOW the holdback (e.g. a take-profit left the wallet USDC-heavy with ~0.122 SOL), the shortfall is
+    // bought from USDC in the same rebalance swap instead of refusing the deploy forever.
     const preSolBal = await connection.getBalance(wallet.publicKey);
-    const existingSolUsd = (Math.max(0, preSolBal - holdbackLamports) / 1e9) * spotPriceUsd;
-    const totalWorkingCapital = usdcBalanceUnits + existingSolUsd;
-    // DEPLOY_PCT overrides regime capitalDeployPct (default 1.0 = deploy ~100% idle).
-    const targetDeployCapital = totalWorkingCapital * DEPLOY_PCT;
-
     const totalBins = Math.max(1, range.bidBins + range.askBins);
     const askRatio = range.askBins / totalBins;
-    const bidRatio = range.bidBins / totalBins;
-    const targetAskUsd = targetDeployCapital * askRatio;
-    const targetBidUsdcUsd = targetDeployCapital * bidRatio;
+    const plan = planInventory({
+      nativeLamports: preSolBal,
+      usdcRaw: Math.floor(usdcBalanceUnits * 1e6),
+      holdbackLamports,
+      spotUsd: spotPriceUsd,
+      askRatio,
+      deployPct: DEPLOY_PCT,
+      minSwapUsd: MIN_SWAP_USD,
+      slippageBps: Math.max(100, JUPITER_SLIPPAGE_BPS * 2),
+    });
+    if (!plan.ok) throw new Error(`Deploy sizing: ${plan.reason}`);
+    const targetAskUsd = plan.targetAskUsd;
+    const targetBidUsdcUsd = plan.targetBidUsd;
+    if (plan.deficitLamports > 0) {
+      console.log(
+        `[DEPLOY] native ${(preSolBal / 1e9).toFixed(6)} SOL is ${(plan.deficitLamports / 1e9).toFixed(6)} short of the holdback — ` +
+          `buying it from USDC with the ask inventory`
+      );
+    }
 
     // Net inventory rebalance: swap only the difference, either direction.
     let swapSig = "";
-    const solSurplusUsd = existingSolUsd - targetAskUsd; // >0 means too much SOL
-    if (solSurplusUsd > MIN_SWAP_USD) {
-      const sellLamports = Math.floor((solSurplusUsd / spotPriceUsd) * 1e9);
-      await notify(`🔄 Rebalancing $${solSurplusUsd.toFixed(2)} SOL → USDC for bid inventory...`);
-      const _swap = await executeJupiterSwap(WSOL_MINT, USDC_MINT, sellLamports.toString(), spotPriceUsd);
+    if (plan.sellSolLamports > 0) {
+      const sellUsd = (plan.sellSolLamports / 1e9) * spotPriceUsd;
+      await notify(`🔄 Rebalancing $${sellUsd.toFixed(2)} SOL → USDC for bid inventory...`);
+      const _swap = await executeJupiterSwap(WSOL_MINT, USDC_MINT, plan.sellSolLamports.toString(), spotPriceUsd);
       swapSig = _swap.sig;
       if (!swapSig) throw new Error("Jupiter SOL→USDC rebalance failed. Aborting deployment.");
-    } else if (-solSurplusUsd > MIN_SWAP_USD) {
-      const buyUsd = Math.min(usdcBalanceUnits, -solSurplusUsd);
-      if (buyUsd > MIN_SWAP_USD) {
-        await notify(`🔄 Rebalancing $${buyUsd.toFixed(2)} USDC → SOL for ask inventory...`);
-        const _swap = await executeJupiterSwap(USDC_MINT, WSOL_MINT, Math.floor(buyUsd * 1e6).toString(), spotPriceUsd);
-        swapSig = _swap.sig;
-        if (!swapSig) throw new Error("Jupiter USDC→SOL rebalance failed. Aborting deployment.");
-      }
+    } else if (plan.buyUsdcRaw > 0) {
+      const buyUsd = plan.buyUsdcRaw / 1e6;
+      await notify(
+        `🔄 Rebalancing $${buyUsd.toFixed(2)} USDC → SOL for ask inventory` +
+          (plan.deficitLamports > 0 ? ` (incl. ${(plan.deficitLamports / 1e9).toFixed(4)} SOL gas holdback)` : "") + "..."
+      );
+      const _swap = await executeJupiterSwap(USDC_MINT, WSOL_MINT, plan.buyUsdcRaw.toString(), spotPriceUsd);
+      swapSig = _swap.sig;
+      if (!swapSig) throw new Error("Jupiter USDC→SOL rebalance failed. Aborting deployment.");
     }
 
     const solBal = await connection.getBalance(wallet.publicKey);
@@ -2776,6 +2923,17 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
       depositedSol = Math.max(0, -(d.solEffectiveDelta) - (d.feeLamports ?? 0));
       depositedUsdc = Math.max(0, -(d.usdcRawDelta));
     }
+    // M1: the wallet's SOL decrease includes the new position's rent (+ any new bin arrays), which is not
+    // liquidity. Subtract it so the DEPLOY row's SOL = SOL actually added to the bins.
+    {
+      let posRent = openCost.positionRentLamports;
+      try {
+        const b = await connection.getBalance(newPositionKeypair.publicKey);
+        if (b > 0) posRent = b;
+      } catch {}
+      const rentPaid = posRent + Math.max(0, openCost.lamports - openCost.positionRentLamports);
+      depositedSol = Math.max(0, depositedSol - rentPaid);
+    }
     if (deployFee > 0) cumulativeGasSol += deployFee / 1e9;
 
     // Post-deploy must still hold the gas reserve
@@ -2791,6 +2949,11 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     highestBinPrice = calculateBinPriceUsd(spotPriceUsd, activeBin.binId, maxBinId, poolBinStep);
     belowRangeTickCount = 0;
     markStopsArmed();
+    if (redeployPending || flatGuard) {
+      console.log(`[REDEPLOY] Position open — pending redeploy (${redeployPending?.reason ?? "n/a"}) and flat guard cleared`);
+    }
+    redeployPending = null;
+    disarmFlatGuard();
 
     const deployedSolValueUsd = (depositedSol / 1e9) * spotPriceUsd;
     const deployedUsdcValueUsd = depositedUsdc / 1e6;
@@ -2840,7 +3003,30 @@ async function deployAsymmetricPosition(dlmmPool: DLMM) {
     const msg = err?.message || String(err);
     console.error("Deployment failed:", msg);
     const abortedForExit = /Abort deploy — exit\/pause lock/i.test(msg);
-    if (!abortedForExit) {
+    if (!abortedForExit && redeployPending) {
+      // C1: a redeploy owed after a close is retried on a bounded backoff (no 600 s cooldown, no Gate 3);
+      // the flat guard keeps the stop on any SOL held meanwhile.
+      const nowF = Math.floor(Date.now() / 1000);
+      redeployPending.attempt += 1;
+      const a = redeployPending.attempt;
+      if (a >= REDEPLOY_MAX_ATTEMPTS) {
+        const why = redeployPending.reason;
+        redeployPending = null;
+        inCooldownUntil = nowF + 600;
+        await notify(
+          `⚠️ [DEPLOYMENT FAILED] ${msg}. Gave up the ${why} redeploy after ${a} attempts — back to normal Gate 1-3 re-entry` +
+            (flatGuard ? `; flat stop $${flatGuard.stopPrice.toFixed(2)} stays armed on the SOL held.` : ".")
+        );
+      } else {
+        const d = redeployDelaySec(a, REDEPLOY_RETRY_BASE_SEC, REDEPLOY_RETRY_MAX_SEC);
+        redeployPending.nextAt = nowF + d;
+        await notify(
+          `⚠️ [DEPLOYMENT FAILED] ${msg}. ${redeployPending.reason} redeploy retry ${a + 1}/${REDEPLOY_MAX_ATTEMPTS} in ~${d}s` +
+            (flatGuard ? ` (flat stop $${flatGuard.stopPrice.toFixed(2)} armed on the SOL held).` : ".")
+        );
+      }
+      void emitLedger({ event: "ERROR", notes: `Deploy failed (pending redeploy attempt ${a}): ${msg}`, is_estimate: true });
+    } else if (!abortedForExit) {
       await notify(`⚠️ [DEPLOYMENT FAILED] ${msg}. Standing by.`);
       inCooldownUntil = Math.floor(Date.now() / 1000) + 600;
       void emitLedger({ event: "ERROR", notes: `Deploy failed: ${msg}`, is_estimate: true });
@@ -3739,6 +3925,89 @@ function logRpcUsage(now: number): void {
   lastRpcLogAt = now;
 }
 
+/**
+ * C1: the flat guard fired — sell the SOL held while flat (above reserve + margin) to USDC. On failure the guard
+ * switches to "liquidation pending" and retries with backoff (30 s, 60 s, … ≤ 5 min) on later ticks.
+ */
+async function liquidateFlatSol(reason: string, spotUsd: number): Promise<void> {
+  if (isLiquidating || isExiting || isDeploying) return;
+  isLiquidating = true;
+  isExiting = true;
+  const now = Math.floor(Date.now() / 1000);
+  try {
+    // Unwrap WSOL first so the whole SOL balance is native (Jupiter wraps the input itself).
+    try {
+      const wsolAta = await getAssociatedTokenAddress(WSOL_MINT, wallet.publicKey);
+      const acc = await getAccount(connection, wsolAta);
+      if (acc && Number(acc.amount) > 0) {
+        await sendTx(new Transaction().add(createCloseAccountInstruction(wsolAta, wallet.publicKey, wallet.publicKey)), [wallet], "WSOL unwrap");
+      }
+    } catch {}
+    const native = await connection.getBalance(wallet.publicKey);
+    const dump = flatSolDumpLamports(native, 0, GAS_RESERVE_LAMPORTS, 5_000_000);
+    if (dump < 1_000_000) {
+      console.log(`[FLAT STOP] Nothing to sell (native ${(native / 1e9).toFixed(4)} SOL) — guard disarmed`);
+      disarmFlatGuard();
+      redeployPending = null;
+      return;
+    }
+    await notify(
+      `🚨 <b>[FLAT STOP TRIGGERED]</b> ${escapeHtml(reason)}\n` +
+        `• Flat (no position) holding ${(dump / 1e9).toFixed(4)} SOL above reserve — selling to USDC...`
+    );
+    let sig = "";
+    try {
+      sig = (await executeJupiterSwap(WSOL_MINT, USDC_MINT, dump.toString(), spotUsd)).sig;
+    } catch (e: any) {
+      console.error("[FLAT STOP] swap error:", e?.message || e);
+    }
+    if (!sig) {
+      flatLiquidationFailures += 1;
+      const d = Math.min(300, 30 * 2 ** (flatLiquidationFailures - 1));
+      flatLiquidationRetryAt = now + d;
+      if (flatGuard) flatGuard = { ...flatGuard, stopPrice: Number.POSITIVE_INFINITY, source: `liquidation pending after: ${reason}` };
+      await notify(`🚨 <b>[FLAT STOP INCOMPLETE]</b> SOL→USDC swap failed (attempt ${flatLiquidationFailures}); retrying in ~${d}s.`);
+      void emitLedger({ event: "ERROR", notes: `Flat stop swap failed (attempt ${flatLiquidationFailures}): ${reason}`, is_estimate: true });
+      return;
+    }
+    let exitEquityUsd = 0;
+    try {
+      exitEquityUsd = Number((await getWalletLiquidEquityUsd(spotUsd)).totalUsd.toFixed(2));
+    } catch {}
+    const cycleEntryEquityUsd = entryEquityUsd;
+    const cyclePnl = cycleEntryEquityUsd > 0 ? cycleRealizedPnlUsd(exitEquityUsd, cycleEntryEquityUsd, sweptSinceEntryUsd) : null;
+    const totalPnl = totalPnlUsd(exitEquityUsd);
+    const cooldownSec = lockedCooldownSec();
+    lastExitPriceUsd = spotUsd;
+    clearEntryState();
+    disarmFlatGuard();
+    redeployPending = null;
+    inCooldownUntil = Math.floor(Date.now() / 1000) + cooldownSec;
+    await notify(
+      `🛡️ <b>[CIRCUIT BREAKER COMPLETE]</b> (flat-with-SOL stop)\n` +
+        `• Sold ${(dump / 1e9).toFixed(4)} SOL → USDC (equity $${exitEquityUsd.toFixed(2)})\n` +
+        `• Realized (cycle): ${cyclePnl != null ? fmtSignedUsd(cyclePnl) : "n/a"}\n` +
+        `• Net PnL vs capital: ${fmtSignedUsd(totalPnl)}\n` +
+        `• Cooldown: Locked for ${cooldownSec / 60} minutes\n` +
+        `• Swap Tx: <code>${sig}</code>`
+    );
+    await emitLedger({
+      event: "CIRCUIT_BREAKER",
+      spot_usd: spotUsd,
+      realized_pnl_usd: cyclePnl ?? undefined,
+      total_equity_usd: exitEquityUsd,
+      entry_equity: cycleEntryEquityUsd || undefined,
+      ...pnlLedgerExtras(exitEquityUsd),
+      tx_sig: sig,
+      notes: `Flat-with-SOL stop: ${reason}. Sold ${(dump / 1e9).toFixed(6)} SOL. Net PnL vs capital: ${fmtSignedUsd(totalPnl)}`,
+      is_estimate: false,
+    });
+  } finally {
+    isLiquidating = false;
+    isExiting = false;
+  }
+}
+
 async function runKeeper() {
   await notify(
     "🚀 DLMM Automated Keeper initialized on Railway." +
@@ -3962,6 +4231,56 @@ async function runKeeper() {
     activePositionPubkey = null;
     clearEntryState();
     lastExitPriceUsd = bootSpotUsd; // Anchor price to prevent premature Gate 3 bypass
+    // C1: flat but holding SOL (restart between a close and its redeploy, or a failed stop liquidation):
+    // arm a stop on that SOL and owe a redeploy, instead of sitting unprotected until Gate 3 clears.
+    let bootFlatSolUsd = 0;
+    try {
+      const w = await snapshotWalletBalances();
+      bootFlatSolUsd = flatSolExposureUsd(w.nativeLamports, w.wsolRaw, GAS_RESERVE_LAMPORTS, bootSpotUsd);
+    } catch (e: any) {
+      console.warn("[BOOT] wallet read for flat-SOL check failed:", e?.message || e);
+    }
+    if (bootFlatSolUsd >= FLAT_SOL_GUARD_MIN_USD && isValidSpot(bootSpotUsd)) {
+      const pinStop = parseStopPctPin(ENTRY_STOP_PCT_ENV);
+      const r = resolveBootFlatGuard({
+        spotUsd: bootSpotUsd,
+        walletEquityUsd: bootEquityUsd,
+        pinSpotUsd: Number(ENTRY_SPOT_USD_ENV) > 0 ? Number(ENTRY_SPOT_USD_ENV) : null,
+        pinEquityUsd: Number(ENTRY_EQUITY_USD_ENV) > 0 ? Number(ENTRY_EQUITY_USD_ENV) : null,
+        pinStopPct: pinStop.ok ? pinStop.value : null,
+        defaultStopPct: REGIME_PROFILES[DEFAULT_REGIME].floorStopPct,
+        maxDrawdownPct: MAX_DRAWDOWN_PCT,
+      });
+      entrySpotUsd = r.entrySpotUsd;
+      entryEquityUsd = r.entryEquityUsd;
+      const lr = regimeForStopPct(r.stopPct);
+      entryStopLock = { stopPct: r.stopPct, cooldownSec: REGIME_PROFILES[lr].cooldownSec, regime: lr, source: r.guard.source };
+      flatGuard = r.guard;
+      flatGuardSince = Math.floor(Date.now() / 1000);
+      flatSolAlertedAt = flatGuardSince;
+      if (BOOT_FLAT_REDEPLOY) redeployPending = { attempt: 0, nextAt: flatGuardSince + 30, reason: "boot-flat" };
+      markStopsArmed();
+      console.warn(`[BOOT] Flat holding $${bootFlatSolUsd.toFixed(2)} SOL above reserve — flat stop $${r.guard.stopPrice.toFixed(2)} (${r.how})${BOOT_FLAT_REDEPLOY ? "; redeploy owed" : "; re-entry via Gate 1-3"}`);
+      await notify(
+        `⚠️ <b>[FLAT WITH SOL]</b> Booted with no position but $${bootFlatSolUsd.toFixed(2)} of SOL above the gas reserve.\n` +
+          `• Flat stop: $${r.guard.stopPrice.toFixed(2)} — ${escapeHtml(r.how)}\n` +
+          (r.guard.equityStop > 0 ? `• Equity stop: $${r.guard.equityStop.toFixed(2)}\n` : "") +
+          (BOOT_FLAT_REDEPLOY
+            ? `• Redeploying around spot in ~30 s (retries with backoff; Gate 3 bypassed for this owed redeploy).\n`
+            : `• The stop is evaluated every tick on that SOL; re-entry waits for Gate 1-3 as usual (no blind deploy at boot).\n`) +
+          `• Equity: ${bootEquityUsd != null ? `$${bootEquityUsd.toFixed(2)}` : "n/a"} | Capital Baseline: ${capitalBaselineLabel()}`
+      );
+      void emitLedger({
+        event: "ATTACH",
+        spot_usd: bootSpotUsd,
+        total_equity_usd: bootEquityUsd ?? undefined,
+        entry_spot: entrySpotUsd,
+        entry_equity: entryEquityUsd || undefined,
+        ...pnlLedgerExtras(bootEquityUsd ?? entryEquityUsd),
+        notes: `Boot flat with SOL ($${bootFlatSolUsd.toFixed(2)} above reserve): flat stop $${r.guard.stopPrice.toFixed(2)} (${r.how}); ${BOOT_FLAT_REDEPLOY ? "redeploy owed" : "re-entry via Gate 1-3"}`,
+        is_estimate: false,
+      });
+    } else {
     if (ENTRY_SPOT_USD_ENV || ENTRY_EQUITY_USD_ENV || ENTRY_POSITION_PUBKEY_ENV) {
       console.warn("[ENTRY] ENTRY_* pin ignored — no open position at boot (stale pin; safe to remove).");
     }
@@ -3970,6 +4289,7 @@ async function runKeeper() {
       `Capital Baseline: ${capitalBaselineLabel()}. Standing by for Gate 1-3 clearance.\n` +
       `• Next fee sweep: ${nextSweepLabel()}`
     );
+    }
   }
 
   // Stop-blindness watchdog (independent of the keeper tick so a hung tick is also caught).
@@ -3987,7 +4307,10 @@ async function runKeeper() {
       if (isBotPaused || isExiting) return;
 
       const now = Math.floor(Date.now() / 1000);
-      if (now < inCooldownUntil) return;
+      // In cooldown with a position: nothing to do (as before). Flat: keep reading so the flat guard can still
+      // protect SOL held while flat (C1); everything else is skipped below until the cooldown ends.
+      const inCooldown = now < inCooldownUntil;
+      if (inCooldown && activePositionPubkey) return;
 
       // ONE batched read (1 credit): pool → active bin → spot, wallet SOL/USDC/WSOL, tracked positions.
       // Same fail-closed read guard as before: a failed/partial read skips the tick (stops not evaluated,
@@ -4022,6 +4345,49 @@ async function runKeeper() {
       // checks below are never delayed by external API calls. The tick only needs the cached label.
       void regimeSentinel.evaluate().catch((e: any) => console.warn("[REGIME] eval error:", e?.message || e));
       const currentConfig = regimeSentinel.current();
+
+      // ---- C1: flat-with-SOL guard (price + equity stop on SOL held while there is no position) ----
+      if (!activePositionPubkey && !isDeploying && !isLiquidating) {
+        const exposureUsd = flatSolExposureUsd(snap.nativeLamports, snap.wsolRaw, GAS_RESERVE_LAMPORTS, currentPrice);
+        const liquidationPending = !!flatGuard && !Number.isFinite(flatGuard.stopPrice);
+        if (exposureUsd >= FLAT_SOL_GUARD_MIN_USD || (liquidationPending && exposureUsd > 1)) {
+          if (!flatGuard) {
+            const pct = lockedStopPct();
+            flatGuard =
+              entrySpotUsd > 0
+                ? { stopPrice: priceStopFromEntry(), equityStop: equityStopFromEntry(), source: `kept entry $${entrySpotUsd.toFixed(2)} stop ${stopLockLabel()}` }
+                : { stopPrice: currentPrice * (1 - pct), equityStop: 0, source: `spot-based default ${(pct * 100).toFixed(1)}% (SOL found while flat)` };
+          }
+          if (!flatGuardSince) flatGuardSince = now;
+          lastPriceStopEvalAt = now;
+          let walletEqUsd: number | null = null;
+          const se = snapshotEquity(snap, null, currentPrice);
+          if (se.ok && se.totalUsd != null) {
+            walletEqUsd = se.totalUsd;
+            lastEquityStopEvalAt = now;
+          }
+          if (now - flatSolAlertedAt >= FLAT_SOL_ALERT_REPEAT_SEC) {
+            flatSolAlertedAt = now;
+            await notify(
+              `⚠️ <b>[FLAT WITH SOL]</b> No open position, holding $${exposureUsd.toFixed(2)} of SOL above the gas reserve ` +
+                `(since ${formatUnixPt(flatGuardSince)}).\n` +
+                `• Flat stop: ${Number.isFinite(flatGuard.stopPrice) ? `$${flatGuard.stopPrice.toFixed(2)}` : "liquidation pending"} (${escapeHtml(flatGuard.source)})` +
+                (flatGuard.equityStop > 0 ? ` | equity ≤ $${flatGuard.equityStop.toFixed(2)}` : "") + `\n` +
+                `• Spot $${currentPrice.toFixed(2)}. ` +
+                (redeployPending ? `Redeploy (${redeployPending.reason}) retry at ${formatUnixPt(Math.max(now, redeployPending.nextAt))}.` : "Waiting for Gate 1-3 re-entry.")
+            );
+          }
+          const hit = flatGuardHit(flatGuard, currentPrice, walletEqUsd);
+          if (hit.hit) {
+            if (now >= flatLiquidationRetryAt) await liquidateFlatSol(hit.reason, currentPrice);
+            return;
+          }
+        } else if (flatGuard) {
+          console.log(`[FLAT GUARD] SOL above reserve now $${exposureUsd.toFixed(2)} (< $${FLAT_SOL_GUARD_MIN_USD}) — disarmed`);
+          disarmFlatGuard();
+        }
+      }
+      if (inCooldown) return;
 
       // Scheduled sweep (before idle top-up so top-up doesn't absorb USDC about to be swept).
       // lastSweepTime only advances on an actual sweep (inside sweepRevenueToVault); if a due sweep
@@ -4090,6 +4456,20 @@ async function runKeeper() {
 
       // Re-entry evaluation if parked in 100% USDC
       if (!activePositionPubkey) {
+        // C1: a redeploy owed after a close / found at boot bypasses Gate 3 (it is the second half of a
+        // recenter or take-profit) but keeps Gate 2 and its own bounded backoff.
+        if (redeployPending) {
+          if (now >= redeployPending.nextAt && !isDeploying) {
+            const g2 = getGate2VolatilityState(dlmmPoolInstance!);
+            if (g2.passed) {
+              console.log(`[REDEPLOY] ${redeployPending.reason} redeploy attempt ${redeployPending.attempt + 1}/${REDEPLOY_MAX_ATTEMPTS}`);
+              await deployAsymmetricPosition(dlmmPoolInstance!);
+            } else {
+              redeployPending.nextAt = now + 60;
+            }
+          }
+          return;
+        }
         // Gate 2: live variable-fee bps from volatilityAccumulator (see getGate2VolatilityState).
         const gate2 = getGate2VolatilityState(dlmmPoolInstance!);
         if (gate2.passed) {
@@ -4228,6 +4608,13 @@ async function runKeeper() {
 
           lastExitPriceUsd = currentPrice;
           clearEntryState();
+          redeployPending = null;
+          if (!swapSig && dumpSolLamports > 0.05 * 1e9) {
+            // C1: the stop's SOL→USDC swap failed — keep liquidating on later ticks (flat guard, even in cooldown).
+            flatGuard = { stopPrice: Number.POSITIVE_INFINITY, equityStop: 0, source: `circuit breaker swap failed (${stopReason})` };
+            flatGuardSince = Math.floor(Date.now() / 1000);
+            flatLiquidationRetryAt = flatGuardSince + 30;
+          }
 
           await notify(
             `🛡️ <b>[CIRCUIT BREAKER COMPLETE]</b>\n` +
@@ -4309,6 +4696,11 @@ async function runKeeper() {
           // cannot ratchet down with each recenter in a downtrend.
           lastRecenterAt = now;
           belowRangeTickCount = 0;
+          // C1: the SOL now in the wallet keeps the entry stop until the redeploy lands; a failed redeploy is
+          // retried on a bounded backoff (REDEPLOY_RETRY_*).
+          armFlatGuardFromEntry("recenter");
+          flatGuardSince = now;
+          redeployPending = { attempt: 0, nextAt: now, reason: "recenter" };
           // Release the exit lock first: deployAsymmetricPosition() bails out while isExiting is true.
           isExiting = false;
           // Redeploy reuses native SOL via deployAsymmetricPosition SOL-aware path (no forced USDC dump).
@@ -4382,6 +4774,8 @@ async function runKeeper() {
         highestBinPrice = 0;
         clearEntryState();
         lastRecenterAt = now;
+        // H0/C1: the take-profit redeploy is owed — retried on a bounded backoff if it fails.
+        redeployPending = { attempt: 0, nextAt: now, reason: "take-profit" };
         // Release the exit lock first: deployAsymmetricPosition() bails out while isExiting is true.
         isExiting = false;
         await deployAsymmetricPosition(dlmmPoolInstance!);
