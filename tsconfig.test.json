@@ -21,6 +21,7 @@
     "flatguard.ts",
     "jupretry.ts",
     "tools/**/*.ts",
-    "tests/**/*.ts"
+    "tests/**/*.ts",
+    "paper-hedge/**/*.ts"
   ]
 }

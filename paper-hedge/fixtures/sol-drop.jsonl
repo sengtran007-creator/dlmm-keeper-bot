@@ -1,0 +1,3 @@
+{"ts":1762460000000,"lpSol":5,"lpEquity":650,"solPrice":100,"bid":10,"ask":10.01,"mark":10,"contractSol":0.1,"fingerprint":"pos","positionIds":["fixture"]}
+{"ts":1762460360000,"lpSol":5,"lpEquity":600,"solPrice":90,"bid":9,"ask":9.01,"mark":9,"contractSol":0.1,"fingerprint":"pos","positionIds":["fixture"]}
+{"ts":1762460720000,"lpSol":5,"lpEquity":550,"solPrice":80,"bid":8,"ask":8.01,"mark":8,"contractSol":0.1,"fingerprint":"pos","positionIds":["fixture"]}
