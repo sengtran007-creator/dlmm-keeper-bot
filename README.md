@@ -233,6 +233,10 @@ Use it as a gate: run at least the quick set before shipping any change to open/
 3. Start command should match the `Procfile`: `npm run build && npm start` (or rely on the Procfile worker process).
 4. Use a single replica per service — two processes polling one Telegram token fight over `getUpdates` (HTTP 409). A second service on another pool needs its own wallet and either its own Telegram token or `TELEGRAM_COMMANDS_ENABLED=false`.
 
+## Paper delta hedge (separate process)
+
+`paper-hedge/` simulates a Kalshi SOL-perp short against this bot's LP SOL. It is not part of `npm start` and does not change keeper trades. Railway start command for a **second** service: `npm run build:paper-hedge && npm run start:paper-hedge`. See [paper-hedge/README.md](paper-hedge/README.md).
+
 ## Security
 
 - Never put private keys, Telegram tokens, or webhook URLs in git.

@@ -8,6 +8,8 @@ node_modules/
 node_modules
 dist/
 dist-test/
+dist-paper-hedge/
+paper-hedge-state.json
 
 # Logs & OS
 *.log

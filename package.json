@@ -5,7 +5,10 @@
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
-    "test": "tsc -p tsconfig.test.json && node --test dist-test/tests/"
+    "test": "tsc -p tsconfig.test.json && node --test \"dist-test/tests/**/*.test.js\"",
+    "build:paper-hedge": "tsc -p tsconfig.paper-hedge.json",
+    "start:paper-hedge": "node dist-paper-hedge/paper-hedge/index.js",
+    "replay:paper-hedge": "npm run build:paper-hedge && node dist-paper-hedge/paper-hedge/replay.js"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",
