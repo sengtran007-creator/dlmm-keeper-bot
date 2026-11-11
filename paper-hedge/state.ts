@@ -24,6 +24,8 @@ export function decodeState(raw: string, fallback: Book): { book: Book; ok: bool
       fundingUsd: finite(b.fundingUsd, 0),
       appliedFunding: b.appliedFunding && typeof b.appliedFunding === "object" ? b.appliedFunding : {},
       fingerprint: typeof b.fingerprint === "string" ? b.fingerprint : null,
+      positionSet: typeof b.positionSet === "string" ? b.positionSet : null,
+      lastHedgeCheckMs: finite(b.lastHedgeCheckMs, 0),
       baselineUsd: finite(b.baselineUsd, fallback.baselineUsd),
       lastLogMs: finite(b.lastLogMs, 0),
       lastMarkSolPx: finite(b.lastMarkSolPx, 0),
