@@ -90,7 +90,8 @@ async function main(): Promise<void> {
 
   console.log(
     `[PAPER] paper-only hedger wallet=${owner.toBase58()} pool=${pool.toBase58()} ticker=${cfg.ticker} ` +
-      `poll=${cfg.pollMs / 1000}s stale=${cfg.staleMs / 1000}s band=${cfg.bandPct} capital=${cfg.capitalUsd} ` +
+      `poll=${cfg.pollMs / 1000}s stale=${cfg.staleMs / 1000}s band=${cfg.bandPct} ` +
+      `check=${cfg.hedgeCheckMs / 1000}s ratio=${cfg.hedgeRatio} capital=${cfg.capitalUsd} ` +
       `margin=${cfg.marginFraction} takerFee=${cfg.takerFeeRate} makerFee(unused)=${cfg.makerFeeRate} ` +
       `fundingSign=${cfg.fundingSign} fallbackRate=${cfg.fundingFallbackRate} gasReserve=${cfg.gasReserveLamports} ` +
       `sheet=${cfg.sheetUrl ? "on" : "off"} state=${cfg.statePath}`
@@ -128,6 +129,7 @@ async function main(): Promise<void> {
       };
       const out = step(book, input, cfg);
       book = out.book;
+      if (out.skipLog) console.log(out.skipLog);
       if (out.row) {
         console.log(formatConsole(out.row));
         if (!cfg.sheetUrl && !sheetWarned) {

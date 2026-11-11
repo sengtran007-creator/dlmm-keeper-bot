@@ -18,8 +18,15 @@ export interface Book {
   fundingUsd: number;
   /** Keyed by the exchange funding timestamp (or the fallback ISO time). */
   appliedFunding: Record<string, { rate: number; usd: number; source: "published" | "fallback" }>;
-  /** Null until the first fresh chain read. A change vs this rebalances inside the band. */
+  /** Last fresh position-amount fingerprint. Inventory drift here does not trade by itself. */
   fingerprint: string | null;
+  /**
+   * Sorted open-position account ids from the last fresh read.
+   * Null until that read. A change (close, stop-out, deploy, recenter) re-hedges immediately.
+   */
+  positionSet: string | null;
+  /** Last time the hedge band was evaluated. 0 until the first fresh check. */
+  lastHedgeCheckMs: number;
   baselineUsd: number;
   lastLogMs: number;
   lastMarkSolPx: number;
@@ -80,7 +87,12 @@ export interface StepInput {
 }
 
 export interface HedgeConfig {
+  /** Hourly check: rebalance when |short − target| exceeds this fraction of the target. */
   bandPct: number;
+  /** Target short = LP SOL × hedgeRatio. 1 keeps a full hedge. */
+  hedgeRatio: number;
+  /** Minimum gap between band checks. A position-set change does not wait. */
+  hedgeCheckMs: number;
   contractSol: number;
   takerFeeRate: number;
   fundingFallbackRate: number;
@@ -139,6 +151,8 @@ export interface StepResult {
   stale: boolean;
   staleReasons: string[];
   reason: string;
+  /** Set when a band check ran and the short was left unchanged because drift was inside the band. */
+  skipLog: string | null;
 }
 
 export function freshBook(baselineUsd: number): Book {
@@ -150,6 +164,8 @@ export function freshBook(baselineUsd: number): Book {
     fundingUsd: 0,
     appliedFunding: {},
     fingerprint: null,
+    positionSet: null,
+    lastHedgeCheckMs: 0,
     baselineUsd: Number.isFinite(baselineUsd) ? baselineUsd : 0,
     lastLogMs: 0,
     lastMarkSolPx: 0,
@@ -207,38 +223,114 @@ export function solFromContract(contractPx: number, contractSol: number): number
   return contractPx / contractSol;
 }
 
+/** Canonical id of the open position accounts. Empty means no open position. */
+export function positionSetKey(ids: readonly string[] | null | undefined): string {
+  if (!ids || !ids.length) return "";
+  const uniq = new Set<string>();
+  for (const id of ids) {
+    if (typeof id !== "string") continue;
+    const s = id.trim();
+    if (s) uniq.add(s);
+  }
+  return [...uniq].sort().join(",");
+}
+
+/** LP SOL × hedge ratio, before contract rounding. */
+export function rawTargetSol(lpSol: number, hedgeRatio: number): number {
+  const lp = Number.isFinite(lpSol) ? Math.max(0, lpSol) : 0;
+  const ratio = Number.isFinite(hedgeRatio) ? Math.max(0, hedgeRatio) : 1;
+  return lp * ratio;
+}
+
+/** True when |short − target| exceeds `bandPct` of |target|. Equality does not exceed. */
+export function driftExceedsBand(shortSol: number, rawTarget: number, bandPct: number): boolean {
+  const short = Number.isFinite(shortSol) ? shortSol : 0;
+  const target = Number.isFinite(rawTarget) ? rawTarget : 0;
+  const limit = (bandPct > 0 ? bandPct : 0) * Math.abs(target);
+  return Math.abs(short - target) > limit;
+}
+
+export function bandSkipMessage(args: {
+  shortSol: number;
+  rawTarget: number;
+  bandPct: number;
+  hedgeRatio: number;
+}): string {
+  const short = Number.isFinite(args.shortSol) ? args.shortSol : 0;
+  const target = Number.isFinite(args.rawTarget) ? args.rawTarget : 0;
+  const diff = Math.abs(short - target);
+  const limit = (args.bandPct > 0 ? args.bandPct : 0) * Math.abs(target);
+  return (
+    `[PAPER] hedge check skipped: drift inside band short=${short.toFixed(4)} ` +
+    `target=${target.toFixed(4)} absDiff=${diff.toFixed(4)} limit=${limit.toFixed(4)} ` +
+    `band=${args.bandPct} ratio=${args.hedgeRatio}`
+  );
+}
+
+export interface RebalanceDecision {
+  tradeSol: number;
+  /** Contract-rounded target. */
+  targetShort: number;
+  /** LP SOL × hedge ratio, before contract rounding. */
+  rawTarget: number;
+  deltaUsd: number;
+  reason: "stale" | "open" | "position_change" | "band" | "inside_band" | "hold";
+  /** True when the band was evaluated or a position-set change was applied. */
+  checked: boolean;
+}
+
 /**
- * Target short is LP SOL rounded to the contract. Trade when the dollar
- * residual exceeds `bandPct` of LP value, or immediately on the first fresh
- * read and whenever the position fingerprint changes (open / close / recenter /
- * top-up that moves a position by a bucket).
+ * Target short is LP SOL × hedge ratio, rounded to the contract.
+ *
+ * The band is checked at most once per `checkEveryMs` (default one hour).
+ * A check trades only when |short − target| exceeds `bandPct` of the target.
+ * Replacing the set of open position accounts (stop-out, close, take-profit,
+ * deploy, recenter) does not wait for that hour and trades to the new target
+ * even inside the band, so a flat LP is not left short. SOL drift inside the
+ * same position accounts does not.
  */
 export function rebalanceTrade(args: {
   lpSol: number;
   shortSol: number;
   solPrice: number;
-  lpEquity: number;
-  fingerprint: string;
-  prevFingerprint: string | null;
   contractSol: number;
   bandPct: number;
+  hedgeRatio: number;
   stale: boolean;
-}): { tradeSol: number; targetShort: number; deltaUsd: number; reason: "stale" | "open" | "position_change" | "band" | "hold" } {
-  const targetShort = roundToContract(Math.max(0, args.lpSol), args.contractSol);
+  nowMs: number;
+  lastCheckMs: number;
+  checkEveryMs: number;
+  positionSet: string;
+  prevPositionSet: string | null;
+}): RebalanceDecision {
+  const rawTarget = rawTargetSol(args.lpSol, args.hedgeRatio);
+  const targetShort = roundToContract(rawTarget, args.contractSol);
   const deltaUsd = netDeltaUsd(args.lpSol, args.shortSol, args.solPrice);
-  if (args.stale || !(args.solPrice > 0)) {
-    return { tradeSol: 0, targetShort, deltaUsd, reason: "stale" };
-  }
+  const hold = (reason: RebalanceDecision["reason"], checked: boolean): RebalanceDecision => ({
+    tradeSol: 0,
+    targetShort,
+    rawTarget,
+    deltaUsd,
+    reason,
+    checked,
+  });
+  if (args.stale || !(args.solPrice > 0)) return hold("stale", false);
+
+  const positionChanged = args.prevPositionSet !== null && args.positionSet !== args.prevPositionSet;
+  const hourlyDue = !(args.lastCheckMs > 0) || args.nowMs - args.lastCheckMs >= args.checkEveryMs;
+  if (!positionChanged && !hourlyDue) return hold("hold", false);
+
   const tradeSol = contractDelta(targetShort, args.shortSol, args.contractSol);
-  if (tradeSol === 0) return { tradeSol: 0, targetShort, deltaUsd, reason: "hold" };
-  const first = args.prevFingerprint === null;
-  const positionChanged = !first && args.fingerprint !== args.prevFingerprint;
-  const bandUsd = (args.bandPct > 0 ? args.bandPct : 0) * (args.lpEquity > 0 ? args.lpEquity : 0);
-  const breach = Number.isFinite(deltaUsd) && Math.abs(deltaUsd) > bandUsd;
-  if (first) return { tradeSol, targetShort, deltaUsd, reason: "open" };
-  if (positionChanged) return { tradeSol, targetShort, deltaUsd, reason: "position_change" };
-  if (breach) return { tradeSol, targetShort, deltaUsd, reason: "band" };
-  return { tradeSol: 0, targetShort, deltaUsd, reason: "hold" };
+  if (positionChanged) {
+    if (tradeSol === 0) return hold("hold", true);
+    const reason = args.shortSol <= 1e-12 && tradeSol > 0 ? "open" : "position_change";
+    return { tradeSol, targetShort, rawTarget, deltaUsd, reason, checked: true };
+  }
+  if (tradeSol === 0 || !driftExceedsBand(args.shortSol, rawTarget, args.bandPct)) {
+    return hold(tradeSol === 0 ? "hold" : "inside_band", true);
+  }
+  const reason = args.shortSol <= 1e-12 && tradeSol > 0 ? "open" : "band";
+  return { tradeSol, targetShort, rawTarget, deltaUsd, reason, checked: true };
 }
 
 export function fundingCashUsd(shortSol: number, markSolPx: number, rate: number, fundingSign = 1): number {
@@ -416,16 +508,20 @@ export function step(book: Book, input: StepInput, cfg: HedgeConfig): StepResult
     }
   }
 
+  const positionSet = positionSetKey(input.positionIds);
   const decision = rebalanceTrade({
     lpSol: input.lpSol,
     shortSol: next.shortSol,
     solPrice: input.solPrice,
-    lpEquity: input.lpEquity,
-    fingerprint: input.fingerprint,
-    prevFingerprint: next.fingerprint,
     contractSol,
     bandPct: cfg.bandPct,
+    hedgeRatio: cfg.hedgeRatio,
     stale,
+    nowMs: input.nowMs,
+    lastCheckMs: next.lastHedgeCheckMs,
+    checkEveryMs: cfg.hedgeCheckMs,
+    positionSet,
+    prevPositionSet: next.positionSet,
   });
 
   let tradeSol = 0;
@@ -444,7 +540,11 @@ export function step(book: Book, input: StepInput, cfg: HedgeConfig): StepResult
     fee = next.feesUsd - beforeFees;
     if (!next.openedAtMs && next.shortSol > 0) next.openedAtMs = input.nowMs;
   }
-  if (!stale && input.chainOk) next.fingerprint = input.fingerprint;
+  if (decision.checked) next.lastHedgeCheckMs = input.nowMs;
+  if (!stale && input.chainOk) {
+    next.fingerprint = input.fingerprint;
+    next.positionSet = positionSet;
+  }
 
   const markForPnl = next.lastMarkSolPx;
   const hedge = hedgePnlUsd(next, markForPnl);
@@ -457,7 +557,16 @@ export function step(book: Book, input: StepInput, cfg: HedgeConfig): StepResult
   if (fundingFallback) warnings.push("funding_fallback");
   if (thin) warnings.push("thin_book");
 
-  const shownReason = stale ? "stale" : tradeSol !== 0 ? decision.reason : "hold";
+  const shownReason = stale ? "stale" : tradeSol !== 0 ? decision.reason : decision.reason === "inside_band" ? "inside_band" : "hold";
+  const skipLog =
+    shownReason === "inside_band"
+      ? bandSkipMessage({
+          shortSol: next.shortSol,
+          rawTarget: decision.rawTarget,
+          bandPct: cfg.bandPct,
+          hedgeRatio: cfg.hedgeRatio,
+        })
+      : null;
 
   const noteParts = [
     `reason=${shownReason}`,
@@ -512,5 +621,5 @@ export function step(book: Book, input: StepInput, cfg: HedgeConfig): StepResult
       }
     : null;
 
-  return { book: next, row, warnings, stale, staleReasons, reason: shownReason };
+  return { book: next, row, warnings, stale, staleReasons, reason: shownReason, skipLog };
 }

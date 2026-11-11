@@ -31,7 +31,9 @@ import { decodeState, encodeState } from "../paper-hedge/state";
 
 function cfg(over: Partial<HedgeConfig> = {}): HedgeConfig {
   return {
-    bandPct: 0.05,
+    bandPct: 0.1,
+    hedgeRatio: 1,
+    hedgeCheckMs: 3_600_000,
     contractSol: 0.1,
     takerFeeRate: 0.0004,
     fundingFallbackRate: 0,
@@ -123,39 +125,176 @@ test("position fingerprint changes on open, close, and a 0.05 SOL bucket, not on
   assert.notEqual(a, closed);
 });
 
-test("rebalance stays inside the 5% band and fires on a breach or a position change", () => {
-  const base = {
-    shortSol: 3.5,
+function hedgeArgs(over: Partial<Parameters<typeof rebalanceTrade>[0]> = {}) {
+  return {
+    shortSol: 10,
     solPrice: 100,
-    lpEquity: 650,
     contractSol: 0.1,
-    bandPct: 0.05,
+    bandPct: 0.1,
+    hedgeRatio: 1,
     stale: false,
-    prevFingerprint: "a",
+    nowMs: 1_000_000,
+    lastCheckMs: 0,
+    checkEveryMs: 3_600_000,
+    positionSet: "A",
+    prevPositionSet: "A" as string | null,
+    lpSol: 10,
+    ...over,
   };
-  const inside = rebalanceTrade({ ...base, lpSol: 3.62, fingerprint: "a" });
+}
+
+function at(now: number, over: Partial<StepInput> = {}): StepInput {
+  return input({
+    nowMs: now,
+    chainTsMs: now,
+    lpSol: 10,
+    positionIds: ["A"],
+    quote: quote({ tsMs: now, fetchedAtMs: now }),
+    funding: { fetchedAtMs: now, nextFundingTimeMs: now + 8 * 3600_000, rates: [] },
+    ...over,
+  });
+}
+
+test("band: inside 10% of target does not trade, outside trades to the rounded target", () => {
+  const inside = rebalanceTrade(hedgeArgs({ lpSol: 10.9, shortSol: 10 }));
+  assert.equal(inside.checked, true);
   assert.equal(inside.tradeSol, 0);
-  assert.equal(inside.reason, "hold");
-  assert.ok(Math.abs(inside.deltaUsd) < 32.5);
+  assert.equal(inside.reason, "inside_band");
+  assert.equal(inside.rawTarget, 10.9);
 
-  const breach = rebalanceTrade({ ...base, lpSol: 4.2, fingerprint: "a" });
-  assert.equal(breach.targetShort, 4.2);
-  assert.equal(breach.tradeSol, 0.7);
-  assert.equal(breach.reason, "band");
-  assert.ok(breach.deltaUsd > 32.5);
+  // |9 − 10| is exactly 10% of the target, which does not exceed the band.
+  const exact = rebalanceTrade(hedgeArgs({ lpSol: 10, shortSol: 9 }));
+  assert.equal(exact.tradeSol, 0);
+  assert.equal(exact.reason, "inside_band");
 
-  const changed = rebalanceTrade({ ...base, lpSol: 3.62, fingerprint: "b" });
-  assert.equal(changed.tradeSol, 0.1);
-  assert.equal(changed.reason, "position_change");
+  const outside = rebalanceTrade(hedgeArgs({ lpSol: 10, shortSol: 8 }));
+  assert.equal(outside.rawTarget, 10);
+  assert.equal(outside.targetShort, 10);
+  assert.equal(outside.tradeSol, 2);
+  assert.equal(outside.reason, "band");
 
-  const opened = rebalanceTrade({ ...base, shortSol: 0, lpSol: 3.54, fingerprint: "a", prevFingerprint: null });
-  assert.equal(opened.targetShort, 3.5);
-  assert.equal(opened.tradeSol, 3.5);
-  assert.equal(opened.reason, "open");
+  const rounded = rebalanceTrade(hedgeArgs({ lpSol: 3.54, shortSol: 0, prevPositionSet: null }));
+  assert.equal(rounded.targetShort, 3.5);
+  assert.equal(rounded.tradeSol, 3.5);
+  assert.equal(rounded.reason, "open");
 
-  const stale = rebalanceTrade({ ...base, lpSol: 10, fingerprint: "b", stale: true });
+  const halfInside = rebalanceTrade(hedgeArgs({ lpSol: 10, shortSol: 5, hedgeRatio: 0.5 }));
+  assert.equal(halfInside.rawTarget, 5);
+  assert.equal(halfInside.tradeSol, 0);
+  assert.equal(halfInside.reason, "hold");
+
+  const halfOutside = rebalanceTrade(hedgeArgs({ lpSol: 12, shortSol: 5, hedgeRatio: 0.5 }));
+  assert.equal(halfOutside.rawTarget, 6);
+  assert.equal(halfOutside.targetShort, 6);
+  assert.equal(halfOutside.tradeSol, 1);
+  assert.equal(halfOutside.reason, "band");
+
+  const stale = rebalanceTrade(hedgeArgs({ lpSol: 0, shortSol: 10, stale: true, positionSet: "", prevPositionSet: "A" }));
   assert.equal(stale.tradeSol, 0);
   assert.equal(stale.reason, "stale");
+  assert.equal(stale.checked, false);
+});
+
+test("hourly cadence holds an out-of-band drift, then trades to target on the next check", () => {
+  const last = 1_000_000;
+  const early = rebalanceTrade(
+    hedgeArgs({ lpSol: 20, shortSol: 10, lastCheckMs: last, nowMs: last + 3_600_000 - 1 })
+  );
+  assert.equal(early.tradeSol, 0);
+  assert.equal(early.checked, false);
+  assert.equal(early.reason, "hold");
+
+  const due = rebalanceTrade(hedgeArgs({ lpSol: 20, shortSol: 10, lastCheckMs: last, nowMs: last + 3_600_000 }));
+  assert.equal(due.checked, true);
+  assert.equal(due.targetShort, 20);
+  assert.equal(due.tradeSol, 10);
+  assert.equal(due.reason, "band");
+
+  // Same position, 0.05 SOL inventory bucket: not a trade, even on the hour.
+  const bucket = rebalanceTrade(
+    hedgeArgs({ lpSol: 10.05, shortSol: 10, lastCheckMs: last, nowMs: last + 3_600_000 })
+  );
+  assert.equal(bucket.tradeSol, 0);
+  assert.equal(bucket.reason, "inside_band");
+});
+
+test("a position-set change re-hedges immediately, including a flat LP", () => {
+  const last = 1_000_000;
+  const soon = last + 30_000;
+  const wiggle = rebalanceTrade(
+    hedgeArgs({ lpSol: 0, shortSol: 10, lastCheckMs: last, nowMs: soon, positionSet: "A", prevPositionSet: "A" })
+  );
+  assert.equal(wiggle.tradeSol, 0);
+  assert.equal(wiggle.checked, false);
+
+  const stopped = rebalanceTrade(
+    hedgeArgs({ lpSol: 0, shortSol: 10, lastCheckMs: last, nowMs: soon, positionSet: "", prevPositionSet: "A" })
+  );
+  assert.equal(stopped.checked, true);
+  assert.equal(stopped.targetShort, 0);
+  assert.equal(stopped.tradeSol, -10);
+  assert.equal(stopped.reason, "position_change");
+
+  // Recenter/redeploy inside the 10% band still snaps to the new target.
+  const recenter = rebalanceTrade(
+    hedgeArgs({ lpSol: 10.4, shortSol: 10, lastCheckMs: last, nowMs: soon, positionSet: "B", prevPositionSet: "A" })
+  );
+  assert.equal(recenter.tradeSol, 0.4);
+  assert.equal(recenter.targetShort, 10.4);
+  assert.equal(recenter.reason, "position_change");
+
+  const redeploy = rebalanceTrade(
+    hedgeArgs({ lpSol: 4, shortSol: 0, lastCheckMs: last, nowMs: soon, positionSet: "C", prevPositionSet: "" })
+  );
+  assert.equal(redeploy.tradeSol, 4);
+  assert.equal(redeploy.reason, "open");
+});
+
+test("step logs an in-band hourly skip and covers a flat LP without waiting out the hour", () => {
+  const c = cfg({ logEveryMs: 300_000 });
+  const open = step(freshBook(650), at(NOW, { lpSol: 10, positionIds: ["A"] }), c);
+  assert.equal(open.book.shortSol, 10);
+  assert.equal(open.row?.reason, "open");
+  assert.equal(open.book.lastHedgeCheckMs, NOW);
+  assert.equal(open.book.positionSet, "A");
+  assert.equal(open.skipLog, null);
+
+  const drift = step(open.book, at(NOW + 30 * 60_000, { lpSol: 20, positionIds: ["A"], fingerprint: "A:20.00" }), c);
+  assert.equal(drift.book.shortSol, 10);
+  assert.equal(drift.row?.tradeSol, 0);
+  assert.equal(drift.reason, "hold");
+  assert.equal(drift.skipLog, null);
+  assert.equal(drift.book.lastHedgeCheckMs, NOW);
+  assert.equal(drift.book.positionSet, "A");
+
+  const hour = step(drift.book, at(NOW + 3_600_000, { lpSol: 10.4, positionIds: ["A"] }), c);
+  assert.equal(hour.book.shortSol, 10);
+  assert.equal(hour.row?.tradeSol, 0);
+  assert.equal(hour.reason, "inside_band");
+  assert.match(hour.skipLog || "", /hedge check skipped: drift inside band/);
+  assert.match(hour.skipLog || "", /short=10\.0000 target=10\.4000/);
+  assert.equal(hour.book.lastHedgeCheckMs, NOW + 3_600_000);
+
+  const closed = step(hour.book, at(NOW + 3_600_000 + 30_000, { lpSol: 0, positionIds: [], fingerprint: "" }), c);
+  assert.equal(closed.book.shortSol, 0);
+  assert.equal(closed.row?.tradeSol, -10);
+  assert.equal(closed.row?.reason, "position_change");
+  assert.equal(closed.skipLog, null);
+  assert.equal(closed.book.positionSet, "");
+
+  const poisoned = step(
+    closed.book,
+    at(NOW + 3_600_000 + 40_000, { chainOk: false, lpSol: 15, positionIds: ["Z"] }),
+    c
+  );
+  assert.equal(poisoned.book.shortSol, 0);
+  assert.equal(poisoned.book.positionSet, "");
+  assert.equal(poisoned.book.lastHedgeCheckMs, closed.book.lastHedgeCheckMs);
+
+  const again = step(poisoned.book, at(NOW + 3_600_000 + 50_000, { lpSol: 4, positionIds: ["Z"] }), c);
+  assert.equal(again.book.shortSol, 4);
+  assert.equal(again.row?.reason, "open");
+  assert.equal(again.book.positionSet, "Z");
 });
 
 test("a stale chain or Kalshi read does not change the short", () => {
@@ -201,6 +340,7 @@ test("taker fills: sell the bid to short, buy the ask to cover, fees and P&L", (
       lpSol: 0,
       lpEquity: 300,
       fingerprint: "",
+      positionIds: [],
       quote: quote({ bidContract: 11.1, askContract: 11.2, markContract: 11.2 }),
     }),
     cfg()
@@ -387,17 +527,27 @@ test("config defaults are safe and a private key blocks startup detection", () =
   assert.equal(c.enabled, false);
   assert.equal(c.wallet, "2YtsAfr19EhNaGrB6W8YqtuJeaaRoY7xq83GFxdnYq6t");
   assert.equal(c.pool, "BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y");
-  assert.equal(c.bandPct, 0.05);
+  assert.equal(c.bandPct, 0.1);
+  assert.equal(c.hedgeRatio, 1);
+  assert.equal(c.hedgeCheckMs, 3_600_000);
   assert.equal(c.takerFeeRate, 0.0004);
   assert.equal(c.marginFraction, 0.25);
   assert.equal(c.capitalUsd, 650);
   assert.equal(c.gasReserveLamports, 120_000_000);
   assert.equal(c.pollMs, 30_000);
   assert.equal(c.staleMs, 60_000);
-  const on = loadConfig({ PAPER_HEDGE_ENABLED: "true", PAPER_HEDGE_BAND_PCT: "0.1", PAPER_HEDGE_FUNDING_SIGN: "-1" });
+  const on = loadConfig({
+    PAPER_HEDGE_ENABLED: "true",
+    PAPER_HEDGE_BAND_PCT: "0.2",
+    PAPER_HEDGE_FUNDING_SIGN: "-1",
+    PAPER_HEDGE_RATIO: "0.5",
+    PAPER_HEDGE_CHECK_SEC: "900",
+  });
   assert.equal(on.enabled, true);
-  assert.equal(on.bandPct, 0.1);
+  assert.equal(on.bandPct, 0.2);
   assert.equal(on.fundingSign, -1);
+  assert.equal(on.hedgeRatio, 0.5);
+  assert.equal(on.hedgeCheckMs, 900_000);
   assert.deepEqual(forbiddenPresent({}), []);
   assert.deepEqual(forbiddenPresent({ BOT_PRIVATE_KEY: "abc", KALSHI_API_KEY: "k" }), ["BOT_PRIVATE_KEY", "KALSHI_API_KEY"]);
   assert.deepEqual(forbiddenPresent({ BOT_PRIVATE_KEY: "   " }), []);
@@ -411,13 +561,22 @@ test("state round-trip keeps the short and ignores a corrupt file", () => {
     feesUsd: 0.14,
     fundingUsd: 0.2,
     fingerprint: "pos",
+    positionSet: "Pos111",
+    lastHedgeCheckMs: 1_700_000_000_000,
     appliedFunding: { "2026-11-06T13:00:00Z": { rate: 0.001, usd: 0.2, source: "published" } },
   };
   const decoded = decodeState(encodeState(book), freshBook(1));
   assert.equal(decoded.ok, true);
   assert.equal(decoded.book.shortSol, 3.4);
   assert.equal(decoded.book.avgEntrySolPx, 99.5);
+  assert.equal(decoded.book.positionSet, "Pos111");
+  assert.equal(decoded.book.lastHedgeCheckMs, 1_700_000_000_000);
   assert.equal(decoded.book.appliedFunding["2026-11-06T13:00:00Z"].usd, 0.2);
+  const legacy = decodeState(JSON.stringify({ version: 1, book: { shortSol: 1, baselineUsd: 650 } }), freshBook(650));
+  assert.equal(legacy.ok, true);
+  assert.equal(legacy.book.shortSol, 1);
+  assert.equal(legacy.book.positionSet, null);
+  assert.equal(legacy.book.lastHedgeCheckMs, 0);
   const bad = decodeState("{not json", freshBook(650));
   assert.equal(bad.ok, false);
   assert.equal(bad.book.shortSol, 0);
