@@ -1,11 +1,12 @@
 {
   "name": "dlmm-keeper-bot",
   "version": "1.0.0",
-  "main": "dist/index.js",
+  "main": "dist/launcher.js",
   "scripts": {
     "build": "tsc",
-    "start": "node dist/index.js",
-    "test": "tsc -p tsconfig.test.json && node --test dist-test/tests/"
+    "start": "node dist/launcher.js",
+    "test": "tsc -p tsconfig.test.json && node --test dist-test/tests/*.test.js",
+    "start:keeper": "node dist/index.js"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.30.1",

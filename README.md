@@ -249,3 +249,38 @@ Provided as-is for educational and operational use. Automated market making invo
 - Calls are paced (`JUPITER_MIN_INTERVAL_MS`, default 2100 ms keyless / 1050 ms with key). A 429 waits until `x-ratelimit-reset` / `Retry-After`, else 5 s, 15 s, 30 s.
 - `JUPITER_POOL_FALLBACK` (default on): after the Jupiter attempts fail with 429/5xx/slippage (never when a signed tx may still land), swap directly in the bot's own Meteora SOL/USDC pool; refused above `POOL_SWAP_MAX_IMPACT_PCT` (default 1%).
 - Rehearsal: `node rehearsal/run.js open,jupiter429` (stub `http429` mode).
+
+## Owner pause (`BOT_PAUSED`)
+
+`npm start` now runs `dist/launcher.js`. Set `BOT_PAUSED` to anything truthy (e.g. `paused by owner Nov 12`) and the
+service idles without loading any trading code — no start-command edits needed. Unset it (or set `false`) to run.
+A paused SOL/USDC keeper with an open position runs **no stops**; close first (`/emergency_exit`) if that matters.
+`npm run start:keeper` runs `dist/index.js` directly (old behaviour).
+
+## LST-pair mode (`BOT_MODE=lst_pair`) — JupSOL-JitoSOL
+
+Unhedged Meteora DLMM LP in JupSOL-JitoSOL (`5cvcHrD2uh2CXhmZnMHsTVWJW1qtyikVaN3MCJNaCKMh`, bin step 1 bp), code in
+`lstpair.ts` (runtime) and `lstlogic.ts` (pure, tested). It shares only helpers with the SOL/USDC keeper.
+
+- Entry (flat, no LST held, not paused): swaps at most `LST_MAX_USDC_IN` USDC (required; 0 = never touch USDC) into
+  ~50/50 JupSOL/JitoSOL via Jupiter (`LST_SWAP_SLIPPAGE_BPS` 30, re-quote up to `LST_SWAP_SLIPPAGE_MAX_BPS` 100, price
+  impact capped), buys the SOL shortfall for position rent (reserve `GAS_RESERVE_LAMPORTS` 0.12 SOL + `LST_OPEN_COST_LAMPORTS`
+  0.05), and opens ONE Spot position at active ± `LST_BIN_HALF_WIDTH` (1) bins. USDC is never touched again.
+- Rebalance: active bin out of range for `LST_OOR_TICKS` (3) × `LST_TICK_SEC` (60 s) and `LST_REBALANCE_COOLDOWN_SEC`
+  (1800 s) since the last one → withdraw + claim + close, swap the excess side back to 50/50 (skipped below
+  `LST_MIN_SWAP_SOL` 0.02 SOL), reopen around the live bin. Fees are compounded (not swept) so the test is self-contained.
+- Depeg guard: pool price vs the stake-pool fair ratio (JupSOL rate ÷ JitoSOL rate, read from both SPL stake pools)
+  off by more than `LST_DEPEG_MAX_PCT` (0.5 %) for `LST_DEPEG_CONFIRM_TICKS` (2) ticks → close and exit to
+  `LST_DEPEG_EXIT_TO` (`SOL` default, `USDC`, or `HOLD`), then pause.
+- Never opens a second position (checks chain before opening; adopts a late-landing or existing one; alerts on extras).
+- Telegram (only `TELEGRAM_CHAT_ID`; backlog dropped at boot): `/status`, `/pause`, `/resume`, `/emergency_exit`
+  (close + all JupSOL/JitoSOL → USDC, then paused — set `BOT_PAUSED` before any restart).
+- Ledger: `LST_BASELINE`, `LST_SWAP`, `LST_DEPLOY`, `LST_CLOSE`, `LST_REBALANCE`, `LST_EXIT`/`EMERGENCY_EXIT`, `ERROR`, and
+  hourly `SNAPSHOT` (`equity_usd`, `equity_sol`, `pnl_usd`, `pnl_sol`, `pnl_pct`, `sol_usd`, `pool_price`, `fair_price`,
+  `depeg_pct`, …) with `pool_name=JupSOL-JitoSOL`, `test_id=lst-jupsol-jitosol-2026-11`.
+- Baseline: measured on chain right before entry (USDC going in + LST held, valued in SOL via stake-pool rates and in
+  USD via the SOL-USDC DLMM price; native SOL at that moment = gas baseline, excluded). Tx fees therefore show as cost;
+  refundable position rent is neutral. Pin after entry: `LST_BASELINE_USD`, `LST_BASELINE_SOL`, `LST_GAS_BASELINE_SOL`,
+  `LST_USDC_EXCLUDED`, `LST_POSITION_PUBKEY` (the bot prints the exact line).
+- Dry run: `LST_DRY_RUN=true` (sends nothing; Jupiter quotes only). `LST_DRY_RUN_OWNER=<pubkey>` simulates against
+  another wallet's real balances (read-only).

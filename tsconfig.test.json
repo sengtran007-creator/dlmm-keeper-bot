@@ -20,6 +20,7 @@
     "gasreserve.ts",
     "flatguard.ts",
     "jupretry.ts",
+    "lstlogic.ts",
     "tools/**/*.ts",
     "tests/**/*.ts"
   ]
