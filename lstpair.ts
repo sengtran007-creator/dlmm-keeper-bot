@@ -141,6 +141,28 @@ async function ledger(event: string, fields: Record<string, any> = {}) {
     baseline_usd: baseline?.usd, baseline_sol: baseline?.sol, cumulative_fees_sol: cumFeesSol, rebalances,
     ...fields,
   };
+  // The sheet's Apps Script (v2.2) keeps a fixed column set: map USD figures onto it and carry the SOL-terms
+  // figures in notes so both views land in the "Ledger v2 - <INSTANCE_LABEL>" tab without a script change.
+  if (payload.equity_usd != null) payload.total_equity_usd = payload.equity_usd;
+  if (payload.baseline_usd != null) payload.entry_equity = payload.baseline_usd;
+  if (payload.pnl_usd != null) payload.unrealized_pnl_usd = payload.pnl_usd;
+  if (payload.sol_usd != null) payload.spot_usd = payload.sol_usd;
+  if (payload.tx_sig && !payload.tx_signature) payload.tx_signature = payload.tx_sig;
+  const f = (v: any, d: number) => (typeof v === "number" && Number.isFinite(v) ? v.toFixed(d) : undefined);
+  const solBits = [
+    payload.equity_sol != null && `equity_sol=${f(payload.equity_sol, 6)}`,
+    payload.baseline_sol != null && `baseline_sol=${f(payload.baseline_sol, 6)}`,
+    payload.pnl_sol != null && `pnl_sol=${f(payload.pnl_sol, 6)}`,
+    payload.pnl_sol_pct != null && `pnl_sol_pct=${f(payload.pnl_sol_pct, 3)}%`,
+    payload.pnl_pct != null && `pnl_usd_pct=${f(payload.pnl_pct, 3)}%`,
+    payload.pool_price != null && `pool=${f(payload.pool_price, 6)}`,
+    payload.fair_price != null && `fair=${f(payload.fair_price, 6)}`,
+    payload.depeg_pct != null && `depeg=${f(payload.depeg_pct, 3)}%`,
+    payload.active_bin != null && `active_bin=${payload.active_bin}`,
+    payload.unclaimed_fees_sol != null && `unclaimed_fees_sol=${f(payload.unclaimed_fees_sol, 6)}`,
+    cumFeesSol ? `claimed_fees_sol=${cumFeesSol.toFixed(6)}` : "",
+  ].filter(Boolean).join(" ");
+  if (solBits) payload.notes = [payload.notes, solBits].filter(Boolean).join(" | ");
   if (typeof payload.notes === "string") payload.notes = redact(payload.notes);
   for (let i = 0; i < 2; i++) {
     try {
