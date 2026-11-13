@@ -131,6 +131,7 @@ async function notify(msg: string) {
 }
 async function ledger(event: string, fields: Record<string, any> = {}) {
   if (!SHEET_URL) return;
+  if (DRY_RUN) { console.log(`[DRY_RUN] ledger ${event} not written`); return; } // keep the sheet clean during dry runs
   const now = new Date();
   const payload: Record<string, any> = {
     schema_version: 2, timestamp_iso: now.toISOString(), timestamp_pt: ptNow(),
@@ -411,7 +412,10 @@ async function swapToBalance(label: string) {
 }
 
 // ---------------------------------------------------------------- flows
+let dryRunEntryDone = false;
 async function entry() {
+  if (DRY_RUN && dryRunEntryDone) return; // simulate the entry once per boot
+  dryRunEntryDone = DRY_RUN;
   const w = await walletState();
   const usdcRaw = usdcToDeploy(w.usdcRaw, MAX_USDC_IN_RAW);
   if (usdcRaw < 20e6 && w.xRaw + w.yRaw === 0) {
